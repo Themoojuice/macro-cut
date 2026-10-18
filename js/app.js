@@ -1,4 +1,4 @@
-import { openClip, decodeRange } from './media.js';
+import { openClip, decodeRange, withTimeout } from './media.js';
 import { Renderer, DEFAULT_LOOK } from './gpu.js';
 import { computeStabilisation, clampPan, frameAt } from './core.js';
 import { analyseClip, exportClip, frameInfo } from './engine.js';
@@ -15,7 +15,7 @@ const LOOK_PRESETS = {
 const state = {
   clip: null, segments: [], sel: 0,
   analysis: null, analysing: null,
-  stab: { mode: 'smooth', sigma: 0.8, maxCrop: 0.25, rotation: true, zoom: true, roiMode: 'all', roi: null },
+  stab: { on: false, level: 'medium', maxCrop: 0.22, rotation: true, zoom: true, roiMode: 'all', roi: null },
   frame: { aspect: 'native', rot: 0, quarter: 0, zoom: 1, panX: 0, panY: 0 },
   look: { ...DEFAULT_LOOK },
   speed: 1,
@@ -23,7 +23,13 @@ const state = {
   muted: false, playing: false, compare: false,
   mediaTime: 0, plan: null, planRaw: null, previewInfo: null, tab: 'tab-trim',
 };
-const STORE = 'macrocut.v3';
+// Plain-language strength levels → engine settings
+const LEVELS = {
+  mild: { mode: 'smooth', sigma: 0.35, maxCrop: 0.12, label: 'Mild', desc: 'Takes out the jitter and keeps your camera moves. Least zoom-in.' },
+  medium: { mode: 'smooth', sigma: 1.0, maxCrop: 0.22, label: 'Medium', desc: 'Smooth and steady, still follows where you point. Good default.' },
+  max: { mode: 'lock', sigma: 1.0, maxCrop: 0.35, label: 'Max', desc: 'Holds the shot as still as possible, like a tripod. Zooms in the most.' },
+};
+const STORE = 'macrocut.v5';
 try {
   const s = JSON.parse(localStorage.getItem(STORE) || 'null');
   if (s) {
@@ -81,8 +87,8 @@ function keptMask() {
 function planOpts(withStab) {
   const st = state.stab, fr = state.frame, c = state.clip;
   return {
-    C: withStab && state.analysis && st.mode !== 'off' ? state.analysis.C : null,
-    times: c.times, kept: keptMask(), mode: st.mode, sigma: st.sigma, strength: 1,
+    C: withStab && state.analysis && st.on ? state.analysis.C : null,
+    times: c.times, kept: keptMask(), mode: LEVELS[st.level].mode, sigma: LEVELS[st.level].sigma, strength: 1,
     rotation: st.rotation, zoom: st.zoom, maxCrop: st.maxCrop,
     A: srcAspect(), Ao: outAspect(), quarter: fr.quarter, rot: fr.rot * Math.PI / 180,
     zoomUser: fr.zoom, panX: fr.panX, panY: fr.panY,
@@ -120,59 +126,93 @@ function draw() {
 }
 
 // ───────────── loading ─────────────
+// Steps run one at a time, each with a time limit, so a stuck step reports itself instead of hanging.
+// The hardware decoder is never asked to serve the analysis decoder and the preview at the same time.
 let videoURL = null;
+function waitVideo(event, ms) {
+  return new Promise((res, rej) => {
+    const ok = () => { clean(); res(); }, bad = () => { clean(); rej(new Error('The browser could not play this file' + (video.error ? ` (code ${video.error.code})` : ''))); };
+    const t = setTimeout(() => { clean(); rej(new Error('timeout')); }, ms);
+    const clean = () => { clearTimeout(t); video.removeEventListener(event, ok); video.removeEventListener('error', bad); };
+    video.addEventListener(event, ok, { once: true }); video.addEventListener('error', bad, { once: true });
+  });
+}
 async function loadFile(file) {
   if (!file) return;
   if (state.analysing) state.analysing.abort();
+  let stepName = 'reading the file';
+  const step = (name, msg) => { stepName = name; toast(msg); };
   try {
     $('emptyState').style.display = 'none';
-    state.previewInfo = null;
+    pause();
+    state.previewInfo = null; state.clip = null;
+    video.removeAttribute('src'); video.load();
     const clip = await openClip(file, msg => toast(msg));
-    state.clip = clip;
-    state.analysis = null; state.stab.roi = null;
+    state.analysis = null; state.stab.roi = null; state.stab.on = false;
     state.segments = [{ start: 0, end: clip.duration }]; state.sel = 0;
     state.frame = { aspect: 'native', rot: 0, quarter: 0, zoom: 1, panX: 0, panY: 0 };
+    // 1. reference thumbnail from the decoder (only needed for rotated or HDR clips), before <video> exists
+    let probe = null;
+    if (clip.rotation || clip.hdr) {
+      step('checking colour', clip.hdr ? 'HDR clip: checking colour…' : 'Checking orientation…');
+      try { probe = await withTimeout(referenceThumb(clip), 12000, 'colour check'); }
+      catch (e) { console.warn('reference thumb failed', e); }
+    }
+    // 2. preview
+    step('loading the preview', 'Loading preview…');
     if (videoURL) URL.revokeObjectURL(videoURL);
     videoURL = URL.createObjectURL(file);
-    video.src = videoURL;
-    video.muted = true;
-    await new Promise((res, rej) => { video.onloadeddata = res; video.onerror = () => rej(new Error('The browser could not play this file.')); });
+    video.muted = true; video.src = videoURL;
+    try { await waitVideo('loadeddata', 20000); }
+    catch (e) { throw new Error(e.message === 'timeout' ? `This browser didn't start the preview for this ${clip.codec.split('.')[0]} video within 20 s.` : e.message); }
     video.currentTime = 0;
-    state.previewInfo = await detectPreview(clip);
+    await waitVideo('seeked', 3000).catch(() => {});
+    // 3. match the preview's colour/orientation handling to the decoder's
+    step('matching colour', 'Matching preview colour…');
+    state.previewInfo = probe ? matchPreview(clip, probe) : defaultPreview(clip);
     video.muted = state.muted;
-    $('metaBadge').textContent = `${clip.dispW}×${clip.dispH} · ${Math.round(clip.fps)}fps · ${clip.codec.split('.')[0]}${clip.hdr ? ' · HDR' : ''}`;
+    state.clip = clip;
+    $('metaBadge').textContent = `${clip.dispW}×${clip.dispH} · ${Math.round(clip.fps)}fps${clip.hdr ? ' · HDR' : ''}`;
     $('durTime').textContent = fmt(clip.duration);
     for (const id of ['btnPlay', 'btnPrev', 'btnNext', 'btnExport', 'btnStill']) $(id).disabled = false;
     clearHeatmap(); renderSegments(); syncControls(); updateSpeedInfo();
     recompute();
     uploadVideo(); draw();
     hideToast();
-    toast(clip.hdr ? `HDR (${clip.hdr.toUpperCase()}) clip: converting to standard colour. Next: Stabilise → Analyse motion` : 'Loaded. Next: Stabilise → Analyse motion', 3500);
+    toast(clip.hdr ? 'Loaded. HDR colour is converted automatically.' : 'Loaded', 2500);
   } catch (e) {
     console.error(e);
-    toast(e.message || String(e), 6000);
+    const hevc = state.clip === null && /hevc|hvc|hev1/i.test(e.message + (file.type || ''));
+    toast(`Couldn't open this clip (while ${stepName}): ${e.message || e}` + (hevc ? ' Tip: in Camera settings turn off "High efficiency video" and "HDR video".' : ''), 9000);
     if (!state.clip) $('emptyState').style.display = '';
   }
 }
 
-// Browsers differ on whether <video> textures arrive rotated, and on whether HDR is colour-managed on upload.
-// Measure it: render the first frame from the decoder (whose handling we know) and from <video> under each
-// candidate interpretation, and keep the one that matches.
-async function detectPreview(clip) {
-  const base = { texW: clip.dispW, texH: clip.dispH, dispW: clip.dispW, dispH: clip.dispH, rot: 0, hdr: 0 };
-  if (!clip.rotation && !clip.hdr) return base;
-  const cands = [base];
+function defaultPreview(clip) {
+  return { texW: clip.dispW, texH: clip.dispH, dispW: clip.dispW, dispH: clip.dispH, rot: 0, hdr: 0 };
+}
+function thumbRenderer(clip) {
+  const tw = 64, th = Math.max(8, Math.round(64 * clip.dispH / clip.dispW));
+  const cv = typeof OffscreenCanvas !== 'undefined' ? new OffscreenCanvas(tw, th) : Object.assign(document.createElement('canvas'), { width: tw, height: th });
+  const R = new Renderer(cv); R.setSize(tw, th); return R;
+}
+// First frame through the decoder, rendered the way analysis/export will see it.
+async function referenceThumb(clip) {
+  const R = thumbRenderer(clip);
+  try {
+    let ref = null;
+    await decodeRange(clip, { fromUs: 0, toUs: 0, stallMs: 8000, onFrame: f => { if (!ref) { R.upload(f, frameInfo(clip, f)); ref = R.thumb().slice(); } f.close(); } });
+    return ref;
+  } finally { R.dispose(); }
+}
+// Browsers differ on whether <video> textures arrive rotated and whether HDR is colour-managed on upload:
+// try each interpretation of the preview frame and keep the one that matches the decoder's.
+function matchPreview(clip, ref) {
+  const base = defaultPreview(clip), cands = [base];
   if (clip.rotation) cands.push({ texW: clip.codedW, texH: clip.codedH, dispW: clip.dispW, dispH: clip.dispH, rot: clip.rotation / 90, hdr: 0 });
   if (clip.hdr) for (const c of cands.slice()) cands.push({ ...c, hdr: clip.hdr === 'hlg' ? 1 : 2 });
-  let R = null;
+  const R = thumbRenderer(clip);
   try {
-    await new Promise(r => { if (video.readyState >= 2 && !video.seeking) r(); else video.addEventListener('seeked', r, { once: true }); setTimeout(r, 800); });
-    const tw = 64, th = Math.max(8, Math.round(64 * clip.dispH / clip.dispW));
-    const cv = typeof OffscreenCanvas !== 'undefined' ? new OffscreenCanvas(tw, th) : Object.assign(document.createElement('canvas'), { width: tw, height: th });
-    R = new Renderer(cv); R.setSize(tw, th);
-    let ref = null;
-    await decodeRange(clip, { fromUs: 0, toUs: 0, onFrame: f => { if (!ref) { R.upload(f, frameInfo(clip, f)); ref = R.thumb().slice(); } f.close(); } });
-    if (!ref) return base;
     let best = base, bestD = Infinity;
     for (const c of cands) {
       R.upload(video, c); const t = R.thumb();
@@ -180,8 +220,19 @@ async function detectPreview(clip) {
       if (d < bestD) { bestD = d; best = c; }
     }
     return best;
-  } catch (e) { console.warn('preview probe failed', e); return base; }
-  finally { if (R) R.dispose(); }
+  } catch (e) { console.warn('preview match failed', e); return base; }
+  finally { R.dispose(); }
+}
+
+// Free the preview's hardware decoder while analysis/export decode the file, then bring it back.
+async function parkVideo() {
+  const t = state.mediaTime;
+  pause(); video.removeAttribute('src'); video.load();
+  return async () => {
+    video.src = videoURL;
+    try { await waitVideo('loadeddata', 15000); video.currentTime = t; await waitVideo('seeked', 3000).catch(() => {}); }
+    catch (e) { toast('Preview reload failed: ' + e.message, 4000); }
+  };
 }
 
 function uploadVideo() {
@@ -277,10 +328,10 @@ window.addEventListener('pointercancel', cmpUp);
 function updateStabChip() {
   const tag = $('compareTag');
   if (!state.clip) { tag.style.display = 'none'; return; }
-  const stab = state.analysis && state.stab.mode !== 'off';
+  const stab = state.analysis && state.stab.on;
   tag.style.display = 'block';
   tag.className = 'compare-tag' + (state.compare ? '' : stab ? ' on' : '');
-  tag.textContent = state.compare ? 'ORIGINAL' : stab ? `STABILISED · ${state.stab.mode === 'lock' ? 'TRIPOD' : 'SMOOTH'}` : 'NOT STABILISED';
+  tag.textContent = state.compare ? 'ORIGINAL' : stab ? `STABILISED · ${LEVELS[state.stab.level].label.toUpperCase()}` : state.analysing ? 'MEASURING SHAKE…' : 'NOT STABILISED';
 }
 
 // ───────────── timeline ─────────────
@@ -406,74 +457,87 @@ function bindRange(id, get, set, label) {
   return () => { el.value = get(); if (lab) lab.textContent = label(get()); };
 }
 const syncers = [
-  bindRange('sigma', () => state.stab.sigma, v => { state.stab.sigma = v; }, v => `${v.toFixed(2)} s`),
   bindRange('maxCrop', () => state.stab.maxCrop, v => { state.stab.maxCrop = v; }, v => `${Math.round(v * 100)}%`),
   bindRange('rot', () => state.frame.rot, v => { state.frame.rot = v; clampFramePan(); }, v => `${v.toFixed(1)}°`),
   bindRange('zoom', () => state.frame.zoom, v => { state.frame.zoom = v; clampFramePan(); }, v => `${v.toFixed(2)}×`),
+  bindRange('speed', () => state.speed, v => { setSpeed(v); }, v => speedLabel(v)),
 ];
 $('stabRot').onchange = e => { state.stab.rotation = e.target.checked; invalidate(); persist(); };
 $('stabZoom').onchange = e => { state.stab.zoom = e.target.checked; invalidate(); persist(); };
-document.querySelectorAll('#stabMode .pill-btn').forEach(b => b.onclick = () => {
-  state.stab.mode = b.dataset.mode; pills('stabMode', 'mode', state.stab.mode);
-  $('sigma').disabled = state.stab.mode !== 'smooth'; invalidate(); persist();
+$('stabOn').onchange = e => setStabOn(e.target.checked);
+document.querySelectorAll('#stabLevel .pill-btn').forEach(b => b.onclick = () => {
+  state.stab.level = b.dataset.level; state.stab.maxCrop = LEVELS[b.dataset.level].maxCrop;
+  syncControls(); persist();
+  if (!state.stab.on) setStabOn(true); else invalidate();
 });
 document.querySelectorAll('#roiMode .pill-btn').forEach(b => b.onclick = () => {
   state.stab.roiMode = b.dataset.roi; pills('roiMode', 'roi', state.stab.roiMode);
-  if (state.stab.roiMode === 'all') { const had = !!state.stab.roi; state.stab.roi = null; if (had && state.analysis) toast('Re-analyse to track the whole frame', 2000); }
-  else toast('Tap the spot to hold still (substrate next to the spood works best)', 2600);
+  if (state.stab.roiMode === 'all') { const had = !!state.stab.roi; state.stab.roi = null; if (had && state.analysis) analyse(); }
+  else toast('Now tap the spot on the picture that should stay still', 2600);
   updateReticle();
 });
+$('btnAnalyse').onclick = () => analyse();
+
+function setStabOn(on) {
+  state.stab.on = on; $('stabOn').checked = on;
+  if (on && !state.analysis && state.clip) analyse();
+  if (!on && state.analysing) state.analysing.abort();
+  invalidate(); updateStabStatus(); updateStabChip(); persist();
+}
 
 function syncControls() {
   syncers.forEach(f => f());
   $('stabRot').checked = state.stab.rotation; $('stabZoom').checked = state.stab.zoom;
-  pills('stabMode', 'mode', state.stab.mode); pills('roiMode', 'roi', state.stab.roiMode);
-  $('sigma').disabled = state.stab.mode !== 'smooth';
+  $('stabOn').checked = state.stab.on;
+  pills('stabLevel', 'level', state.stab.level); pills('roiMode', 'roi', state.stab.roiMode);
+  $('levelDesc').textContent = LEVELS[state.stab.level].desc;
   pills('aspectGroup', 'aspect', state.frame.aspect); pills('speedGroup', 'speed', state.speed);
   lookSync.forEach(f => f());
+  updateStabStatus();
 }
 
 function updateStabStatus() {
-  const el = $('stabStatus'), a = state.analysis, p = state.plan;
+  const el = $('stabStatus'), a = state.analysis, p = state.plan, st = state.stab;
+  $('stabSub').textContent = st.on ? `On · ${LEVELS[st.level].label}` : 'Off';
   if (state.analysing) return;
-  if (!a) { el.innerHTML = 'Not analysed yet. Analysis tracks hundreds of points at sub-pixel accuracy (~1–3× clip length on a phone).'; return; }
+  if (!state.clip) { el.textContent = 'Open a clip, then switch this on.'; return; }
+  if (!st.on) { el.textContent = a ? 'Switch on to use the steadied version.' : 'Switch on to steady the shake. The first time, it measures the shake in your clip (takes about as long as the clip).'; return; }
+  if (!a) { el.textContent = ''; return; }
+  const parts = [`<b>✓ Steadied</b> · zoomed in ${Math.round(p.cropPct)}% to hide the moving edges.`];
   const weak = a.ok.reduce((s, v) => s + (v ? 0 : 1), 0);
-  const parts = [`<span class="good">Tracked ${a.ok.length - weak}/${a.ok.length} frames</span>`];
-  if (weak) parts.push(`<span class="warn">${weak} weak (blur/no texture)</span>`);
-  if (state.stab.mode !== 'off') {
-    parts.unshift('<b>✓ Applied to preview & export</b>');
-    parts.push(`crop ${p.cropPct.toFixed(0)}%`);
-    const pct = Math.round(100 * p.limitedFrames / a.ok.length);
-    if (pct > 0) parts.push(`<span class="warn">lighter smoothing on ${pct}% of frames to fit the crop. Raise Max crop for steadier</span>`);
-  } else parts.push('stabilisation off');
-  if (state.stab.roi) parts.push('tracking tapped spot');
-  el.innerHTML = parts.join(' · ');
+  if (weak > a.ok.length * 0.02) parts.push('Some blurry moments couldn\'t be measured; they\'re smoothed over.');
+  if (p.limitedFrames > a.ok.length * 0.1) parts.push(`<span class="warn">Your camera moved a lot in places, so those bits are a little less steady.${st.level !== 'max' ? ' Max (or more zoom-in) helps.' : ''}</span>`);
+  if (st.roi) parts.push('Keeping the tapped spot still.');
+  el.innerHTML = parts.join(' ');
 }
 
-$('btnAnalyse').onclick = async () => {
+async function analyse() {
   if (!state.clip) return;
   if (state.analysing) { state.analysing.abort(); return; }
-  pause();
   const ac = new AbortController(); state.analysing = ac;
-  const btn = $('btnAnalyse'); btn.textContent = '✕ Cancel analysis';
   const t0 = performance.now();
+  const el = $('stabStatus');
+  updateStabChip();
+  el.innerHTML = 'Measuring the shake… <a href="#" id="cancelAnalyse">cancel</a>';
+  $('cancelAnalyse').onclick = ev => { ev.preventDefault(); ac.abort(); };
+  const resume = await parkVideo();
   try {
     const res = await analyseClip(state.clip, {
       roi: state.stab.roi, signal: ac.signal,
-      onProgress: p => { progress(p); $('stabStatus').textContent = `Tracking motion… ${Math.round(p * 100)}%`; },
+      onProgress: p => { progress(p); const s = el.querySelector('span') || el; el.innerHTML = `Measuring the shake… ${Math.round(p * 100)}% <a href="#" id="cancelAnalyse">cancel</a>`; $('cancelAnalyse').onclick = ev => { ev.preventDefault(); ac.abort(); }; void s; },
     });
     if (res) {
-      state.analysis = res;
-      if (state.stab.mode === 'off') { state.stab.mode = 'smooth'; pills('stabMode', 'mode', 'smooth'); }
-      drawHeatmap();
-      toast(`✓ Stabilisation applied (${((performance.now() - t0) / 1000).toFixed(0)} s). Press ▶ to watch, tap ❖ for before/after`, 4000);
-      // re-prime the <video> decoder (it may have been parked while the analysis decoder ran)
-      try { video.currentTime = Math.max(0, state.mediaTime); } catch (e) { /* ignore */ }
-    }
-  } catch (e) { console.error(e); toast('Analysis failed: ' + e.message, 5000); }
-  state.analysing = null; btn.textContent = '⚡ Re-analyse motion'; progress(null);
-  invalidate(); updateStabStatus(); updateStabChip(); drawMotionGraph();
-};
+      state.analysis = res; drawHeatmap();
+      toast(`✓ Steadied (${((performance.now() - t0) / 1000).toFixed(0)} s). Tap ❖ to compare before/after`, 3500);
+    } else if (state.stab.on && !state.analysis) { state.stab.on = false; }
+  } catch (e) {
+    console.error(e); toast('Couldn\'t measure the shake: ' + e.message, 6000);
+    if (!state.analysis) state.stab.on = false;
+  }
+  state.analysing = null; progress(null);
+  syncControls(); invalidate(); updateStabChip(); drawMotionGraph();
+  await resume();
+}
 
 // ───────────── frame controls + gestures ─────────────
 function clampFramePan() {
@@ -499,7 +563,7 @@ view.addEventListener('pointerdown', e => {
     const [ox, oy] = canvasToOut(e), M = state.plan.M.subarray(4 * currentIndex(), 4 * currentIndex() + 4);
     state.stab.roi = { x: M[0] * ox - M[1] * oy + M[2], y: M[1] * ox + M[0] * oy + M[3], r: 0.2 };
     state.stab.roiScreen = [e.clientX, e.clientY];
-    updateReticle(); toast('Spot set. Tap Analyse motion to apply', 2400);
+    updateReticle(); state.stab.on = true; analyse();
     return;
   }
   if (state.tab !== 'tab-frame') return;
@@ -546,18 +610,18 @@ function updateReticle() {
 
 // ───────────── look ─────────────
 const LOOK_UI = [
-  ['cas', 'Sharpen (CAS)', 0, 1, 0.01, v => `${Math.round(v * 100)}%`],
-  ['detail', 'Micro-detail', 0, 2.5, 0.01, v => `${Math.round(v * 100)}%`],
-  ['radius', 'Detail radius', 0.6, 4, 0.1, v => `${v.toFixed(1)} px`],
-  ['denoise', 'Bokeh smooth', 0, 1, 0.01, v => `${Math.round(v * 100)}%`],
-  ['exposure', 'Exposure', -2, 2, 0.05, v => `${v > 0 ? '+' : ''}${v.toFixed(2)} EV`],
+  ['cas', 'Sharpen', 0, 1, 0.01, v => `${Math.round(v * 100)}%`],
+  ['detail', 'Hair & texture', 0, 2.5, 0.01, v => `${Math.round(v * 100)}%`],
+  ['radius', 'Detail size', 0.6, 4, 0.1, v => v < 1.2 ? 'fine' : v < 2.2 ? 'medium' : 'coarse'],
+  ['denoise', 'Smooth background', 0, 1, 0.01, v => `${Math.round(v * 100)}%`],
+  ['exposure', 'Brightness', -2, 2, 0.05, v => `${v > 0 ? '+' : ''}${Math.round(v * 50)}`],
   ['contrast', 'Contrast', -0.5, 0.6, 0.01, v => `${Math.round(v * 100)}`],
-  ['shadows', 'Shadows', -0.5, 1, 0.01, v => `${Math.round(v * 100)}`],
-  ['highlights', 'Highlights', -0.5, 1, 0.01, v => `${Math.round(v * 100)}`],
-  ['saturation', 'Saturation', -1, 1, 0.01, v => `${Math.round(v * 100)}`],
-  ['vibrance', 'Vibrance', -0.5, 1.5, 0.01, v => `${Math.round(v * 100)}`],
-  ['warmth', 'Warmth', -1, 1, 0.01, v => `${Math.round(v * 100)}`],
-  ['tint', 'Tint', -1, 1, 0.01, v => `${Math.round(v * 100)}`],
+  ['shadows', 'Brighten shadows', -0.5, 1, 0.01, v => `${Math.round(v * 100)}`],
+  ['highlights', 'Calm bright areas', -0.5, 1, 0.01, v => `${Math.round(v * 100)}`],
+  ['saturation', 'Colour strength', -1, 1, 0.01, v => `${Math.round(v * 100)}`],
+  ['vibrance', 'Boost dull colours', -0.5, 1.5, 0.01, v => `${Math.round(v * 100)}`],
+  ['warmth', 'Cool ↔ warm', -1, 1, 0.01, v => `${Math.round(v * 100)}`],
+  ['tint', 'Green ↔ pink', -1, 1, 0.01, v => `${Math.round(v * 100)}`],
 ];
 const lookSync = LOOK_UI.map(([key, label, min, max, st, f]) => {
   const row = document.createElement('div'); row.className = 'control-row';
@@ -574,16 +638,25 @@ document.querySelectorAll('#lookPresets .pill-btn').forEach(b => b.onclick = () 
 });
 
 // ───────────── speed ─────────────
-document.querySelectorAll('#speedGroup .pill-btn').forEach(b => b.onclick = () => {
-  state.speed = parseFloat(b.dataset.speed); pills('speedGroup', 'speed', b.dataset.speed);
-  video.playbackRate = state.speed; updateSpeedInfo();
-});
+function speedLabel(v) { return Math.abs(v - 1) < 1e-6 ? 'normal' : `${+v.toFixed(2)}×`; }
+function setSpeed(v) {
+  state.speed = Math.round(v * 100) / 100;
+  video.playbackRate = state.speed;
+  pills('speedGroup', 'speed', String(state.speed));
+  const el = $('speed'); if (el && +el.value !== state.speed) el.value = state.speed;
+  $('v-speed').textContent = speedLabel(state.speed);
+  updateSpeedInfo();
+}
+document.querySelectorAll('#speedGroup .pill-btn').forEach(b => b.onclick = () => setSpeed(parseFloat(b.dataset.speed)));
 function updateSpeedInfo() {
-  const el = $('speedInfo'); if (!state.clip) { el.textContent = 'Load a clip first.'; return; }
-  const f = state.clip.fps, eff = f * state.speed;
-  el.innerHTML = state.speed === 1 ? `Source ${f.toFixed(0)} fps.` :
-    eff >= 29 ? `<span class="good">Real slow-mo:</span> ${f.toFixed(0)} fps source × ${state.speed} = ${eff.toFixed(0)} unique frames/s.`
-      : `<span class="warn">${f.toFixed(0)} fps source × ${state.speed} = only ${eff.toFixed(1)} unique frames/s, so it will step.</span> Shoot at 60 or 120 fps for smooth slow-mo.`;
+  const el = $('speedInfo'); if (!state.clip) { el.textContent = 'Open a clip first.'; return; }
+  const f = state.clip.fps, sp = state.speed, eff = f * sp;
+  if (sp === 1) { el.textContent = `Normal speed (your clip is ${Math.round(f)} frames per second).`; return; }
+  if (sp > 1) { el.textContent = `Sped up ${sp}×. Sound is dropped when the speed changes.`; return; }
+  el.innerHTML = eff >= 24
+    ? `<span class="good">Smooth slow motion.</span> Each second shows ${Math.round(eff)} different frames from your clip.`
+    : `<span class="warn">Slightly steppy:</span> your ${Math.round(f)} fps clip only has ${Math.round(eff)} different frames per second at this speed. For silky slow motion, film at 60 or 120 fps.`;
+  el.innerHTML += ' Sound is dropped when the speed changes.';
 }
 
 // ───────────── open ─────────────
@@ -635,7 +708,7 @@ function renderExportOptions() {
   $('expAudio').checked = state.exp.audio;
   $('expAudio').disabled = state.speed !== 1 || !state.clip.audio;
   const total = state.segments.reduce((s, x) => s + (x.end - x.start), 0) / state.speed;
-  $('exportSummary').textContent = `${total.toFixed(1)} s at ${exportFps()} fps · ${state.analysis && state.stab.mode !== 'off' ? `stabilised (${state.stab.mode === 'lock' ? 'tripod lock' : 'smooth'})` : 'not stabilised'} · speed ${state.speed}×`;
+  $('exportSummary').textContent = `${total.toFixed(1)} s · ${exportFps()} fps · ${state.analysis && state.stab.on ? `steadied (${LEVELS[state.stab.level].label})` : 'not steadied'} · ${speedLabel(state.speed)} speed`;
 }
 document.querySelectorAll('#fpsGroup .pill-btn').forEach(b => b.onclick = () => { state.exp.fps = b.dataset.fps; persist(); renderExportOptions(); });
 $('expAudio').onchange = e => { state.exp.audio = e.target.checked; persist(); };
@@ -649,7 +722,8 @@ function setExportUI(mode) {
 }
 $('btnExport').onclick = () => {
   if (!state.clip) return;
-  pause(); if (!state.analysis) toast('Tip: run Stabilise → Analyse motion first', 2500);
+  pause(); if (!state.stab.on) toast('Tip: switch on Stabilise first for a steadier video', 2500);
+  if (state.analysing) return toast('Wait for the shake measurement to finish', 2000);
   if (planDirty) recompute();
   setExportUI('options'); renderExportOptions(); $('exportSheet').classList.add('open');
 };
@@ -663,6 +737,7 @@ $('btnExportGo').onclick = async () => {
   $('exportMsg').textContent = `Rendering ${w}×${h} @ ${fps} fps…`;
   exportAbort = new AbortController();
   const t0 = performance.now();
+  const resume = await parkVideo();
   try {
     if (planDirty) recompute();
     const res = await exportClip(state.clip, {
@@ -672,7 +747,7 @@ $('btnExportGo').onclick = async () => {
       signal: exportAbort.signal,
       onProgress: p => { $('exportBar').style.width = `${Math.round(p * 100)}%`; $('exportMsg').textContent = `Rendering ${w}×${h} @ ${fps} fps… ${Math.round(p * 100)}%`; },
     });
-    if (!res) { setExportUI('options'); exportAbort = null; return; }
+    if (!res) { setExportUI('options'); exportAbort = null; await resume(); return; }
     exportResult = { blob: res.blob, name: `MacroCut_${stem()}.mp4` };
     $('exportMsg').textContent = `Done in ${((performance.now() - t0) / 1000).toFixed(0)} s: ${(res.blob.size / 1e6).toFixed(1)} MB, ${res.frames} frames, ${res.codec.startsWith('avc') ? 'H.264' : 'VP9'}${res.hasAudio ? ' + audio' : ''}.`;
     setExportUI('done');
@@ -680,6 +755,7 @@ $('btnExportGo').onclick = async () => {
     console.error(e); $('exportMsg').textContent = 'Export failed: ' + (e.message || e); setExportUI('error');
   }
   exportAbort = null;
+  await resume();
 };
 $('exportSheet').addEventListener('click', e => { if (e.target === $('exportSheet') && !exportAbort) $('exportSheet').classList.remove('open'); });
 $('btnSave').onclick = () => exportResult && download(exportResult.blob, exportResult.name);
@@ -696,4 +772,4 @@ updateSpeedInfo();
 if (!('VideoDecoder' in window)) toast('This browser lacks WebCodecs. Use Chrome on Android/desktop.', 8000);
 window.addEventListener('resize', () => updateReticle());
 if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
-window.__macrocut = { state, loadFile, recompute }; // debugging / tests
+window.__macrocut = { state, loadFile, recompute, setStabOn, setSpeed }; // debugging / tests

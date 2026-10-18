@@ -17,7 +17,7 @@ async def main():
             d1 = await pg.evaluate('window.__macrocut.state.draws||0'); t1 = await pg.evaluate('document.getElementById("video").currentTime')
             print(f'{label}: video advanced {t1-t0:.2f}s, draws {d1-d0}')
         await playfor('before analysis')
-        await pg.click('.dock-item[data-tab="tab-stab"]'); await pg.click('#btnAnalyse')
+        await pg.click('.dock-item[data-tab="tab-stab"]'); await pg.click('#stabOn + .knob')
         await pg.wait_for_function('window.__macrocut.state.analysis && !window.__macrocut.state.analysing', timeout=300000)
         await playfor('after analysis')
         await pg.click('#btnCompare'); print('compare on:', await pg.evaluate('window.__macrocut.state.compare'))

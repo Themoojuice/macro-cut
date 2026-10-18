@@ -6,7 +6,7 @@
   <meta name="theme-color" content="#0b0d10" />
   <title>MacroCut</title>
   <link rel="manifest" href="manifest.json" />
-  <link rel="stylesheet" href="css/app.css?v=4" />
+  <link rel="stylesheet" href="css/app.css?v=5" />
   <script src="vendor/mp4box.all.min.js"></script>
   <script src="vendor/mp4-muxer.js"></script>
 </head>
@@ -71,32 +71,39 @@
 
     <!-- STABILISE -->
     <div class="tab-pane" id="tab-stab">
-      <div class="control-row">
-        <button class="btn-primary" id="btnAnalyse" style="flex:1;padding:10px">⚡ Analyse motion</button>
+      <label class="big-switch">
+        <input type="checkbox" id="stabOn" />
+        <span class="knob"></span>
+        <span class="big-switch-text"><b>Stabilise</b><span id="stabSub">Off</span></span>
+      </label>
+      <div class="pill-group" id="stabLevel">
+        <button class="pill-btn" data-level="mild">Mild</button>
+        <button class="pill-btn active" data-level="medium">Medium</button>
+        <button class="pill-btn" data-level="max">Max</button>
       </div>
-      <div class="graph-wrap" id="graphWrap" style="display:none">
-        <canvas id="motionGraph" width="800" height="150"></canvas>
-        <div id="graphHead"></div>
-        <div class="graph-legend"><span style="color:#8b95a5">— your shaky camera</span><span style="color:var(--accent)">— stabilised path</span><span>↔ horizontal · ↕ vertical</span></div>
-      </div>
-      <div class="stat" id="stabStatus">Not analysed yet. Analysis tracks hundreds of points at sub-pixel accuracy; ~1–3× clip length on a phone.</div>
-      <div class="pill-group" id="stabMode">
-        <button class="pill-btn active" data-mode="smooth">〰️ Smooth</button>
-        <button class="pill-btn" data-mode="lock">📌 Tripod lock</button>
-        <button class="pill-btn" data-mode="off">Off</button>
-      </div>
-      <div class="control-row"><div class="control-label">Smoothing <b id="v-sigma"></b></div><input type="range" id="sigma" min="0.1" max="3" step="0.05" /></div>
-      <div class="control-row"><div class="control-label">Max crop <b id="v-maxCrop"></b></div><input type="range" id="maxCrop" min="0" max="0.5" step="0.01" /></div>
-      <div class="control-row">
-        <label class="toggle"><input type="checkbox" id="stabRot" /> Fix rotation</label>
-        <label class="toggle"><input type="checkbox" id="stabZoom" /> Fix focus breathing</label>
-      </div>
-      <div class="section-label">Track</div>
-      <div class="pill-group" id="roiMode">
-        <button class="pill-btn active" data-roi="all">Whole frame</button>
-        <button class="pill-btn" data-roi="tap">🎯 Tap a spot</button>
-      </div>
-      <div class="hint">Tripod lock pins the view (best when the spood sits still). Smooth keeps intentional moves and removes heartbeat/tremor. If the spider walks and the frame chases it, use <b>Tap a spot</b> on the substrate and re-analyse.</div>
+      <div class="hint" id="levelDesc"></div>
+      <div class="stat" id="stabStatus"></div>
+      <details id="stabMore">
+        <summary>More options</summary>
+        <div class="more-body">
+          <div class="graph-wrap" id="graphWrap" style="display:none">
+            <canvas id="motionGraph" width="800" height="150"></canvas>
+            <div id="graphHead"></div>
+            <div class="graph-legend"><span style="color:#8b95a5">— your hand's movement</span><span style="color:var(--accent)">— the steadied version</span></div>
+          </div>
+          <div class="control-row"><div class="control-label">Zoom-in allowed <b id="v-maxCrop"></b></div><input type="range" id="maxCrop" min="0.05" max="0.5" step="0.01" /></div>
+          <div class="hint">Steadying works by zooming in slightly and moving the picture against the shake. More zoom = steadier, but a little less sharp.</div>
+          <label class="toggle"><input type="checkbox" id="stabRot" /> Fix tilting (camera twisting in your hand)</label>
+          <label class="toggle"><input type="checkbox" id="stabZoom" /> Fix zoom wobble (picture pulsing as focus shifts)</label>
+          <div class="section-label">Keep steady</div>
+          <div class="pill-group" id="roiMode">
+            <button class="pill-btn active" data-roi="all">The whole picture</button>
+            <button class="pill-btn" data-roi="tap">🎯 A spot I tap</button>
+          </div>
+          <div class="hint">If the spider walks and the picture chases it, choose <b>A spot I tap</b> and tap the leaf next to it.</div>
+          <button class="btn-ghost" id="btnAnalyse">Re-measure shake</button>
+        </div>
+      </details>
     </div>
 
     <!-- FRAME -->
@@ -126,16 +133,19 @@
         <button class="pill-btn" data-preset="pop">Spood pop</button>
         <button class="pill-btn" data-preset="off">Off</button>
       </div>
+      <div class="hint">Double-tap any slider to reset it.</div>
       <div id="lookSliders" style="display:flex;flex-direction:column;gap:6px"></div>
     </div>
 
     <!-- SPEED -->
     <div class="tab-pane" id="tab-speed">
+      <div class="control-row"><div class="control-label">Speed <b id="v-speed"></b></div><input type="range" id="speed" min="0.1" max="2" step="0.05" /></div>
       <div class="pill-group" id="speedGroup">
-        <button class="pill-btn active" data-speed="1">1×</button>
-        <button class="pill-btn" data-speed="0.5">½×</button>
         <button class="pill-btn" data-speed="0.25">¼×</button>
-        <button class="pill-btn" data-speed="0.125">⅛×</button>
+        <button class="pill-btn" data-speed="0.5">½×</button>
+        <button class="pill-btn" data-speed="0.75">¾×</button>
+        <button class="pill-btn active" data-speed="1">Normal</button>
+        <button class="pill-btn" data-speed="2">2×</button>
       </div>
       <div class="stat" id="speedInfo"></div>
     </div>
@@ -161,7 +171,7 @@
           <button class="pill-btn" data-fps="30">30</button>
           <button class="pill-btn" data-fps="60">60</button>
         </div>
-        <label class="toggle"><input type="checkbox" id="expAudio" /> Keep audio (1× speed only)</label>
+        <label class="toggle"><input type="checkbox" id="expAudio" /> Keep sound (only at normal speed)</label>
         <div class="hint" id="exportSummary"></div>
       </div>
       <div id="exportProgress" style="display:none;flex-direction:column;gap:8px">
@@ -178,6 +188,6 @@
   </div>
 
   <video id="video" playsinline muted preload="auto" style="position:fixed;left:-9999px;top:-9999px;width:2px;height:2px;opacity:0;pointer-events:none"></video>
-  <script type="module" src="js/app.js?v=4"></script>
+  <script type="module" src="js/app.js?v=5"></script>
 </body>
 </html>
