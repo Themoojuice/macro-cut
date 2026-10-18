@@ -113,7 +113,10 @@ export function detectFeatures(img, w, h, maxN = 160, mask = null, margin = 12, 
       if (dx * dx + dy * dy > (rect ? 9 : 36)) best.push([s2, i2]);
     }
   }
-  const floor = Math.max(150, 0.02 * maxScore);
+  // Robust threshold: relative to the typical cell, not the single strongest point
+  // (a specular catch-light in a spider's eye would otherwise wipe out all substrate texture).
+  const med = best.map(b => b[0]).sort((a, b) => a - b)[best.length >> 1] || 0;
+  const floor = Math.max(150, 0.1 * med, 0.002 * maxScore);
   const sel = best.filter(b => b[0] > floor).sort((a, b) => b[0] - a[0]).slice(0, maxN);
   const out = new Float32Array(sel.length * 2);
   sel.forEach(([, i], k) => { out[2 * k] = i % w; out[2 * k + 1] = (i / w) | 0; });
@@ -308,7 +311,7 @@ export class MotionTracker {
     const m = this._mask(C);
     const feats = detectFeatures(pyr[0].d, this.w, this.h, this.maxFeatures, m, 12, m ? m.rect : null);
     const tpl = makeTemplates(pyr, feats, this.half);
-    return { pyr, C, feats, tpl, n0: 0, Q: IDENT.slice() };
+    return { pyr, C, feats, tpl, n0: 0, Q: IDENT.slice(), sharp: frameSharpness(pyr[1].d, pyr[1].w, pyr[1].h) };
   }
 
   _estimate(key, pyr, guessM) {
@@ -327,45 +330,110 @@ export class MotionTracker {
     return fit;
   }
 
+  // Wide translation search at the coarsest pyramid level (used only to re-acquire after a failure).
+  _globalGuess(key, pyr, guessM) {
+    const L = Math.min(key.pyr.length, pyr.length) - 1, sc = 1 << L;
+    const A = key.pyr[L], B = pyr[L], R = 14;
+    const pts = [];
+    for (let y = 4; y < A.h - 4; y += 2) for (let x = 4; x < A.w - 4; x += 2) {
+      const [qx, qy] = apply(guessM, x * sc, y * sc);
+      pts.push(x, y, qx / sc, qy / sc);
+    }
+    let best = Infinity, bx = 0, by = 0;
+    for (let dy = -R; dy <= R; dy++) for (let dx = -R; dx <= R; dx++) {
+      let sad = 0, n = 0, sd = 0;
+      for (let i = 0; i < pts.length; i += 4) {
+        const qx = pts[i + 2] + dx, qy = pts[i + 3] + dy;
+        if (qx < 0 || qy < 0 || qx > B.w - 1.001 || qy > B.h - 1.001) continue;
+        const d = bilin(B.d, B.w, B.h, qx, qy) - A.d[pts[i + 1] * A.w + pts[i]];
+        sd += d; sad += Math.abs(d); n++;
+      }
+      if (n < pts.length / 16) continue;
+      const score = (sad - Math.abs(sd)) / n; // brightness-offset tolerant
+      if (score < best) { best = score; bx = dx; by = dy; }
+    }
+    return [guessM[0], guessM[1], guessM[2] + bx * sc, guessM[3] + by * sc];
+  }
+
   // gray: Float32Array w*h. Returns { C, ok, inliers, rekey }
   push(gray) {
     const pyr = buildPyramid(gray, this.w, this.h, this.levels);
-    const k = this.frame++;
+    this.frame++;
     if (!this.kf) {
       this.kf = this._makeKey(pyr, IDENT.slice());
       this.kf.n0 = this.kf.feats.length / 2;
-      this.prev = { pyr, C: IDENT.slice() };
-      return { C: IDENT.slice(), ok: true, inliers: this.kf.n0, rekey: true, nFeat: this.kf.n0 };
+      this.prev = { pyr, C: IDENT.slice(), ok: true };
+      this.fails = 0;
+      return { C: IDENT.slice(), ok: true, inliers: this.kf.n0, rekey: true };
     }
     const kf = this.kf;
     let C = null, ok = false, inliers = 0, Q = null;
     const minIn = Math.max(10, Math.round(0.35 * kf.n0));
-    const fit = this._estimate(kf, pyr, kf.Q);
-    if (fit && fit.inliers >= minIn) {
+    const good = f => f && f.inliers >= minIn;
+    let fit = this._estimate(kf, pyr, kf.Q);
+    if (!good(fit) && kf.n0 >= 12) fit = this._estimate(kf, pyr, this._globalGuess(kf, pyr, kf.Q)) || fit;
+    if (good(fit)) {
       Q = fit.M; inliers = fit.inliers; ok = true;
       C = compose(kf.C, invert(pixToNorm(Q, this.w, this.h)));
-    } else {
-      // frame-to-frame fallback from previous frame
+    } else if (this.prev.ok) {
+      // frame-to-frame fallback, only from a frame we trust
       const pk = this._makeKey(this.prev.pyr, this.prev.C);
       const f2 = this._estimate(pk, pyr, IDENT);
-      if (f2 && f2.inliers >= 8) {
+      if (f2 && f2.inliers >= Math.max(8, 0.35 * pk.feats.length / 2)) {
         C = compose(this.prev.C, invert(pixToNorm(f2.M, this.w, this.h)));
         ok = true; inliers = f2.inliers;
-      } else {
-        C = this.prev.C.slice(); ok = false; inliers = f2 ? f2.inliers : 0;
       }
     }
-    // re-key?
-    let rekey = !Q;
-    if (Q) {
-      const p = toParams(Q);
-      if (inliers < 0.6 * kf.n0 || Math.abs(p.th) > 0.06 || Math.abs(p.ls) > 0.05) rekey = true;
-      kf.Q = Q;
+    let rekey = false;
+    if (ok) {
+      this.fails = 0;
+      if (Q) {
+        const p = toParams(Q);
+        rekey = inliers < 0.6 * kf.n0 || Math.abs(p.th) > 0.06 || Math.abs(p.ls) > 0.05;
+        kf.Q = Q;
+      } else rekey = true;
+    } else {
+      // Lost (blur, occlusion). Keep the last good keyframe so we can re-acquire against it;
+      // only give up on it if it was poor or we've been lost for a long time.
+      this.fails++;
+      C = this.prev.C.slice();
+      if (kf.n0 < 12 || this.fails > 90) rekey = true;
     }
-    if (rekey) { this.kf = this._makeKey(pyr, C); this.kf.n0 = this.kf.feats.length / 2; }
-    this.prev = { pyr, C };
+    if (rekey) {
+      const cand = this._makeKey(pyr, C); cand.n0 = cand.feats.length / 2;
+      // Never swap a good anchor for a blurrier/emptier frame: during focus loss we keep the
+      // last sharp anchor and re-acquire against it when focus returns.
+      const kfBad = kf.n0 < 12;
+      const candOk = cand.n0 >= Math.max(12, 0.3 * kf.n0) && cand.sharp >= 0.65 * kf.sharp;
+      if ((kfBad && cand.n0 > kf.n0) || candOk || (this.fails > 90 && cand.n0 >= 12)) this.kf = cand;
+      else rekey = false;
+    }
+    this.prev = { pyr, C, ok };
     return { C, ok, inliers, rekey };
   }
+}
+
+// ───────────────────────── gap filling ─────────────────────────
+// Replace camera estimates on failed frames by interpolating (in θ, log-scale, x, y) between good neighbours.
+export function fillGaps(C, ok, times) {
+  const N = C.length, out = C.map(m => m.slice());
+  let i = 0;
+  while (i < N) {
+    if (ok[i]) { i++; continue; }
+    let j = i; while (j < N && !ok[j]) j++;
+    const L = i - 1, R = j < N ? j : -1;
+    for (let k = i; k < j; k++) {
+      if (L < 0 && R < 0) break;
+      if (L < 0) { out[k] = C[R].slice(); continue; }
+      if (R < 0) { out[k] = C[L].slice(); continue; }
+      const u = (times[k] - times[L]) / Math.max(1e-9, times[R] - times[L]);
+      const a = toParams(C[L]), b = toParams(C[R]);
+      let dth = b.th - a.th; while (dth > Math.PI) dth -= 2 * Math.PI; while (dth < -Math.PI) dth += 2 * Math.PI;
+      out[k] = fromParams(a.th + u * dth, a.ls + u * (b.ls - a.ls), a.x + u * (b.x - a.x), a.y + u * (b.y - a.y));
+    }
+    i = j;
+  }
+  return out;
 }
 
 // ───────────────────────── path smoothing + auto crop ─────────────────────────
@@ -376,6 +444,33 @@ function unwrap(arr) {
     while (d < -Math.PI) { arr[i] += 2 * Math.PI; d += 2 * Math.PI; }
   }
   return arr;
+}
+
+function medianStep(times) {
+  const d = []; for (let i = 1; i < times.length; i++) d.push(times[i] - times[i - 1]);
+  d.sort((a, b) => a - b); return d.length ? Math.max(1e-4, d[d.length >> 1]) : 1 / 30;
+}
+
+// O(N) Gaussian approximation: three box passes (σ in frames), optional mask weights on the first pass.
+export function boxSmooth3(vals, sigma, mask) {
+  const n = vals.length;
+  const r = Math.max(0, Math.round((Math.sqrt(4 * sigma * sigma + 1) - 1) / 2));
+  if (!r || n < 2) return Float64Array.from(vals);
+  const pv = new Float64Array(n + 1), pw = new Float64Array(n + 1);
+  let cur = Float64Array.from(vals);
+  for (let pass = 0; pass < 3; pass++) {
+    for (let i = 0; i < n; i++) {
+      const w = pass === 0 && mask ? (mask[i] ? 1 : 0) : 1;
+      pv[i + 1] = pv[i] + cur[i] * w; pw[i + 1] = pw[i] + w;
+    }
+    const out = new Float64Array(n);
+    for (let i = 0; i < n; i++) {
+      const a = Math.max(0, i - r), b = Math.min(n, i + r + 1), ws = pw[b] - pw[a];
+      out[i] = ws > 0 ? (pv[b] - pv[a]) / ws : cur[i];
+    }
+    cur = out;
+  }
+  return cur;
 }
 
 function gaussSmooth(vals, times, sigma, mask) {
@@ -438,70 +533,70 @@ export function computeStabilisation(o) {
   const zFloor = Math.max(o.zoomUser || 1, zFrame);
   const W = new Array(N);
   const haveStab = !!(o.C && o.C.length === N);
-  let C = null, S = null;
+  let Z = zFloor, adjusted = 0, touching = 0, paths = null;
   if (haveStab) {
-    C = o.C;
-    const th = unwrap(Float64Array.from(C, m => Math.atan2(m[1], m[0])));
-    const ls = Float64Array.from(C, m => Math.log(Math.hypot(m[0], m[1])));
-    const xs = Float64Array.from(C, m => m[2]), ys = Float64Array.from(C, m => m[3]);
+    const C = o.C;
+    const P = [unwrap(Float64Array.from(C, m => Math.atan2(m[1], m[0]))),
+      Float64Array.from(C, m => Math.log(Math.hypot(m[0], m[1]))),
+      Float64Array.from(C, m => m[2]), Float64Array.from(C, m => m[3])];
     const mask = o.kept && o.kept.some(v => v) ? o.kept : null;
-    let sth, sls, sx, sy;
-    if (o.mode === 'lock') {
-      const mean = a => { let s = 0, c = 0; for (let i = 0; i < N; i++) if (!mask || mask[i]) { s += a[i]; c++; } return s / Math.max(1, c); };
-      const f = (a) => new Float64Array(N).fill(mean(a));
-      sth = f(th); sls = f(ls); sx = f(xs); sy = f(ys);
-    } else {
-      const sg = Math.max(0.02, o.sigma || 0.6);
-      sth = gaussSmooth(th, o.times, sg, mask); sls = gaussSmooth(ls, o.times, sg, mask);
-      sx = gaussSmooth(xs, o.times, sg, mask); sy = gaussSmooth(ys, o.times, sg, mask);
-    }
+    const dt = medianStep(o.times);
+    const lock = o.mode === 'lock';
     const st = o.strength == null ? 1 : o.strength;
-    S = new Array(N);
-    for (let i = 0; i < N; i++) {
-      const pth = o.rotation === false ? th[i] : th[i] + st * (sth[i] - th[i]);
-      const pls = o.zoom === false ? ls[i] : ls[i] + st * (sls[i] - ls[i]);
-      S[i] = [pth, pls, xs[i] + st * (sx[i] - xs[i]), ys[i] + st * (sy[i] - ys[i]), th[i], ls[i]];
-    }
-  }
-  const warpAt = (i, alpha) => {
-    if (!haveStab) return IDENT;
-    const s = S[i], c = C[i];
-    const Sk = fromParams(s[4] + alpha * (s[0] - s[4]), s[5] + alpha * (s[1] - s[5]),
-      c[2] + alpha * (s[2] - c[2]), c[3] + alpha * (s[3] - c[3]));
-    return compose(invert(c), Sk);
-  };
-  let Z = zFloor, limited = 0;
-  if (haveStab) {
+    const active = [o.rotation !== false, o.zoom !== false, true, true];
+    // Ladder of smoothing strengths, strongest first. Where the crop budget can't cover the strongest,
+    // we fall back to weaker low-pass for those moments only: slow drift is followed, jitter still removed.
+    const sig = Math.max(0.05, o.sigma || 0.8);
+    const ladder = lock ? [Infinity, 4, 2, 1, 0.5, 0.25, 0.12, 0.06] : [];
+    if (!lock) { for (let x = sig; x > 0.05; x *= 0.6) ladder.push(x); ladder.push(0.04); }
+    const mkPath = (sg) => P.map((arr, c) => {
+      if (!active[c]) return Float64Array.from(arr);
+      let sm;
+      if (sg === Infinity) { let t = 0, n = 0; for (let i = 0; i < N; i++) if (!mask || mask[i]) { t += arr[i]; n++; } sm = new Float64Array(N).fill(t / Math.max(1, n)); }
+      else sm = boxSmooth3(arr, sg / dt, mask);
+      return Float64Array.from(arr, (v, i) => v + st * (sm[i] - v));
+    });
+    const L = [mkPath(ladder[0])];
+    const warp = (i, Sx) => compose(invert(C[i]), fromParams(Sx[0][i], Sx[1][i], Sx[2][i], Sx[3][i]));
     const zMax = zFloor * (1 + Math.max(0, o.maxCrop ?? 0.2));
     let need = 0;
-    const needs = new Float64Array(N);
-    for (let i = 0; i < N; i++) {
-      W[i] = warpAt(i, 1); needs[i] = needZoom(W[i], fr);
-      if (!o.kept || o.kept[i]) need = Math.max(need, needs[i]);
-    }
+    for (let i = 0; i < N; i++) if (!o.kept || o.kept[i]) need = Math.max(need, needZoom(warp(i, L[0]), fr));
     Z = Math.min(Math.max(need, zFloor), zMax);
-    // per-frame correction strength alpha so every frame fits at Z
-    const alpha = new Float64Array(N).fill(1);
-    for (let i = 0; i < N; i++) {
-      if (needs[i] <= Z * 1.0001) continue;
-      let lo = 0, hi = 1;
-      for (let it = 0; it < 18; it++) { const m = (lo + hi) / 2; if (needZoom(warpAt(i, m), fr) <= Z) lo = m; else hi = m; }
-      alpha[i] = lo;
+    let S = L[0].map(a => Float64Array.from(a));
+    if (need > Z * 1.0001) {
+      // feasible level per frame (0 = strongest smoothing)
+      const nL = ladder.length, feas = new Float64Array(N);
+      for (let j = 1; j < nL; j++) L.push(mkPath(ladder[j]));
+      for (let i = 0; i < N; i++) {
+        let j = 0;
+        while (j < nL - 1 && needZoom(warp(i, L[j]), fr) > Z) j++;
+        feas[i] = (o.kept && !o.kept[i]) ? 0 : j;
+      }
+      // spread + ease the level changes in time so the switch itself is invisible
+      const win = Math.max(1, Math.round(0.4 / dt)), dil = new Float64Array(N);
+      for (let i = 0; i < N; i++) { let m = 0; for (let k = Math.max(0, i - win); k <= Math.min(N - 1, i + win); k++) m = Math.max(m, feas[k]); dil[i] = m; }
+      const lvS = boxSmooth3(dil, 0.2 / dt, null);
+      for (let i = 0; i < N; i++) {
+        const lv = Math.min(nL - 1, Math.max(lvS[i], feas[i]));
+        const j0 = Math.floor(lv), j1 = Math.min(nL - 1, j0 + 1), u = lv - j0;
+        for (let c = 0; c < 4; c++) S[c][i] = L[j0][c][i] + u * (L[j1][c][i] - L[j0][c][i]);
+        if (lv > 1e-3) adjusted++;
+      }
+      // last resort: frames that still don't fit (even light smoothing) get pulled toward the raw camera
+      for (let i = 0; i < N; i++) {
+        if ((o.kept && !o.kept[i]) || needZoom(warp(i, S), fr) <= Z * 1.0001) continue;
+        const keep = S.map(a => a[i]); let lo = 0, hi = 1;
+        for (let it = 0; it < 16; it++) {
+          const m = (lo + hi) / 2;
+          for (let c = 0; c < 4; c++) S[c][i] = P[c][i] + m * (keep[c] - P[c][i]);
+          if (needZoom(warp(i, S), fr) <= Z) lo = m; else hi = m;
+        }
+        for (let c = 0; c < 4; c++) S[c][i] = P[c][i] + lo * (keep[c] - P[c][i]);
+        touching++;
+      }
     }
-    // smooth the release: erode (min) then gaussian, never exceeding the per-frame limit
-    const win = 0.25;
-    const er = new Float64Array(N);
-    let lo = 0;
-    for (let i = 0; i < N; i++) {
-      while (o.times[lo] < o.times[i] - win) lo++;
-      let m = 1; for (let j = lo; j < N && o.times[j] <= o.times[i] + win; j++) m = Math.min(m, alpha[j]);
-      er[i] = m;
-    }
-    const sm = gaussSmooth(er, o.times, 0.12, null);
-    for (let i = 0; i < N; i++) {
-      const a = Math.min(sm[i], alpha[i]);
-      if (a < 0.999) { limited++; W[i] = warpAt(i, a); }
-    }
+    for (let i = 0; i < N; i++) W[i] = warp(i, S);
+    paths = { rx: P[2], ry: P[3], sx: S[2], sy: S[3], rth: P[0], sth: S[0] };
   }
   const c = Math.cos(fr.rot), s = Math.sin(fr.rot), k = fr.base / Z;
   const F = [k * c, k * s, fr.panX, fr.panY];
@@ -509,7 +604,7 @@ export function computeStabilisation(o) {
     const m = compose(haveStab ? W[i] : IDENT, F);
     M[4 * i] = m[0]; M[4 * i + 1] = m[1]; M[4 * i + 2] = m[2]; M[4 * i + 3] = m[3];
   }
-  return { M, Z, zFloor, cropPct: (1 - 1 / Z) * 100, limitedFrames: limited };
+  return { M, Z, zFloor, cropPct: (1 - 1 / Z) * 100, limitedFrames: adjusted, touchingFrames: touching, paths };
 }
 
 // Clamp a pan so that the un-stabilised view fits at zoom z.

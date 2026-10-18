@@ -1,8 +1,8 @@
 // Analysis (motion tracking) and export (frame-accurate WebCodecs render → MP4).
 /* global Mp4Muxer */
-import { decodeRange } from './media.js';
+import { decodeRange, WindowReader } from './media.js';
 import { Downscaler, Renderer } from './gpu.js';
-import { MotionTracker, frameSharpness, frameAt } from './core.js';
+import { MotionTracker, frameSharpness, frameAt, fillGaps } from './core.js';
 
 export function frameInfo(clip, f) {
   const odd = (clip.rotation / 90) & 1;
@@ -31,6 +31,7 @@ export async function analyseClip(clip, { roi = null, onProgress = () => {}, sig
   const C = new Array(N).fill(null), ok = new Uint8Array(N), sharp = new Float32Array(N), inl = new Uint16Array(N);
   const gray = new Float32Array(w * h);
   let done = 0, last = performance.now();
+  try {
   await decodeRange(clip, {
     signal,
     onFrame: async f => {
@@ -45,10 +46,12 @@ export async function analyseClip(clip, { roi = null, onProgress = () => {}, sig
       if (performance.now() - last > 120) { last = performance.now(); onProgress(done / N); await tick(); }
     },
   });
+  } finally { ds.dispose(); }
   if (signal && signal.aborted) return null;
   // any frame the decoder never produced: hold previous camera
-  for (let i = 0; i < N; i++) if (!C[i]) C[i] = i ? C[i - 1].slice() : [1, 0, 0, 0];
-  return { C, ok, sharp, inliers: inl, w, h };
+  for (let i = 0; i < N; i++) if (!C[i]) { C[i] = i ? C[i - 1].slice() : [1, 0, 0, 0]; ok[i] = 0; }
+  // camera over blurred / lost frames is interpolated between the good frames either side
+  return { C: fillGaps(C, ok, clip.times), ok, sharp, inliers: inl, w, h };
 }
 
 // Output timeline: which source frame feeds each output tick.
@@ -125,6 +128,7 @@ export async function exportClip(clip, plan, { onProgress = () => {}, signal } =
   clip.times.forEach((t, i) => tsIndex.set(Math.round(t * 1e6), i));
   let emitted = 0, last = performance.now();
   const keyEvery = Math.max(1, Math.round(fps * 2));
+  try {
   await decodeRange(clip, {
     fromUs, toUs, signal,
     onFrame: async f => {
@@ -147,6 +151,8 @@ export async function exportClip(clip, plan, { onProgress = () => {}, signal } =
       if (performance.now() - last > 150) { last = performance.now(); onProgress(emitted / ticks.length); await tick(); }
     },
   });
+  } catch (e) { if (encoder.state !== 'closed') encoder.close(); R.dispose(); throw e; }
+  R.dispose();
   if (signal && signal.aborted) { encoder.close(); return null; }
   await encoder.flush();
   if (encErr) throw encErr;
@@ -154,6 +160,7 @@ export async function exportClip(clip, plan, { onProgress = () => {}, signal } =
 
   if (withAudio) {
     let outT = 0, first = true;
+    const areader = new WindowReader(clip.file, 4 << 20);
     const meta = { decoderConfig: { codec: A.codec, sampleRate: A.sampleRate, numberOfChannels: A.channels, description: A.description } };
     for (const seg of plan.segments) {
       const s0 = seg.start * 1e6, s1 = seg.end * 1e6;
@@ -162,7 +169,7 @@ export async function exportClip(clip, plan, { onProgress = () => {}, signal } =
         if (s.ts < s0 || s.ts + s.dur > s1) continue;
         const ts = Math.round(outT * 1e6 + (s.ts - s0));
         if (ts <= lastTs) continue;
-        muxer.addAudioChunkRaw(new Uint8Array(clip.buf, s.offset, s.size), 'key', ts, s.dur, first ? meta : undefined);
+        muxer.addAudioChunkRaw((await areader.read(s.offset, s.size)).slice(), 'key', ts, s.dur, first ? meta : undefined);
         first = false; lastTs = ts;
       }
       outT += seg.end - seg.start;

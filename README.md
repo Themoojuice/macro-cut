@@ -9,8 +9,10 @@ A phone-first video editor for handheld macro footage (jumping spiders, mostly).
 | Step | How |
 |---|---|
 | **Stabilise** | Every frame is decoded exactly (WebCodecs, no seeking), downscaled on the GPU, and ~180 corner features are tracked with pyramidal Lucas–Kanade at sub-pixel accuracy. A robust (RANSAC) similarity fit gives shift **+ rotation + scale** (focus breathing) per frame. Frames are matched against a keyframe rather than chained frame-to-frame, so the path doesn't drift. |
-| **Smooth / Tripod lock** | *Smooth* low-passes the camera path (Gaussian, adjustable window) to keep intentional moves and remove heartbeat and tremor. *Tripod lock* pins the view. |
-| **Auto-crop** | Picks the smallest zoom that never shows black edges, up to your *Max crop*. Frames that would exceed it get proportionally less correction, eased in and out. |
+| **Smooth / Tripod lock** | *Smooth* low-passes the camera path (adjustable window) to keep intentional moves and remove heartbeat and tremor. *Tripod lock* pins the view. |
+| **Auto-crop** | Picks the smallest zoom that never shows black edges, up to your *Max crop*. Where the shake needs more than that, it switches (smoothly, in time) to lighter smoothing for just those moments, so slow drift is followed but tremor is still removed. |
+| **Focus loss** | Blurred frames keep the last sharp anchor; tracking re-acquires the moment focus returns, and the camera is interpolated across the gap. |
+| **Motion graph** | After analysis, the Stabilise tab plots your raw camera path (grey) against the stabilised one (teal). |
 | **Tap a spot** | Track a chosen region (e.g. the leaf) instead of the dominant motion, for when the spider walks. |
 | **Frame** | Fine rotation, 90° turns, zoom, drag-to-pan, pinch/twist, aspect presets (9:16, 4:5, 1:1, 16:9). |
 | **Look** | Bicubic warp → AMD-style contrast-adaptive sharpening + halo-limited micro-detail (unsharp at adjustable radius, weighted to in-focus areas) + bokeh smoothing in out-of-focus areas → grading in OKLab (exposure, contrast, shadows, highlights, saturation, vibrance, warmth, tint). |
@@ -21,14 +23,14 @@ A phone-first video editor for handheld macro footage (jumping spiders, mostly).
 
 1. Open a clip (MP4/MOV, H.264 or HEVC; Chrome on Android or desktop).
 2. **Trim**: cut out the blurry bits (the focus strip appears after analysis).
-3. **Stabilise → Analyse motion**, then pick Smooth or Tripod lock. Hold **❖** to compare with the original.
+3. **Stabilise → Analyse motion**. It applies automatically (the chip on the video says STABILISED). Pick Smooth or Tripod lock. Tap **❖** to flip before/after, or hold it to peek.
 4. **Frame**, **Look**, **Speed** as wanted. Settings are remembered.
 5. **Export → Render MP4 → Save/Share.**
 
 ## Limits
 
 - Needs WebCodecs + WebGL2 (Chrome/Edge). Not Firefox or older Safari.
-- The whole file is held in memory: very long 4K clips can run a phone out of RAM. Trim on the phone first if that happens.
+- Slow-motion from a 25/30 fps source repeats frames (no frame interpolation): shoot 60/120 fps for smooth slow-mo.
 - Fragmented MP4 isn't supported (phone camera files are fine).
 - HDR (10-bit) footage is converted to SDR without tone-mapping control.
 - Rolling-shutter wobble isn't corrected (the model is a rigid similarity).
@@ -46,4 +48,4 @@ vendor/                   mp4box.js (BSD-3), mp4-muxer (MIT)
 test/                     synthetic shaky-clip generator, Node + headless-browser tests
 ```
 
-Tests: `python3 test/make_synth.py /tmp/s 640 360 150 30` (add `3` as a 6th argument for 3× shake), then `python3 -c "import numpy as np; np.load('/tmp/s.npy').mean(-1).astype('uint8').tofile('/tmp/s.gray')"` and `node test/core.test.mjs /tmp/s`. `test/e2e.py` drives the real app in headless Chromium, and `test/measure.py` scores any video's residual shake with OpenCV.
+Tests: `test/make_hard.py` builds a realistic hard case (big wander, walking spider, focus-loss spans), `test/score.mjs` scores tracking and jitter against ground truth, `test/features.py` measures every control on exported files. Older: `python3 test/make_synth.py /tmp/s 640 360 150 30` (add `3` as a 6th argument for 3× shake), then `python3 -c "import numpy as np; np.load('/tmp/s.npy').mean(-1).astype('uint8').tofile('/tmp/s.gray')"` and `node test/core.test.mjs /tmp/s`. `test/e2e.py` drives the real app in headless Chromium, and `test/measure.py` scores any video's residual shake with OpenCV.

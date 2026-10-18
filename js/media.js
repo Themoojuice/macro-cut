@@ -24,9 +24,44 @@ export function matrixRotation(m) {
   return ((Math.round(deg / 90) * 90) % 360 + 360) % 360;
 }
 
+// Sliding-window reader: sequential decode only ever holds ~16 MB of the file in memory.
+export class WindowReader {
+  constructor(file, win = 16 << 20) { this.file = file; this.win = win; this.start = 0; this.buf = null; }
+  async read(off, len) {
+    if (!this.buf || off < this.start || off + len > this.start + this.buf.length) {
+      const end = Math.min(this.file.size, off + Math.max(this.win, len));
+      this.buf = new Uint8Array(await this.file.slice(off, end).arrayBuffer());
+      this.start = off;
+    }
+    return this.buf.subarray(off - this.start, off - this.start + len);
+  }
+}
+
+async function bytes(file, off, len) { return new Uint8Array(await file.slice(off, off + len).arrayBuffer()); }
+
+// Walk top-level boxes; return ftyp + moov bytes only (sample data stays on disk).
+async function readHeader(file) {
+  let off = 0, ftyp = null, moov = null, frag = false;
+  while (off + 8 <= file.size) {
+    const h = await bytes(file, off, 16), dv = new DataView(h.buffer);
+    let size = dv.getUint32(0); const type = String.fromCharCode(h[4], h[5], h[6], h[7]);
+    if (size === 1) size = Number(dv.getBigUint64(8)); else if (size === 0) size = file.size - off;
+    if (size < 8) break;
+    if (type === 'ftyp') ftyp = await bytes(file, off, size);
+    else if (type === 'moov') moov = await bytes(file, off, size);
+    else if (type === 'moof') frag = true;
+    off += size;
+  }
+  if (!moov) throw new Error(frag ? 'Fragmented MP4 is not supported yet.' : 'Not an MP4/MOV file I can read (no movie header found).');
+  const out = new Uint8Array((ftyp ? ftyp.length : 0) + moov.length);
+  if (ftyp) out.set(ftyp, 0);
+  out.set(moov, ftyp ? ftyp.length : 0);
+  return out.buffer;
+}
+
 export async function openClip(file, onStatus = () => {}) {
-  onStatus('Reading file…');
-  const buf = await file.arrayBuffer();
+  onStatus('Reading header…');
+  const buf = await readHeader(file);
   onStatus('Parsing container…');
   const mp4 = MP4Box.createFile();
   const info = await new Promise((resolve, reject) => {
@@ -82,14 +117,14 @@ export async function openClip(file, onStatus = () => {}) {
   }
   const duration = times[times.length - 1] + (iv.length ? iv[iv.length >> 1] : 1 / 30);
   return {
-    file, buf, codec, decoderConfig, samples, times, fps, rotation,
+    file, reader: new WindowReader(file), codec, decoderConfig, samples, times, fps, rotation,
     codedW, codedH, dispW, dispH, duration, audio,
     name: file.name,
   };
 }
 
-export function chunkFor(clip, s) {
-  return new EncodedVideoChunk({ type: s.key ? 'key' : 'delta', timestamp: s.ts, duration: s.dur, data: new Uint8Array(clip.buf, s.offset, s.size) });
+export async function chunkFor(clip, s, reader = clip.reader) {
+  return new EncodedVideoChunk({ type: s.key ? 'key' : 'delta', timestamp: s.ts, duration: s.dur, data: await reader.read(s.offset, s.size) });
 }
 
 /**
@@ -113,6 +148,7 @@ export async function decodeRange(clip, { fromUs = 0, toUs = Infinity, onFrame, 
   });
   dec.addEventListener('dequeue', poke);
   dec.configure(clip.decoderConfig);
+  const reader = new WindowReader(clip.file); // own window: decodes may run alongside each other
   let i = start, flushed = false;
   const drain = async () => {
     while (pending.length) {
@@ -128,7 +164,7 @@ export async function decodeRange(clip, { fromUs = 0, toUs = Infinity, onFrame, 
       if (signal && signal.aborted) break;
       if (pending.length) { await drain(); continue; }
       if (i <= end) {
-        if (dec.decodeQueueSize < 4 && pending.length < maxQueue) { dec.decode(chunkFor(clip, S[i++])); continue; }
+        if (dec.decodeQueueSize < 4 && pending.length < maxQueue) { const ch = await chunkFor(clip, S[i++], reader); if (dec.state === 'configured') dec.decode(ch); continue; }
       } else if (!flushed) {
         flushed = true;
         await dec.flush();

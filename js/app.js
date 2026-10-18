@@ -96,7 +96,7 @@ function recompute() {
   renderer.setSize(pw, ph);
   state.plan = computeStabilisation(planOpts(true));
   state.planRaw = computeStabilisation(planOpts(false));
-  updateStabStatus();
+  updateStabStatus(); updateStabChip(); drawMotionGraph();
   planDirty = false;
 }
 function invalidate() { planDirty = true; requestDraw(); }
@@ -113,6 +113,7 @@ function currentM() {
 }
 function draw() {
   if (!state.clip || !renderer || !renderer.srcInfo) return;
+  state.draws = (state.draws || 0) + 1;
   if (planDirty) recompute();
   const [, eh] = exportDims();
   renderer.render(currentM(), state.look, { raw: state.compare, pxScale: renderer.size[1] / eh });
@@ -169,6 +170,7 @@ async function detectPreviewOrientation(clip) {
     let ref = null;
     await decodeRange(clip, { fromUs: 0, toUs: 0, onFrame: f => { if (!ref) ref = ds.grab(f, frameInfo(clip, f)).slice(); f.close(); } });
     const a = ds.grab(video, disp).slice(), b = ds.grab(video, alt).slice();
+    ds.dispose();
     return corr(a, ref) >= corr(b, ref) ? disp : alt;
   } catch (e) { console.warn('orientation probe failed', e); return disp; }
 }
@@ -181,20 +183,34 @@ function uploadVideo() {
   renderer.upload(video, state.previewInfo, scale > 1.25);
 }
 
-// frame callbacks (preview)
+// frame callbacks (preview). Re-arm first and never let an exception break the chain.
+const hasRVFC = 'requestVideoFrameCallback' in HTMLVideoElement.prototype;
+let lastFrameAt = 0;
+function showFrame(t) {
+  state.mediaTime = t; lastFrameAt = performance.now();
+  try { uploadVideo(); draw(); updatePlayhead(); if (state.playing) checkSegmentBounds(); }
+  catch (e) { console.error('preview frame failed', e); }
+}
 function onVideoFrame(now, meta) {
-  state.mediaTime = meta.mediaTime;
-  uploadVideo(); draw(); updatePlayhead();
-  if (state.playing) checkSegmentBounds();
   video.requestVideoFrameCallback(onVideoFrame);
+  showFrame(meta.mediaTime);
 }
-if ('requestVideoFrameCallback' in HTMLVideoElement.prototype) video.requestVideoFrameCallback(onVideoFrame);
-else {
-  const loop = () => { state.mediaTime = video.currentTime; if (state.clip) { uploadVideo(); draw(); updatePlayhead(); if (state.playing) checkSegmentBounds(); } requestAnimationFrame(loop); };
-  requestAnimationFrame(loop);
-}
-video.addEventListener('seeked', () => {
-  if (!state.playing) { state.mediaTime = video.currentTime; uploadVideo(); draw(); updatePlayhead(); }
+if (hasRVFC) video.requestVideoFrameCallback(onVideoFrame);
+// Watchdog: if frame callbacks stall (decoder hiccup, background tab, older browsers) keep drawing anyway.
+(function watchdog() {
+  if (state.clip && state.playing && video.readyState >= 2 && (!hasRVFC || performance.now() - lastFrameAt > 250)) showFrame(video.currentTime);
+  requestAnimationFrame(watchdog);
+})();
+video.addEventListener('seeked', () => { if (!state.playing) showFrame(video.currentTime); });
+let waitTimer = null;
+video.addEventListener('waiting', () => { clearTimeout(waitTimer); waitTimer = setTimeout(() => { if (state.playing && video.readyState < 3) toast('Buffering…', 1200); }, 700); });
+video.addEventListener('playing', () => clearTimeout(waitTimer));
+
+// GPU context loss (phones do this under memory pressure): rebuild the preview renderer.
+view.addEventListener('webglcontextlost', e => { e.preventDefault(); toast('Graphics reset, recovering…', 1500); });
+view.addEventListener('webglcontextrestored', () => {
+  try { renderer = new Renderer(view); if (state.clip) { renderer.setSize(...previewDims()); planDirty = true; showFrame(video.currentTime); } }
+  catch (e) { toast('Graphics failed to recover, reload the page: ' + e.message, 6000); }
 });
 
 function seek(t) {
@@ -216,7 +232,7 @@ function play() {
   const t = video.currentTime;
   if (!state.segments.some(s => t >= s.start && t < s.end - 0.05)) video.currentTime = state.segments[0].start;
   video.playbackRate = state.speed;
-  video.play().catch(() => {});
+  video.play().catch(e => { state.playing = false; $('btnPlay').textContent = '▶'; toast('Playback blocked: ' + e.message, 3000); });
   state.playing = true; $('btnPlay').textContent = '⏸';
   const tickLoop = () => { if (!state.playing) return; checkSegmentBounds(); requestAnimationFrame(tickLoop); };
   requestAnimationFrame(tickLoop);
@@ -238,16 +254,32 @@ $('btnMute').onclick = () => {
   $('muteIcon').textContent = state.muted ? '🔇' : '🔊'; $('muteLabel').textContent = state.muted ? 'Muted' : 'Audio';
 };
 const cmp = $('btnCompare');
-const setCompare = v => { state.compare = v; cmp.classList.toggle('held', v); $('compareTag').style.display = v ? 'block' : 'none'; draw(); };
-cmp.addEventListener('pointerdown', e => { e.preventDefault(); setCompare(true); });
-window.addEventListener('pointerup', () => { if (state.compare) setCompare(false); });
-window.addEventListener('pointercancel', () => { if (state.compare) setCompare(false); });
+const setCompare = v => { state.compare = v; cmp.classList.toggle('held', v); updateStabChip(); draw(); };
+// tap = toggle before/after, press-and-hold = peek at the original while held
+let cmpDown = 0, cmpWas = false;
+cmp.addEventListener('pointerdown', e => { e.preventDefault(); cmpDown = performance.now(); cmpWas = state.compare; setCompare(true); });
+const cmpUp = () => {
+  if (!cmpDown) return;
+  const held = performance.now() - cmpDown > 350; cmpDown = 0;
+  setCompare(held ? false : !cmpWas);
+};
+window.addEventListener('pointerup', cmpUp);
+window.addEventListener('pointercancel', cmpUp);
+function updateStabChip() {
+  const tag = $('compareTag');
+  if (!state.clip) { tag.style.display = 'none'; return; }
+  const stab = state.analysis && state.stab.mode !== 'off';
+  tag.style.display = 'block';
+  tag.className = 'compare-tag' + (state.compare ? '' : stab ? ' on' : '');
+  tag.textContent = state.compare ? 'ORIGINAL' : stab ? `STABILISED · ${state.stab.mode === 'lock' ? 'TRIPOD' : 'SMOOTH'}` : 'NOT STABILISED';
+}
 
 // ───────────── timeline ─────────────
 const segEl = $('segments'), track = $('track'), playhead = $('playhead');
 function updatePlayhead() {
   if (!state.clip) return;
-  playhead.style.left = `${Math.max(0, Math.min(100, (state.mediaTime / state.clip.duration) * 100))}%`;
+  const pct = `${Math.max(0, Math.min(100, (state.mediaTime / state.clip.duration) * 100))}%`;
+  playhead.style.left = pct; $('graphHead').style.left = pct;
   $('curTime').textContent = fmt(state.mediaTime);
 }
 function renderSegments() {
@@ -309,6 +341,30 @@ $('btnDelete').onclick = () => {
   seek(state.segments[state.sel].start); renderSegments(); invalidate();
 };
 $('btnResetCuts').onclick = () => { if (!state.clip) return; state.segments = [{ start: 0, end: state.clip.duration }]; state.sel = 0; renderSegments(); invalidate(); };
+
+// Raw vs stabilised camera path (horizontal + vertical), so you can see what the analysis found.
+function drawMotionGraph() {
+  const wrap = $('graphWrap'), p = state.plan && state.plan.paths;
+  if (!p || !state.clip) { wrap.style.display = 'none'; return; }
+  wrap.style.display = '';
+  const c = $('motionGraph'), x = c.getContext('2d'), W = c.width, H = c.height, T = state.clip.times, D = state.clip.duration;
+  x.clearRect(0, 0, W, H);
+  const rows = [[p.rx, p.sx], [p.ry, p.sy]];
+  rows.forEach(([raw, sm], r) => {
+    const top = r * H / 2, hh = H / 2;
+    let lo = Infinity, hi = -Infinity;
+    for (let i = 0; i < raw.length; i++) { lo = Math.min(lo, raw[i], sm[i]); hi = Math.max(hi, raw[i], sm[i]); }
+    const span = Math.max(hi - lo, 0.01), Y = v => top + 4 + (1 - (v - lo) / span) * (hh - 8);
+    const line = (arr, col, w) => {
+      x.beginPath(); x.strokeStyle = col; x.lineWidth = w;
+      for (let i = 0; i < arr.length; i++) { const px = T[i] / D * W, py = Y(arr[i]); i ? x.lineTo(px, py) : x.moveTo(px, py); }
+      x.stroke();
+    };
+    line(raw, '#6b7585', 1.5); line(sm, '#00d2d3', 2.5);
+    x.fillStyle = '#8b95a5'; x.font = '18px sans-serif'; x.fillText(r ? '↕' : '↔', 6, top + 22);
+  });
+  x.strokeStyle = '#232934'; x.beginPath(); x.moveTo(0, H / 2); x.lineTo(W, H / 2); x.stroke();
+}
 
 function clearHeatmap() { const c = $('heatmap'); c.getContext('2d').clearRect(0, 0, c.width, c.height); }
 function drawHeatmap() {
@@ -376,8 +432,10 @@ function updateStabStatus() {
   const parts = [`<span class="good">Tracked ${a.ok.length - weak}/${a.ok.length} frames</span>`];
   if (weak) parts.push(`<span class="warn">${weak} weak (blur/no texture)</span>`);
   if (state.stab.mode !== 'off') {
+    parts.unshift('<b>✓ Applied to preview & export</b>');
     parts.push(`crop ${p.cropPct.toFixed(0)}%`);
-    if (p.limitedFrames) parts.push(`<span class="warn">${p.limitedFrames} frames hit the crop limit, raise Max crop</span>`);
+    const pct = Math.round(100 * p.limitedFrames / a.ok.length);
+    if (pct > 0) parts.push(`<span class="warn">lighter smoothing on ${pct}% of frames to fit the crop. Raise Max crop for steadier</span>`);
   } else parts.push('stabilisation off');
   if (state.stab.roi) parts.push('tracking tapped spot');
   el.innerHTML = parts.join(' · ');
@@ -399,11 +457,13 @@ $('btnAnalyse').onclick = async () => {
       state.analysis = res;
       if (state.stab.mode === 'off') { state.stab.mode = 'smooth'; pills('stabMode', 'mode', 'smooth'); }
       drawHeatmap();
-      toast(`Analysed in ${((performance.now() - t0) / 1000).toFixed(1)} s, hold ❖ to compare`, 2600);
+      toast(`✓ Stabilisation applied (${((performance.now() - t0) / 1000).toFixed(0)} s). Press ▶ to watch, tap ❖ for before/after`, 4000);
+      // re-prime the <video> decoder (it may have been parked while the analysis decoder ran)
+      try { video.currentTime = Math.max(0, state.mediaTime); } catch (e) { /* ignore */ }
     }
   } catch (e) { console.error(e); toast('Analysis failed: ' + e.message, 5000); }
   state.analysing = null; btn.textContent = '⚡ Re-analyse motion'; progress(null);
-  invalidate(); updateStabStatus();
+  invalidate(); updateStabStatus(); updateStabChip(); drawMotionGraph();
 };
 
 // ───────────── frame controls + gestures ─────────────
