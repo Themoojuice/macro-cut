@@ -35,7 +35,8 @@ async def main():
         await (await dl.value).save_as(OUT + '.mp4')
         await pg.click('#btnExportCancel')
         # still
-        async with pg.expect_download() as dl: await pg.click('#btnStill')
+        await pg.click('#btnStill')
+        async with pg.expect_download() as dl: await pg.click('#btnThisFrame')
         await (await dl.value).save_as(OUT + '_still.png')
         print('errors', errs[:8]); await b.close()
 asyncio.run(main())

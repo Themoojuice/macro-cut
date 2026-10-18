@@ -1,6 +1,6 @@
 import { openClip, decodeRange, withTimeout } from './media.js';
 import { Renderer, DEFAULT_LOOK } from './gpu.js';
-import { computeStabilisation, clampPan, frameAt } from './core.js';
+import { computeStabilisation, clampPan, frameAt, suggestCuts } from './core.js';
 import { analyseClip, exportClip, frameInfo } from './engine.js';
 
 const $ = id => document.getElementById(id);
@@ -149,7 +149,8 @@ async function loadFile(file) {
     video.removeAttribute('src'); video.load();
     const clip = await openClip(file, msg => toast(msg));
     state.analysis = null; state.stab.roi = null; state.stab.on = false;
-    state.segments = [{ start: 0, end: clip.duration }]; state.sel = 0;
+    state.segments = [{ start: 0, end: clip.duration }]; state.sel = 0; clearUndo();
+    $('shotsGrid').innerHTML = ''; $('btnShotsSaveAll').style.display = 'none';
     state.frame = { aspect: 'native', rot: 0, quarter: 0, zoom: 1, panX: 0, panY: 0 };
     // 1. reference thumbnail from the decoder (only needed for rotated or HDR clips), before <video> exists
     let probe = null;
@@ -223,6 +224,17 @@ function matchPreview(clip, ref) {
   } catch (e) { console.warn('preview match failed', e); return base; }
   finally { R.dispose(); }
 }
+
+// Keep the screen on during long jobs: a sleeping phone pauses the page and can kill an export.
+let wakeLock = null, wakeWanted = 0;
+async function acquireWake() { try { if (navigator.wakeLock && !wakeLock) { wakeLock = await navigator.wakeLock.request('screen'); wakeLock.addEventListener('release', () => { wakeLock = null; }); } } catch (e) { /* not allowed */ } }
+async function keepAwake() {
+  wakeWanted++; await acquireWake();
+  return () => { wakeWanted = Math.max(0, wakeWanted - 1); if (!wakeWanted && wakeLock) { wakeLock.release().catch(() => {}); wakeLock = null; } };
+}
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && wakeWanted) { acquireWake(); toast('Still working. Keep MacroCut open on screen until it finishes', 3000); }
+});
 
 // Free the preview's hardware decoder while analysis/export decode the file, then bring it back.
 async function parkVideo() {
@@ -393,14 +405,15 @@ $('btnSplit').onclick = () => {
   if (i < 0) return toast('Move the playhead inside a segment first', 1800);
   const s = state.segments[i];
   state.segments.splice(i, 1, { start: s.start, end: t }, { start: t, end: s.end });
-  state.sel = i + 1; renderSegments(); invalidate();
+  state.sel = i + 1; renderSegments(); invalidate(); clearUndo();
 };
 $('btnDelete').onclick = () => {
   if (state.segments.length <= 1) return toast('Split first, then delete the bad piece', 1800);
   state.segments.splice(state.sel, 1); state.sel = Math.max(0, state.sel - 1);
-  seek(state.segments[state.sel].start); renderSegments(); invalidate();
+  seek(state.segments[state.sel].start); renderSegments(); invalidate(); clearUndo();
 };
-$('btnResetCuts').onclick = () => { if (!state.clip) return; state.segments = [{ start: 0, end: state.clip.duration }]; state.sel = 0; renderSegments(); invalidate(); };
+$('btnResetCuts').onclick = () => { if (!state.clip) return; state.segments = [{ start: 0, end: state.clip.duration }]; state.sel = 0; renderSegments(); invalidate(); clearUndo(); };
+function clearUndo() { undoSegs = null; $('btnAutoTrim').textContent = '✨ Cut out the blurry & searching bits'; }
 
 // Raw vs stabilised camera path (horizontal + vertical), so you can see what the analysis found.
 function drawMotionGraph() {
@@ -521,6 +534,7 @@ async function analyse() {
   el.innerHTML = 'Measuring the shake… <a href="#" id="cancelAnalyse">cancel</a>';
   $('cancelAnalyse').onclick = ev => { ev.preventDefault(); ac.abort(); };
   const resume = await parkVideo();
+  const awake = await keepAwake();
   try {
     const res = await analyseClip(state.clip, {
       roi: state.stab.roi, signal: ac.signal,
@@ -528,13 +542,13 @@ async function analyse() {
     });
     if (res) {
       state.analysis = res; drawHeatmap();
-      toast(`✓ Steadied (${((performance.now() - t0) / 1000).toFixed(0)} s). Tap ❖ to compare before/after`, 3500);
+      toast(state.stab.on ? `✓ Steadied (${((performance.now() - t0) / 1000).toFixed(0)} s). Tap ❖ to compare before/after` : `✓ Clip measured (${((performance.now() - t0) / 1000).toFixed(0)} s)`, 3500);
     } else if (state.stab.on && !state.analysis) { state.stab.on = false; }
   } catch (e) {
     console.error(e); toast('Couldn\'t measure the shake: ' + e.message, 6000);
     if (!state.analysis) state.stab.on = false;
   }
-  state.analysing = null; progress(null);
+  state.analysing = null; progress(null); awake();
   syncControls(); invalidate(); updateStabChip(); drawMotionGraph();
   await resume();
 }
@@ -664,10 +678,11 @@ const pick = () => { $('fileInput').value = ''; $('fileInput').click(); };
 $('btnOpen').onclick = pick; $('btnOpen2').onclick = pick;
 $('fileInput').onchange = e => loadFile(e.target.files && e.target.files[0]);
 
-// ───────────── still ─────────────
-$('btnStill').onclick = async () => {
-  if (!state.clip) return;
-  pause();
+// ───────────── stills ─────────────
+$('btnStill').onclick = () => { if (!state.clip) return; pause(); $('shotsSheet').classList.add('open'); };
+$('btnShotsClose').onclick = () => { if (!shotsBusy) $('shotsSheet').classList.remove('open'); };
+$('shotsSheet').addEventListener('click', e => { if (e.target === $('shotsSheet') && !shotsBusy) $('shotsSheet').classList.remove('open'); });
+$('btnThisFrame').onclick = async () => {
   const [w, h] = outputDims(4320);
   const c = typeof OffscreenCanvas !== 'undefined' ? new OffscreenCanvas(w, h) : Object.assign(document.createElement('canvas'), { width: w, height: h });
   const R = new Renderer(c); R.setSize(w, h);
@@ -675,9 +690,99 @@ $('btnStill').onclick = async () => {
   R.upload(video, state.previewInfo, Math.hypot(m[0], m[1]) * state.previewInfo.dispH / h > 1.25);
   R.render(m, state.look, { pxScale: 1, raw: state.compare });
   const blob = c.convertToBlob ? await c.convertToBlob({ type: 'image/png' }) : await new Promise(r => c.toBlob(r, 'image/png'));
+  R.dispose();
   download(blob, `MacroCut_${stem()}_${fmt(state.mediaTime).replace(/[:.]/g, '-')}.png`);
-  toast(`Saved ${w}×${h} PNG`, 1800);
+  toast(`Saved ${w}×${h} still`, 1800);
 };
+
+// Wait for (or start) the shake/focus measurement that several tools rely on.
+async function ensureAnalysis(why) {
+  if (state.analysis) return true;
+  if (!state.analysing) { toast(why, 2500); analyse(); }
+  while (state.analysing) await new Promise(r => setTimeout(r, 200));
+  return !!state.analysis;
+}
+
+// Find the sharpest, well-separated moments and render them as full-resolution stills.
+let shotsBusy = false, shots = [];
+$('btnFindBest').onclick = async () => {
+  if (shotsBusy || !state.clip) return;
+  shotsBusy = true; $('btnShotsSaveAll').style.display = 'none';
+  const grid = $('shotsGrid'), msg = $('shotsMsg');
+  grid.innerHTML = ''; shots = [];
+  try {
+    msg.textContent = 'Measuring focus across the clip first…';
+    if (!await ensureAnalysis('Measuring focus across the clip…')) { msg.textContent = 'Couldn\'t measure the clip.'; return; }
+    if (planDirty) recompute();
+    const c = state.clip, a = state.analysis, kept = keptMask(), T = c.times;
+    const total = state.segments.reduce((x, sg) => x + sg.end - sg.start, 0);
+    const gap = Math.max(0.6, total / 12);
+    const cand = [...T.keys()].filter(i => kept[i]).sort((i, j) => a.sharp[j] - a.sharp[i]);
+    const picks = [];
+    for (const i of cand) { if (picks.every(j => Math.abs(T[i] - T[j]) >= gap)) picks.push(i); if (picks.length === 6) break; }
+    picks.sort((i, j) => i - j);
+    const [w, h] = outputDims(4320);
+    const cv = typeof OffscreenCanvas !== 'undefined' ? new OffscreenCanvas(w, h) : Object.assign(document.createElement('canvas'), { width: w, height: h });
+    const resume = await parkVideo(), awake = await keepAwake();
+    const R = new Renderer(cv); R.setSize(w, h);
+    try {
+      for (let n = 0; n < picks.length; n++) {
+        const i = picks[n], ts = Math.round(T[i] * 1e6);
+        msg.textContent = `Rendering sharpest shots… ${n + 1}/${picks.length}`;
+        let got = false;
+        await decodeRange(c, { fromUs: ts, toUs: ts, onFrame: f => {
+          if (!got && f.timestamp === ts) {
+            const info = frameInfo(c, f), m = state.plan.M.subarray(4 * i, 4 * i + 4);
+            R.upload(f, info, Math.hypot(m[0], m[1]) * info.dispH / h > 1.25); R.render(m, state.look, { pxScale: 1 }); got = true;
+          }
+          f.close();
+        } });
+        if (!got) continue;
+        const blob = cv.convertToBlob ? await cv.convertToBlob({ type: 'image/png' }) : await new Promise(r => cv.toBlob(r, 'image/png'));
+        const bmp = await createImageBitmap(cv, { resizeWidth: 360, resizeHeight: Math.round(360 * h / w), resizeQuality: 'high' });
+        const shot = { i, t: T[i], blob, name: `MacroCut_${stem()}_${fmt(T[i]).replace(/[:.]/g, '-')}.png` };
+        shots.push(shot);
+        const card = document.createElement('div'); card.className = 'shot';
+        const tc = document.createElement('canvas'); tc.width = bmp.width; tc.height = bmp.height; tc.getContext('2d').drawImage(bmp, 0, 0);
+        tc.title = 'Show this moment'; tc.onclick = () => { $('shotsSheet').classList.remove('open'); seek(shot.t + 0.0005); };
+        const row = document.createElement('div'); row.className = 'shot-row';
+        row.innerHTML = `<span>${fmt(shot.t)}</span>`;
+        const sv = document.createElement('button'); sv.textContent = 'Save'; sv.onclick = () => download(shot.blob, shot.name);
+        row.appendChild(sv); card.append(tc, row); grid.appendChild(card);
+      }
+    } finally { R.dispose(); awake(); await resume(); }
+    msg.textContent = shots.length ? `${shots.length} sharpest moments (${w}×${h}). Tap a picture to jump to it.` : 'No frames found.';
+    if (shots.length) $('btnShotsSaveAll').style.display = '';
+  } catch (e) { console.error(e); msg.textContent = 'Couldn\'t make the stills: ' + e.message; }
+  finally { shotsBusy = false; }
+};
+$('btnShotsSaveAll').onclick = async () => {
+  const files = shots.map(x => new File([x.blob], x.name, { type: 'image/png' }));
+  try { if (navigator.canShare && navigator.canShare({ files })) { await navigator.share({ files, title: 'MacroCut stills' }); return; } }
+  catch (e) { if (e.name === 'AbortError') return; }
+  for (const x of shots) { download(x.blob, x.name); await new Promise(r => setTimeout(r, 400)); }
+};
+
+// ───────────── auto-trim ─────────────
+let undoSegs = null;
+$('btnAutoTrim').onclick = async () => {
+  if (!state.clip) return;
+  const btn = $('btnAutoTrim');
+  if (undoSegs) {
+    state.segments = undoSegs; undoSegs = null; state.sel = 0;
+    btn.textContent = '✨ Cut out the blurry & searching bits'; renderSegments(); invalidate(); return;
+  }
+  pause();
+  if (!await ensureAnalysis('Measuring focus and camera movement first…')) return;
+  const a = state.analysis, T = state.clip.times;
+  const segs = suggestCuts(T, a.sharp, a.ok, a.C);
+  undoSegs = state.segments.map(x => ({ ...x }));
+  state.segments = segs; state.sel = 0; renderSegments(); invalidate(); seek(segs[0].start);
+  const kept = segs.reduce((x, sg) => x + sg.end - sg.start, 0);
+  btn.textContent = '↩ Undo auto-cut';
+  toast(`Kept the good ${kept.toFixed(1)} s of ${state.clip.duration.toFixed(1)} s (${segs.length} part${segs.length > 1 ? 's' : ''}). Adjust with the handles if you like.`, 4000);
+};
+
 const stem = () => (state.clip.name || 'clip').replace(/\.[^.]+$/, '');
 function download(blob, name) {
   const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = name;
@@ -738,6 +843,7 @@ $('btnExportGo').onclick = async () => {
   exportAbort = new AbortController();
   const t0 = performance.now();
   const resume = await parkVideo();
+  const awake = await keepAwake();
   try {
     if (planDirty) recompute();
     const res = await exportClip(state.clip, {
@@ -747,14 +853,14 @@ $('btnExportGo').onclick = async () => {
       signal: exportAbort.signal,
       onProgress: p => { $('exportBar').style.width = `${Math.round(p * 100)}%`; $('exportMsg').textContent = `Rendering ${w}×${h} @ ${fps} fps… ${Math.round(p * 100)}%`; },
     });
-    if (!res) { setExportUI('options'); exportAbort = null; await resume(); return; }
+    if (!res) { setExportUI('options'); exportAbort = null; awake(); await resume(); return; }
     exportResult = { blob: res.blob, name: `MacroCut_${stem()}.mp4` };
     $('exportMsg').textContent = `Done in ${((performance.now() - t0) / 1000).toFixed(0)} s: ${(res.blob.size / 1e6).toFixed(1)} MB, ${res.frames} frames, ${res.codec.startsWith('avc') ? 'H.264' : 'VP9'}${res.hasAudio ? ' + audio' : ''}.`;
     setExportUI('done');
   } catch (e) {
     console.error(e); $('exportMsg').textContent = 'Export failed: ' + (e.message || e); setExportUI('error');
   }
-  exportAbort = null;
+  exportAbort = null; awake();
   await resume();
 };
 $('exportSheet').addEventListener('click', e => { if (e.target === $('exportSheet') && !exportAbort) $('exportSheet').classList.remove('open'); });

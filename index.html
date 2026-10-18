@@ -6,7 +6,7 @@
   <meta name="theme-color" content="#0b0d10" />
   <title>MacroCut</title>
   <link rel="manifest" href="manifest.json" />
-  <link rel="stylesheet" href="css/app.css?v=5" />
+  <link rel="stylesheet" href="css/app.css?v=6" />
   <script src="vendor/mp4box.all.min.js"></script>
   <script src="vendor/mp4-muxer.js"></script>
 </head>
@@ -18,7 +18,7 @@
       <span class="badge-pill" id="metaBadge">No clip</span>
     </div>
     <div class="top-right">
-      <button class="icon-btn" id="btnStill" title="Save processed frame as PNG" disabled>📸</button>
+      <button class="icon-btn" id="btnStill" title="Stills: this frame or the sharpest shots" disabled>📸</button>
       <button class="btn-primary" id="btnExport" disabled>Export</button>
     </div>
   </div>
@@ -61,6 +61,7 @@
   <div class="controls-drawer">
     <!-- TRIM -->
     <div class="tab-pane active" id="tab-trim">
+      <button class="btn-primary" id="btnAutoTrim" style="padding:10px">✨ Cut out the blurry &amp; searching bits</button>
       <div class="pill-group">
         <button class="pill-btn" id="btnSplit">✂️ Split</button>
         <button class="pill-btn danger" id="btnDelete">🗑️ Delete</button>
@@ -159,6 +160,22 @@
     <button class="dock-item" data-tab="tab-speed"><span class="icon">🐢</span><span>Speed</span></button>
   </div>
 
+  <div class="sheet-backdrop" id="shotsSheet">
+    <div class="sheet">
+      <h2>Stills</h2>
+      <div class="pill-group">
+        <button class="pill-btn" id="btnThisFrame">Save this frame</button>
+        <button class="pill-btn active" id="btnFindBest">✨ Find the sharpest shots</button>
+      </div>
+      <div class="hint" id="shotsMsg">Full resolution, with your steadying, colour and sharpening applied. Great for iNaturalist.</div>
+      <div class="shots-grid" id="shotsGrid"></div>
+      <div class="row-end">
+        <button class="btn-ghost" id="btnShotsClose">Close</button>
+        <button class="btn-primary" id="btnShotsSaveAll" style="display:none">Save all</button>
+      </div>
+    </div>
+  </div>
+
   <div class="sheet-backdrop" id="exportSheet">
     <div class="sheet">
       <h2>Export</h2>
@@ -188,6 +205,6 @@
   </div>
 
   <video id="video" playsinline muted preload="auto" style="position:fixed;left:-9999px;top:-9999px;width:2px;height:2px;opacity:0;pointer-events:none"></video>
-  <script type="module" src="js/app.js?v=5"></script>
+  <script type="module" src="js/app.js?v=6"></script>
 </body>
 </html>

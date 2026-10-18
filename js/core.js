@@ -66,13 +66,14 @@ function bilin(d, w, h, x, y) {
 // ───────────────────────── features (Shi–Tomasi, grid-spread) ─────────────────────────
 // Expected min-eigenvalue score of pure sensor noise (5×5 window), from a robust noise estimate.
 function noiseFloor(img, w, h) {
-  const v = [];
-  for (let y = 2; y < h - 2; y += 3) for (let x = 2; x < w - 2; x += 3) {
-    const i = y * w + x;
-    v.push(Math.abs(4 * img[i] - img[i - 1] - img[i + 1] - img[i - w] - img[i + w]));
-  }
-  v.sort((a, b) => a - b);
-  const sigma = 1.4826 * v[v.length >> 1] / Math.sqrt(20);       // Laplacian of white noise has σ·√20
+  // median |Laplacian| in quarter-units for precision, via histogram
+  const med = histPercentile(add => {
+    for (let y = 2; y < h - 2; y += 3) for (let x = 2; x < w - 2; x += 3) {
+      const i = y * w + x;
+      add(4 * Math.abs(4 * img[i] - img[i - 1] - img[i + 1] - img[i - w] - img[i + w]));
+    }
+  }, 0.5) / 4;
+  const sigma = 1.4826 * med / Math.sqrt(20);                    // Laplacian of white noise has σ·√20
   return Math.max(12, 25 * 0.5 * sigma * sigma * 3);               // ~3× the noise-only score
 }
 // mask(x, y) → boolean (optional). Returns Float32Array [x0,y0,x1,y1,…] in level-0 pixels.
@@ -295,14 +296,24 @@ export function ransacSimilarity(S, D, idx, thr = 1.2, iters = 160, seed = 1, pr
 }
 
 // ───────────────────────── sharpness metric ─────────────────────────
+// High-percentile |Laplacian| (focus measure). Histogram percentile: O(n), no sorting.
+const _hist = new Uint32Array(1024);
+function histPercentile(fill, q) {
+  _hist.fill(0); let n = 0;
+  fill(v => { _hist[v > 1023 ? 1023 : v | 0]++; n++; });
+  const target = q * n; let c = 0;
+  for (let i = 0; i < 1024; i++) { c += _hist[i]; if (c >= target) return i; }
+  return 1023;
+}
 export function frameSharpness(g, w, h) {
-  const vals = [];
-  for (let y = 2; y < h - 2; y += 2) for (let x = 2 + (y & 2); x < w - 2; x += 3) {
-    const i = y * w + x;
-    vals.push(Math.abs(4 * g[i] - g[i - 1] - g[i + 1] - g[i - w] - g[i + w]));
-  }
-  vals.sort((a, b) => a - b);
-  return vals[Math.floor(vals.length * 0.97)] || 0;
+  // Laplacian on a 2×2-binned grid: real detail survives, per-pixel sensor noise averages out.
+  const W2 = w >> 1, H2 = h >> 1;
+  const b = (x, y) => { const i = 2 * y * w + 2 * x; return (g[i] + g[i + 1] + g[i + w] + g[i + w + 1]) * 0.25; };
+  return histPercentile(add => {
+    for (let y = 2; y < H2 - 2; y += 2) for (let x = 2 + (y & 2); x < W2 - 2; x += 2) {
+      add(4 * Math.abs(4 * b(x, y) - b(x - 1, y) - b(x + 1, y) - b(x, y - 1) - b(x, y + 1)));
+    }
+  }, 0.97) / 4;
 }
 
 // ───────────────────────── frame-to-world tracker ─────────────────────────
@@ -685,4 +696,38 @@ export function frameAt(times, t) {
   while (lo < hi) { const m = (lo + hi) >> 1; if (times[m] < t) lo = m + 1; else hi = m; }
   if (lo > 0 && Math.abs(times[lo - 1] - t) <= Math.abs(times[lo] - t)) return lo - 1;
   return lo;
+}
+
+// ───────────────────────── auto-trim suggestions ─────────────────────────
+// Keep the stretches that are in focus and not mid-sweep. Returns [{start, end}] (seconds).
+export function suggestCuts(times, sharp, ok, C, o = {}) {
+  const N = times.length; if (N < 3) return [{ start: 0, end: times[N - 1] || 0 }];
+  const dt = medianStep(times);
+  const sorted = Array.from(sharp).sort((a, b) => a - b), ref = sorted[Math.floor(0.85 * (N - 1))] || 1;
+  const blurFrac = o.blur ?? 0.4, minKeep = o.minKeep ?? 1.2, maxGap = o.maxGap ?? 0.6;
+  const speed = new Float64Array(N);
+  for (let k = 1; k < N; k++) speed[k] = Math.hypot(C[k][2] - C[k - 1][2], C[k][3] - C[k - 1][3]) / Math.max(1e-3, times[k] - times[k - 1]);
+  speed[0] = speed[1];
+  // a "sweep" is camera motion well above this clip's normal handheld following (frame-heights per second)
+  const medSpeed = Array.from(speed).sort((a, b) => a - b)[N >> 1];
+  const sweep = o.sweep ?? Math.max(1.2, 3 * medSpeed);
+  const spS = boxSmooth3(speed, 0.15 / dt, null);
+  const bad = new Float64Array(N);
+  for (let k = 0; k < N; k++) bad[k] = (!ok[k] || sharp[k] < blurFrac * ref || spS[k] > sweep) ? 1 : 0;
+  const badS = boxSmooth3(bad, 0.2 / dt, null);
+  let segs = [];
+  for (let k = 0; k < N;) {
+    if (badS[k] >= 0.5) { k++; continue; }
+    let j = k; while (j < N && badS[j] < 0.5) j++;
+    segs.push({ start: times[k], end: j < N ? times[j] : times[N - 1] + dt });
+    k = j;
+  }
+  // merge tiny gaps, drop tiny keeps
+  const merged = [];
+  for (const s of segs) {
+    const last = merged[merged.length - 1];
+    if (last && s.start - last.end < maxGap) last.end = s.end; else merged.push({ ...s });
+  }
+  segs = merged.filter(s => s.end - s.start >= minKeep);
+  return segs.length ? segs : [{ start: times[0], end: times[N - 1] + dt }];
 }

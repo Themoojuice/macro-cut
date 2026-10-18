@@ -273,6 +273,20 @@ export class Downscaler extends Base {
     for (let i = 0, j = 0; j < g.length; i += 4, j++) g[j] = this.px[i];
     return g;
   }
+  // Same as grab() but into a Uint8Array (compact, transferable to a worker).
+  grabBytes(source, info, out) {
+    const gl = this.gl;
+    this.upload(source, info, info.dispH / this.h > 2.5);
+    gl.useProgram(this.prog.p);
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, this.src);
+    gl.uniform1i(this.prog.u.u_src, 0);
+    gl.uniform2f(this.prog.u.u_out, this.w, this.h);
+    this.setOrient(this.prog, info);
+    this.draw(this.target.fb, this.w, this.h);
+    gl.readPixels(0, 0, this.w, this.h, gl.RGBA, gl.UNSIGNED_BYTE, this.px);
+    for (let i = 0, j = 0; j < out.length; i += 4, j++) out[j] = this.px[i];
+    return out;
+  }
 }
 
 export const DEFAULT_LOOK = Object.freeze({
