@@ -43,7 +43,6 @@
       flex-direction: column;
     }
 
-    /* TOP BAR (CapCut style) */
     .top-bar {
       height: 52px;
       padding: 0 12px;
@@ -103,7 +102,6 @@
       pointer-events: none;
     }
 
-    /* VIEWPORT CANVAS AREA */
     .viewport {
       flex: 1;
       position: relative;
@@ -134,11 +132,14 @@
       color: var(--text-muted);
       text-align: center;
       padding: 24px;
+      z-index: 10;
+      background: #050608;
     }
 
-    .empty-state label {
+    .empty-state button {
       background: var(--accent);
       color: #051617;
+      border: none;
       font-weight: 700;
       padding: 12px 22px;
       border-radius: 10px;
@@ -146,7 +147,6 @@
       cursor: pointer;
     }
 
-    /* Target Reticle for Mode 2 Subject Lock */
     #targetReticle {
       position: absolute;
       width: 44px;
@@ -157,6 +157,7 @@
       pointer-events: none;
       display: none;
       box-shadow: 0 0 12px rgba(0, 210, 211, 0.8);
+      z-index: 15;
     }
     #targetReticle::after {
       content: '';
@@ -175,7 +176,7 @@
       top: 12px;
       left: 50%;
       transform: translateX(-50%);
-      background: rgba(14, 18, 24, 0.9);
+      background: rgba(14, 18, 24, 0.92);
       border: 1px solid var(--accent);
       color: var(--text-main);
       padding: 6px 14px;
@@ -187,7 +188,6 @@
       white-space: nowrap;
     }
 
-    /* TRANSPORT BAR */
     .transport-bar {
       height: 40px;
       padding: 0 14px;
@@ -206,7 +206,6 @@
     }
     .timecode span { color: var(--text-main); font-weight: 600; }
 
-    /* TIMELINE & MULTI-SEGMENT TRACK */
     .timeline-section {
       height: 96px;
       background: var(--bg-panel);
@@ -292,7 +291,7 @@
     }
 
     .seg-handle {
-      width: 12px;
+      width: 14px;
       height: 100%;
       background: var(--text-main);
       display: flex;
@@ -331,7 +330,6 @@
       clip-path: polygon(0 0, 100% 0, 50% 100%);
     }
 
-    /* CONTROLS DRAWER */
     .controls-drawer {
       height: 195px;
       background: var(--bg-main);
@@ -395,7 +393,6 @@
       border-color: rgba(255, 71, 87, 0.35);
     }
 
-    /* BOTTOM NAVIGATION DOCK */
     .bottom-dock {
       height: 58px;
       background: var(--bg-panel);
@@ -429,8 +426,8 @@
   <!-- TOP HEADER BAR -->
   <div class="top-bar">
     <div class="top-left">
-      <label for="fileInput" class="icon-btn" title="Open Video">📂</label>
-      <input type="file" id="fileInput" accept="video/*" style="display:none" />
+      <button class="icon-btn" id="btnOpenTop" title="Open Video">📂</button>
+      <input type="file" id="fileInput" accept="video/*,.mp4,.mov,.webm,.mkv" style="display:none" />
       <span class="badge-pill" id="metaBadge">No Clip</span>
     </div>
     <div class="top-right">
@@ -441,7 +438,7 @@
 
   <!-- MAIN INTERACTIVE VIEWPORT -->
   <div class="viewport" id="viewport">
-    <div class="status-toast" id="statusToast">Analyzing Optical Flow...</div>
+    <div class="status-toast" id="statusToast">Ready</div>
     <canvas id="glCanvas" width="1280" height="720"></canvas>
     <div id="targetReticle"></div>
 
@@ -451,7 +448,7 @@
       <div style="font-size: 12px; max-width: 260px;">
         Zero-watermark 2D similarity stabilization, focus-masked CAS sharpening & OKLCH grading.
       </div>
-      <label for="fileInput">Select Macro Video</label>
+      <button type="button" id="btnOpenCenter">Select Macro Video</button>
     </div>
   </div>
 
@@ -587,18 +584,20 @@
     </button>
   </div>
 
-  <!-- Hidden source video element -->
-  <video id="srcVideo" playsinline crossorigin="anonymous" style="display:none;"></video>
+  <!-- Hidden source video element (no crossorigin attribute so local Android blobs never block) -->
+  <video id="srcVideo" playsinline webkit-playsinline preload="auto" style="position:fixed; top:-9999px; left:-9999px; width:1px; height:1px; opacity:0; pointer-events:none;"></video>
 
   <script>
     if ('serviceWorker' in navigator) {
-      navigator.serviceWorker.register('sw.js').catch(() => {});
+      navigator.serviceWorker.register('sw.js').then(reg => reg.update()).catch(() => {});
     }
 
-    // --- STATE ---
     const video = document.getElementById('srcVideo');
     const glCanvas = document.getElementById('glCanvas');
-    const gl = glCanvas.getContext('2d') ? null : glCanvas.getContext('webgl2', { preserveDrawingBuffer: true });
+
+    // FIXED: Directly initialize WebGL2 without calling getContext('2d') first!
+    const gl = glCanvas.getContext('webgl2', { preserveDrawingBuffer: true, alpha: false })
+            || glCanvas.getContext('webgl', { preserveDrawingBuffer: true, alpha: false });
 
     let duration = 0;
     let isPlaying = false;
@@ -606,37 +605,34 @@
     let compareRaw = false;
     let playbackRate = 1.0;
     let aspectMode = 'native';
+    let currentVideoURL = null;
 
-    // Multi-segment list: [{ start: 0, end: duration }]
     let segments = [];
     let selectedSegIdx = 0;
 
-    // Stabilization state
-    let stabMode = 'substrate'; // 'substrate' | 'subject'
+    let stabMode = 'substrate';
     let subjectTargetNorm = { x: 0.5, y: 0.5 };
-    let rawMotionVectors = []; // [{ t, dx, dy, da, sharpness }]
-    let smoothedTransforms = []; // [{ t, tx, ty, ta }]
+    let rawMotionVectors = [];
+    let smoothedTransforms = [];
     let isStabilized = false;
 
-    // Audio routing for export
     let audioCtx = null;
     let audioSource = null;
     let audioGain = null;
     let audioDest = null;
 
-    // --- WEBGL2 SHADER PIPELINE ---
-    const vsSource = `#version 300 es
-      in vec2 a_position;
-      in vec2 a_texCoord;
+    // --- SHADER SETUP (WebGL1 / WebGL2 compatible) ---
+    const vsSource = `
+      attribute vec2 a_position;
+      attribute vec2 a_texCoord;
       uniform vec2 u_translate;
       uniform float u_angle;
       uniform float u_scale;
       uniform vec2 u_aspectScale;
-      out vec2 v_texCoord;
+      varying vec2 v_texCoord;
 
       void main() {
         gl_Position = vec4(a_position, 0.0, 1.0);
-        // Center UV around (0.5, 0.5) for similarity transform
         vec2 uv = a_texCoord - 0.5;
         uv *= u_aspectScale;
         uv /= u_scale;
@@ -648,9 +644,9 @@
       }
     `;
 
-    const fsSource = `#version 300 es
+    const fsSource = `
       precision highp float;
-      in vec2 v_texCoord;
+      varying vec2 v_texCoord;
       uniform sampler2D u_image;
       uniform vec2 u_texSize;
       uniform float u_sharp;
@@ -658,8 +654,7 @@
       uniform float u_shadow;
       uniform float u_specular;
       uniform float u_denoise;
-      uniform bool u_rawMode;
-      out vec4 outColor;
+      uniform int u_rawMode;
 
       float luma(vec3 c) {
         return dot(c, vec3(0.299, 0.587, 0.114));
@@ -667,29 +662,26 @@
 
       void main() {
         vec2 uv = clamp(v_texCoord, 0.001, 0.999);
-        vec3 center = texture(u_image, uv).rgb;
-        if (u_rawMode) {
-          outColor = vec4(center, 1.0);
+        vec3 center = texture2D(u_image, uv).rgb;
+        if (u_rawMode == 1) {
+          gl_FragColor = vec4(center, 1.0);
           return;
         }
 
-        vec2 px = 1.0 / u_texSize;
-        vec3 n = texture(u_image, uv + vec2(0.0, -px.y)).rgb;
-        vec3 s = texture(u_image, uv + vec2(0.0,  px.y)).rgb;
-        vec3 e = texture(u_image, uv + vec2( px.x, 0.0)).rgb;
-        vec3 w = texture(u_image, uv + vec2(-px.x, 0.0)).rgb;
+        vec2 px = 1.0 / max(u_texSize, vec2(1.0));
+        vec3 n = texture2D(u_image, uv + vec2(0.0, -px.y)).rgb;
+        vec3 s = texture2D(u_image, uv + vec2(0.0,  px.y)).rgb;
+        vec3 e = texture2D(u_image, uv + vec2( px.x, 0.0)).rgb;
+        vec3 w = texture2D(u_image, uv + vec2(-px.x, 0.0)).rgb;
 
-        // 1. Local Focus-Gradient Mask (High-frequency energy detector)
         float lc = luma(center);
         float ln = luma(n), ls = luma(s), le = luma(e), lw = luma(w);
         float grad = abs(ln - ls) + abs(le - lw) + abs(4.0 * lc - (ln + ls + le + lw));
         float focusMask = smoothstep(0.015, 0.12, grad);
 
-        // 2. Inverse-Focus Bokeh Denoise (Smooths background grain, preserves sharp setae)
         vec3 meanCross = (n + s + e + w + center) * 0.2;
         vec3 col = mix(center, meanCross, u_denoise * (1.0 - focusMask) * 0.85);
 
-        // 3. Macro-CAS (Focus-Masked Contrast Adaptive Sharpening)
         vec3 minRGB = min(min(n, s), min(e, w));
         vec3 maxRGB = max(max(n, s), max(e, w));
         minRGB = min(minRGB, col);
@@ -701,7 +693,6 @@
         vec3 casCol = clamp((col + (n + s + e + w) * wgt) / (1.0 + 4.0 * wgt), 0.0, 1.0);
         col = mix(col, casCol, u_sharp * (0.25 + 0.75 * focusMask));
 
-        // 4. Shadow Lift & Specular Roll-off
         float lum = luma(col);
         if (u_shadow != 0.0) {
           float shadowMask = pow(1.0 - lum, 2.2);
@@ -712,7 +703,6 @@
           col = mix(col, col * 0.82, hiMask * u_specular);
         }
 
-        // 5. Perceptual Chroma / Iridescence Boost (Protects neutral whites & skin/bark)
         float maxC = max(col.r, max(col.g, col.b));
         float minC = min(col.r, min(col.g, col.b));
         float sat = maxC - minC;
@@ -720,7 +710,7 @@
         vec3 gray = vec3(luma(col));
         col = mix(gray, col, 1.0 + vibWeight * 1.35);
 
-        outColor = vec4(clamp(col, 0.0, 1.0), 1.0);
+        gl_FragColor = vec4(clamp(col, 0.0, 1.0), 1.0);
       }
     `;
 
@@ -728,6 +718,9 @@
       const sh = gl.createShader(type);
       gl.shaderSource(sh, src);
       gl.compileShader(sh);
+      if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
+        console.error(gl.getShaderInfoLog(sh));
+      }
       return sh;
     }
 
@@ -774,7 +767,7 @@
       rawMode: gl.getUniformLocation(prog, 'u_rawMode'),
     };
 
-    // --- UI & VIDEO LOADING ---
+    // --- UI & ROBUST MOBILE VIDEO LOADER ---
     const fileInput = document.getElementById('fileInput');
     const emptyState = document.getElementById('emptyState');
     const metaBadge = document.getElementById('metaBadge');
@@ -783,22 +776,55 @@
     const btnSaveStill = document.getElementById('btnSaveStill');
     const statusToast = document.getElementById('statusToast');
 
+    let toastTimer = null;
     function showToast(msg, ms = 0) {
+      if (toastTimer) clearTimeout(toastTimer);
       statusToast.textContent = msg;
       statusToast.style.display = 'block';
-      if (ms > 0) setTimeout(() => { statusToast.style.display = 'none'; }, ms);
+      if (ms > 0) {
+        toastTimer = setTimeout(() => { statusToast.style.display = 'none'; }, ms);
+      }
     }
 
-    fileInput.addEventListener('change', (e) => {
-      const file = e.target.files[0];
+    document.getElementById('btnOpenTop').addEventListener('click', () => {
+      fileInput.value = '';
+      fileInput.click();
+    });
+    document.getElementById('btnOpenCenter').addEventListener('click', () => {
+      fileInput.value = '';
+      fileInput.click();
+    });
+
+    fileInput.addEventListener('change', async (e) => {
+      const file = e.target.files && e.target.files[0];
       if (!file) return;
-      const url = URL.createObjectURL(file);
-      video.src = url;
+
+      showToast(`Loading ${file.name}...`);
+      emptyState.style.display = 'none';
+
+      if (currentVideoURL) URL.revokeObjectURL(currentVideoURL);
+      currentVideoURL = URL.createObjectURL(file);
+
+      video.pause();
+      isPlaying = false;
+      btnPlayPause.textContent = '▶';
+      video.src = currentVideoURL;
       video.load();
+
+      // Wake up mobile hardware decoder so frame 1 renders immediately
+      try {
+        video.muted = true;
+        await video.play();
+        video.pause();
+        video.muted = isMuted;
+        video.currentTime = 0.001;
+      } catch (err) {
+        video.muted = isMuted;
+      }
     });
 
     video.addEventListener('loadedmetadata', () => {
-      duration = video.duration;
+      duration = video.duration || 0.1;
       emptyState.style.display = 'none';
       btnPlayPause.disabled = false;
       btnExport.disabled = false;
@@ -816,12 +842,22 @@
 
       renderSegmentsUI();
       clearHeatmap();
-      video.currentTime = 0.001;
+      showToast('Clip Loaded!', 1500);
+    });
+
+    video.addEventListener('loadeddata', () => {
+      renderFrame();
+      updatePlayheadUI();
     });
 
     video.addEventListener('seeked', () => {
       renderFrame();
       updatePlayheadUI();
+    });
+
+    video.addEventListener('error', () => {
+      const code = video.error ? video.error.code : 'Unknown';
+      showToast(`Video Codec Error (${code}) — try standard MP4/H.264`, 4500);
     });
 
     function updateCanvasAspect() {
@@ -871,7 +907,6 @@
           renderSegmentsUI();
         });
 
-        // Handle dragging for start/end trim
         setupHandleDrag(hLeft, idx, true);
         setupHandleDrag(hRight, idx, false);
 
@@ -910,7 +945,6 @@
       });
     }
 
-    // Scrubbing timeline
     timelineTrack.addEventListener('pointerdown', (ev) => {
       if (!duration) return;
       const rect = timelineTrack.getBoundingClientRect();
@@ -929,7 +963,6 @@
       window.addEventListener('pointerup', onUp);
     });
 
-    // Split & Delete Segment Buttons
     document.getElementById('btnSplitSeg').addEventListener('click', () => {
       if (!duration) return;
       const t = video.currentTime;
@@ -1008,33 +1041,31 @@
 
       const w = analysisCanvas.width;
       const h = analysisCanvas.height;
-      const dt = 1 / 30; // 30Hz analysis grid
+      const dt = 1 / 24;
       rawMotionVectors = [];
 
       let prevGray = null;
       let targetPos = { x: Math.round(subjectTargetNorm.x * w), y: Math.round(subjectTargetNorm.y * h) };
-      let cumX = 0, cumY = 0, cumA = 0;
+      let cumX = 0, cumY = 0;
 
-      const totalSteps = Math.floor(duration / dt);
       let stepIdx = 0;
-
       for (let t = 0; t < duration; t += dt) {
         stepIdx++;
-        if (stepIdx % 10 === 0) {
+        if (stepIdx % 6 === 0) {
           showToast(`Pass 1 Optical Analysis: ${Math.round((t / duration) * 100)}%`);
           await new Promise(r => setTimeout(r, 0));
         }
 
-        // Only analyze frames inside kept segments (huge speedup!)
         const inSeg = segments.some(s => t >= s.start - 0.05 && t <= s.end + 0.05);
         if (!inSeg && prevGray) {
-          rawMotionVectors.push({ t, cx: cumX, cy: cumY, ca: cumA, sharp: 0 });
+          rawMotionVectors.push({ t, cx: cumX, cy: cumY, sharp: 0 });
           continue;
         }
 
         video.currentTime = t;
         await new Promise(res => {
-          const hnd = () => { video.removeEventListener('seeked', hnd); res(); };
+          const timeout = setTimeout(res, 250);
+          const hnd = () => { clearTimeout(timeout); video.removeEventListener('seeked', hnd); res(); };
           video.addEventListener('seeked', hnd);
         });
 
@@ -1045,7 +1076,6 @@
           gray[j] = 0.299 * imgData[i] + 0.587 * imgData[i+1] + 0.114 * imgData[i+2];
         }
 
-        // Compute spatial focus energy map (Laplacian magnitude)
         const gradMap = new Float32Array(w * h);
         let gradList = [];
         for (let y = 2; y < h - 2; y++) {
@@ -1062,14 +1092,11 @@
         if (prevGray) {
           let dx = 0, dy = 0;
           if (stabMode === 'substrate') {
-            // Track high-focus blocks across the frame and take median (RANSAC outlier rejection)
             const dxs = [], dys = [];
-            const blockSize = 12;
-            const searchRad = 6;
             for (let by = 14; by < h - 14; by += 14) {
               for (let bx = 14; bx < w - 14; bx += 14) {
-                if (gradMap[by * w + bx] < sharp95 * 0.45) continue; // Ignore out-of-focus bokeh!
-                const match = matchBlock(prevGray, gray, w, h, bx, by, blockSize, searchRad);
+                if (gradMap[by * w + bx] < sharp95 * 0.45) continue;
+                const match = matchBlock(prevGray, gray, w, h, bx, by, 10, 6);
                 dxs.push(match.dx);
                 dys.push(match.dy);
               }
@@ -1081,22 +1108,20 @@
               dy = dys[Math.floor(dys.length / 2)] / h;
             }
           } else {
-            // Mode 2: Track spider centroid patch
-            const match = matchBlock(prevGray, gray, w, h, targetPos.x, targetPos.y, 18, 9);
+            const match = matchBlock(prevGray, gray, w, h, targetPos.x, targetPos.y, 16, 8);
             targetPos.x = Math.max(20, Math.min(w - 20, targetPos.x + match.dx));
             targetPos.y = Math.max(20, Math.min(h - 20, targetPos.y + match.dy));
             dx = match.dx / w;
             dy = match.dy / h;
           }
 
-          // Focus-loss trajectory hold: damp motion jumps during Z-axis blur dips
           const focusConfidence = Math.min(1.0, sharp95 / 12.0);
           cumX += dx * focusConfidence;
           cumY += dy * focusConfidence;
         }
 
         prevGray = gray;
-        rawMotionVectors.push({ t, cx: cumX, cy: cumY, ca: 0, sharp: sharp95 });
+        rawMotionVectors.push({ t, cx: cumX, cy: cumY, sharp: sharp95 });
       }
 
       isStabilized = true;
@@ -1123,7 +1148,6 @@
               sad += Math.abs(prev[py * w + px] - curr[qy * w + qx]);
             }
           }
-          // Slight bias toward zero to prevent drift in flat regions
           sad += (Math.abs(dx) + Math.abs(dy)) * 0.5;
           if (sad < bestSAD) {
             bestSAD = sad;
@@ -1143,13 +1167,11 @@
 
       smoothedTransforms = rawMotionVectors.map((pt, i) => {
         if (stabMode === 'subject') {
-          // Lock subject directly to its initial coordinate
           const tx = Math.max(-maxShift, Math.min(maxShift, pt.cx));
           const ty = Math.max(-maxShift, Math.min(maxShift, pt.cy));
           return { t: pt.t, tx, ty };
         }
 
-        // Zero-phase Gaussian window filter over camera path
         let sumX = 0, sumY = 0, sumW = 0;
         for (let k = -radius; k <= radius; k++) {
           const idx = Math.max(0, Math.min(rawMotionVectors.length - 1, i + k));
@@ -1203,7 +1225,7 @@
     }
 
     function renderFrame() {
-      if (!video.videoWidth) return;
+      if (!video.videoWidth || video.readyState < 2) return;
 
       gl.bindTexture(gl.TEXTURE_2D, tex);
       gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, video);
@@ -1212,7 +1234,6 @@
       const scale = (!compareRaw && isStabilized) ? (1.0 + cropPct) : 1.0;
       const tr = (!compareRaw && isStabilized) ? getTransformAtTime(video.currentTime) : { tx: 0, ty: 0 };
 
-      // Aspect ratio crop scaling
       let ax = 1.0, ay = 1.0;
       const srcAspect = video.videoWidth / video.videoHeight;
       const dstAspect = glCanvas.width / glCanvas.height;
@@ -1242,7 +1263,6 @@
       if (!isPlaying) return;
       const t = video.currentTime;
 
-      // Enforce multi-segment boundaries (skip deleted middle sections!)
       const activeSegIdx = segments.findIndex(s => t >= s.start - 0.03 && t <= s.end);
       if (activeSegIdx === -1) {
         const nextSeg = segments.find(s => s.start > t);
@@ -1294,8 +1314,7 @@
       }
     });
 
-    // Audio Mute Toggle
-    document.getElementById('btnMute').addEventListener('click', (e) => {
+    document.getElementById('btnMute').addEventListener('click', () => {
       isMuted = !isMuted;
       video.muted = isMuted;
       const btn = document.getElementById('btnMute');
@@ -1304,12 +1323,10 @@
       document.getElementById('muteLabel').textContent = isMuted ? 'Muted' : 'Audio';
     });
 
-    // Compare Raw vs Graded
     const btnCompare = document.getElementById('btnCompare');
     btnCompare.addEventListener('pointerdown', () => { compareRaw = true; renderFrame(); });
     window.addEventListener('pointerup', () => { if (compareRaw) { compareRaw = false; renderFrame(); } });
 
-    // Reset Grades
     document.getElementById('btnResetAll').addEventListener('click', () => {
       document.getElementById('slSharp').value = 45;
       document.getElementById('slVib').value = 25;
@@ -1320,7 +1337,6 @@
       renderFrame();
     });
 
-    // Sliders
     function updateSliderLabels() {
       document.getElementById('valSmooth').textContent = document.getElementById('slSmooth').value;
       document.getElementById('valCrop').textContent = document.getElementById('slCrop').value + '%';
@@ -1345,7 +1361,6 @@
       });
     });
 
-    // Speed & Aspect Pills
     document.querySelectorAll('#speedGroup .pill-btn').forEach(btn => {
       btn.addEventListener('click', () => {
         document.querySelectorAll('#speedGroup .pill-btn').forEach(b => b.classList.remove('active'));
@@ -1365,7 +1380,6 @@
       });
     });
 
-    // Bottom Dock Tab Switching
     document.querySelectorAll('.dock-item').forEach(btn => {
       btn.addEventListener('click', () => {
         document.querySelectorAll('.dock-item').forEach(b => b.classList.remove('active'));
@@ -1375,7 +1389,6 @@
       });
     });
 
-    // One-Tap iNaturalist Frame Extractor (PNG)
     btnSaveStill.addEventListener('click', () => {
       renderFrame();
       glCanvas.toBlob((blob) => {
@@ -1387,7 +1400,6 @@
       }, 'image/png');
     });
 
-    // --- HARDWARE-ACCELERATED VIDEO EXPORT (Zero Watermark, With Audio) ---
     btnExport.addEventListener('click', async () => {
       if (!duration) return;
       video.pause();
@@ -1395,7 +1407,6 @@
 
       const stream = glCanvas.captureStream(60);
 
-      // Attach audio track if not muted
       if (!isMuted) {
         try {
           if (!audioCtx) {
@@ -1424,7 +1435,7 @@
 
       const recorder = new MediaRecorder(stream, {
         mimeType,
-        videoBitsPerSecond: 28_000_000 // 28 Mbps crisp macro bitrate
+        videoBitsPerSecond: 28000000
       });
 
       const chunks = [];
@@ -1444,13 +1455,13 @@
       showToast('Rendering & Encoding Macro Video...');
       recorder.start();
 
-      // Play through each active segment sequentially
       video.playbackRate = playbackRate;
       for (let i = 0; i < segments.length; i++) {
         const seg = segments[i];
         video.currentTime = seg.start;
         await new Promise(r => {
-          const h = () => { video.removeEventListener('seeked', h); r(); };
+          const timeout = setTimeout(r, 300);
+          const h = () => { clearTimeout(timeout); video.removeEventListener('seeked', h); r(); };
           video.addEventListener('seeked', h);
         });
         await video.play();
