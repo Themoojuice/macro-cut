@@ -1,7 +1,7 @@
 {
-  "name": "MacroCut Optical Studio",
+  "name": "MacroCut",
   "short_name": "MacroCut",
-  "description": "2-Pass Macro Video Stabilizer, Focus-Masked CAS & OKLCH Color Grader",
+  "description": "Macro video stabiliser (shift, rotation, focus breathing), sharpening and OKLab grading. Runs fully on-device.",
   "start_url": "./index.html",
   "display": "standalone",
   "orientation": "portrait",

@@ -4,1485 +4,175 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
   <meta name="theme-color" content="#0b0d10" />
-  <meta name="apple-mobile-web-app-capable" content="yes" />
-  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
-  <title>MacroCut — Optical Macro Video Editor</title>
+  <title>MacroCut</title>
   <link rel="manifest" href="manifest.json" />
-  <style>
-    :root {
-      --bg-main: #0b0d10;
-      --bg-panel: #14171d;
-      --bg-elevated: #1e232c;
-      --accent: #00d2d3;
-      --accent-dim: rgba(0, 210, 211, 0.18);
-      --text-main: #f1f5f9;
-      --text-muted: #8b95a5;
-      --danger: #ff4757;
-      --sharp-good: #2ed573;
-      --sharp-warn: #ffa502;
-      --sharp-bad: #ff4757;
-    }
-
-    * {
-      box-sizing: border-box;
-      margin: 0;
-      padding: 0;
-      user-select: none;
-      -webkit-user-select: none;
-      -webkit-tap-highlight-color: transparent;
-    }
-
-    body {
-      background-color: var(--bg-main);
-      color: var(--text-main);
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-      height: 100dvh;
-      width: 100vw;
-      overflow: hidden;
-      display: flex;
-      flex-direction: column;
-    }
-
-    .top-bar {
-      height: 52px;
-      padding: 0 12px;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      background: var(--bg-main);
-      border-bottom: 1px solid #1c2026;
-      flex-shrink: 0;
-      z-index: 20;
-    }
-
-    .top-left, .top-right {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-    }
-
-    .icon-btn {
-      background: transparent;
-      border: none;
-      color: var(--text-main);
-      font-size: 18px;
-      width: 36px;
-      height: 36px;
-      border-radius: 8px;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      cursor: pointer;
-    }
-    .icon-btn:active { background: var(--bg-elevated); }
-    .icon-btn.active { color: var(--accent); background: var(--accent-dim); }
-
-    .badge-pill {
-      background: var(--bg-elevated);
-      color: var(--text-main);
-      font-size: 11px;
-      font-weight: 600;
-      padding: 5px 10px;
-      border-radius: 6px;
-      letter-spacing: 0.3px;
-    }
-
-    .btn-primary {
-      background: var(--accent);
-      color: #041214;
-      border: none;
-      font-weight: 700;
-      font-size: 13px;
-      padding: 7px 14px;
-      border-radius: 7px;
-      cursor: pointer;
-    }
-    .btn-primary:disabled {
-      opacity: 0.4;
-      pointer-events: none;
-    }
-
-    .viewport {
-      flex: 1;
-      position: relative;
-      background: #050608;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      overflow: hidden;
-      min-height: 180px;
-    }
-
-    #glCanvas {
-      max-width: 100%;
-      max-height: 100%;
-      border: 1.5px solid rgba(0, 210, 211, 0.55);
-      box-shadow: 0 8px 30px rgba(0,0,0,0.6);
-      touch-action: none;
-    }
-
-    .empty-state {
-      position: absolute;
-      inset: 0;
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      justify-content: center;
-      gap: 12px;
-      color: var(--text-muted);
-      text-align: center;
-      padding: 24px;
-      z-index: 10;
-      background: #050608;
-    }
-
-    .empty-state button {
-      background: var(--accent);
-      color: #051617;
-      border: none;
-      font-weight: 700;
-      padding: 12px 22px;
-      border-radius: 10px;
-      font-size: 15px;
-      cursor: pointer;
-    }
-
-    #targetReticle {
-      position: absolute;
-      width: 44px;
-      height: 44px;
-      border: 2px solid var(--accent);
-      border-radius: 50%;
-      transform: translate(-50%, -50%);
-      pointer-events: none;
-      display: none;
-      box-shadow: 0 0 12px rgba(0, 210, 211, 0.8);
-      z-index: 15;
-    }
-    #targetReticle::after {
-      content: '';
-      position: absolute;
-      top: 50%;
-      left: 50%;
-      width: 6px;
-      height: 6px;
-      background: var(--accent);
-      border-radius: 50%;
-      transform: translate(-50%, -50%);
-    }
-
-    .status-toast {
-      position: absolute;
-      top: 12px;
-      left: 50%;
-      transform: translateX(-50%);
-      background: rgba(14, 18, 24, 0.92);
-      border: 1px solid var(--accent);
-      color: var(--text-main);
-      padding: 6px 14px;
-      border-radius: 20px;
-      font-size: 12px;
-      font-weight: 600;
-      display: none;
-      z-index: 30;
-      white-space: nowrap;
-    }
-
-    .transport-bar {
-      height: 40px;
-      padding: 0 14px;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      background: var(--bg-main);
-      border-top: 1px solid #161a20;
-      flex-shrink: 0;
-    }
-
-    .timecode {
-      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-      font-size: 12px;
-      color: var(--text-muted);
-    }
-    .timecode span { color: var(--text-main); font-weight: 600; }
-
-    .timeline-section {
-      height: 96px;
-      background: var(--bg-panel);
-      border-top: 1px solid #1f242d;
-      border-bottom: 1px solid #1f242d;
-      display: flex;
-      align-items: center;
-      padding: 0 10px;
-      gap: 10px;
-      flex-shrink: 0;
-    }
-
-    .mute-track-btn {
-      width: 48px;
-      height: 64px;
-      border-radius: 8px;
-      background: var(--bg-elevated);
-      border: 1px solid #2b323f;
-      color: var(--text-main);
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      justify-content: center;
-      gap: 4px;
-      font-size: 10px;
-      cursor: pointer;
-      flex-shrink: 0;
-    }
-    .mute-track-btn.muted {
-      color: var(--danger);
-      border-color: rgba(255, 71, 87, 0.4);
-    }
-
-    .timeline-track-wrapper {
-      position: relative;
-      flex: 1;
-      height: 68px;
-      background: #0d0f13;
-      border-radius: 8px;
-      overflow: hidden;
-      border: 1px solid #262c36;
-      touch-action: none;
-    }
-
-    #heatmapCanvas {
-      width: 100%;
-      height: 14px;
-      display: block;
-      background: #12161c;
-      border-bottom: 1px solid #1e242e;
-    }
-
-    #segmentsContainer {
-      position: relative;
-      width: 100%;
-      height: 54px;
-      background: repeating-linear-gradient(
-        45deg,
-        #101318,
-        #101318 6px,
-        #161a22 6px,
-        #161a22 12px
-      );
-    }
-
-    .clip-segment {
-      position: absolute;
-      top: 4px;
-      bottom: 4px;
-      background: rgba(0, 210, 211, 0.16);
-      border-top: 2px solid var(--accent);
-      border-bottom: 2px solid var(--accent);
-      border-radius: 5px;
-      cursor: pointer;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      overflow: hidden;
-    }
-    .clip-segment.selected {
-      background: rgba(0, 210, 211, 0.28);
-      box-shadow: 0 0 0 1.5px #ffffff inset;
-    }
-
-    .seg-handle {
-      width: 14px;
-      height: 100%;
-      background: var(--text-main);
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      cursor: ew-resize;
-      z-index: 5;
-    }
-    .seg-handle::after {
-      content: '';
-      width: 2px;
-      height: 16px;
-      background: #111;
-      border-radius: 1px;
-    }
-
-    #playheadLine {
-      position: absolute;
-      top: 0;
-      bottom: 0;
-      width: 2px;
-      background: #ffffff;
-      left: 0%;
-      pointer-events: none;
-      z-index: 15;
-      box-shadow: 0 0 6px rgba(0,0,0,0.9);
-    }
-    #playheadLine::before {
-      content: '';
-      position: absolute;
-      top: 0;
-      left: -5px;
-      width: 12px;
-      height: 10px;
-      background: #ffffff;
-      clip-path: polygon(0 0, 100% 0, 50% 100%);
-    }
-
-    .controls-drawer {
-      height: 195px;
-      background: var(--bg-main);
-      padding: 10px 14px;
-      overflow-y: auto;
-      flex-shrink: 0;
-    }
-
-    .tab-pane { display: none; flex-direction: column; gap: 10px; }
-    .tab-pane.active { display: flex; }
-
-    .control-row {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 10px;
-    }
-
-    .control-label {
-      font-size: 12px;
-      color: var(--text-muted);
-      min-width: 118px;
-      display: flex;
-      justify-content: space-between;
-    }
-    .control-label b { color: var(--text-main); font-weight: 600; }
-
-    input[type="range"] {
-      flex: 1;
-      accent-color: var(--accent);
-      height: 5px;
-      background: var(--bg-elevated);
-      border-radius: 4px;
-    }
-
-    .pill-group {
-      display: flex;
-      gap: 6px;
-      width: 100%;
-    }
-
-    .pill-btn {
-      flex: 1;
-      background: var(--bg-elevated);
-      color: var(--text-muted);
-      border: 1px solid #28303d;
-      padding: 8px 6px;
-      border-radius: 7px;
-      font-size: 12px;
-      font-weight: 600;
-      text-align: center;
-      cursor: pointer;
-    }
-    .pill-btn.active {
-      background: var(--accent-dim);
-      color: var(--accent);
-      border-color: var(--accent);
-    }
-    .pill-btn.danger {
-      color: var(--danger);
-      border-color: rgba(255, 71, 87, 0.35);
-    }
-
-    .bottom-dock {
-      height: 58px;
-      background: var(--bg-panel);
-      border-top: 1px solid #1e232d;
-      display: flex;
-      align-items: center;
-      justify-content: space-around;
-      padding-bottom: env(safe-area-inset-bottom);
-      flex-shrink: 0;
-    }
-
-    .dock-item {
-      background: none;
-      border: none;
-      color: var(--text-muted);
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      gap: 3px;
-      font-size: 10px;
-      font-weight: 600;
-      cursor: pointer;
-      padding: 6px 12px;
-    }
-    .dock-item span.icon { font-size: 17px; }
-    .dock-item.active { color: var(--accent); }
-  </style>
+  <link rel="stylesheet" href="css/app.css?v=3" />
+  <script src="vendor/mp4box.all.min.js"></script>
+  <script src="vendor/mp4-muxer.js"></script>
 </head>
 <body>
-
-  <!-- TOP HEADER BAR -->
   <div class="top-bar">
     <div class="top-left">
-      <button class="icon-btn" id="btnOpenTop" title="Open Video">📂</button>
-      <input type="file" id="fileInput" accept="video/*,.mp4,.mov,.webm,.mkv" style="display:none" />
-      <span class="badge-pill" id="metaBadge">No Clip</span>
+      <button class="icon-btn" id="btnOpen" title="Open video">📂</button>
+      <input type="file" id="fileInput" accept="video/mp4,video/quicktime,.mp4,.mov,.m4v" hidden />
+      <span class="badge-pill" id="metaBadge">No clip</span>
     </div>
     <div class="top-right">
-      <button class="icon-btn" id="btnSaveStill" title="Save iNaturalist PNG Frame" disabled>📸</button>
+      <button class="icon-btn" id="btnStill" title="Save processed frame as PNG" disabled>📸</button>
       <button class="btn-primary" id="btnExport" disabled>Export</button>
     </div>
   </div>
+  <div class="progress"><div id="progressBar"></div></div>
 
-  <!-- MAIN INTERACTIVE VIEWPORT -->
   <div class="viewport" id="viewport">
-    <div class="status-toast" id="statusToast">Ready</div>
-    <canvas id="glCanvas" width="1280" height="720"></canvas>
-    <div id="targetReticle"></div>
-
+    <div class="status-toast" id="toast"></div>
+    <canvas id="view" width="640" height="360"></canvas>
+    <div id="reticle"></div>
+    <div class="compare-tag" id="compareTag">ORIGINAL</div>
     <div class="empty-state" id="emptyState">
-      <div style="font-size: 36px;">🕷️</div>
-      <div style="font-size: 15px; font-weight: 600; color: var(--text-main);">MacroCut Optical Studio</div>
-      <div style="font-size: 12px; max-width: 260px;">
-        Zero-watermark 2D similarity stabilization, focus-masked CAS sharpening & OKLCH grading.
-      </div>
-      <button type="button" id="btnOpenCenter">Select Macro Video</button>
+      <div class="big">🕷️</div>
+      <h1>MacroCut</h1>
+      <p>Macro stabiliser for handheld spood footage: tracks shift, rotation and focus-breathing zoom, then sharpens and grades on the GPU. Everything stays on your phone.</p>
+      <button type="button" id="btnOpen2">Select macro video</button>
     </div>
   </div>
 
-  <!-- TRANSPORT BAR -->
   <div class="transport-bar">
-    <div class="timecode">
-      <span id="curTimeTxt">00:00.0</span> / <span id="durTimeTxt">00:00.0</span>
+    <div class="timecode"><span id="curTime">00:00.00</span> / <span id="durTime">00:00.00</span></div>
+    <div class="transport-mid">
+      <button class="icon-btn" id="btnPrev" title="Previous frame" disabled>⏮</button>
+      <button class="icon-btn" id="btnPlay" title="Play / pause" disabled>▶</button>
+      <button class="icon-btn" id="btnNext" title="Next frame" disabled>⏭</button>
     </div>
-    <div style="display:flex; align-items:center; gap: 8px;">
-      <button class="icon-btn" id="btnPlayPause" disabled>▶</button>
-    </div>
-    <div style="display:flex; align-items:center; gap: 4px;">
-      <button class="icon-btn" id="btnCompare" title="Hold to Compare Raw vs Processed">❖</button>
-      <button class="icon-btn" id="btnResetAll" title="Reset Grades">↺</button>
+    <div class="transport-right">
+      <button class="icon-btn" id="btnCompare" title="Hold to see the original">❖</button>
     </div>
   </div>
 
-  <!-- TIMELINE WITH FOCUS HEATMAP & MULTI-SEGMENT SNIPPING -->
   <div class="timeline-section">
-    <button class="mute-track-btn" id="btnMute">
-      <span id="muteIcon" style="font-size:16px;">🔊</span>
-      <span id="muteLabel">Audio</span>
-    </button>
-
-    <div class="timeline-track-wrapper" id="timelineTrack">
-      <canvas id="heatmapCanvas" width="600" height="14"></canvas>
-      <div id="segmentsContainer"></div>
-      <div id="playheadLine"></div>
+    <button class="mute-track-btn" id="btnMute"><span id="muteIcon" style="font-size:16px">🔊</span><span id="muteLabel">Audio</span></button>
+    <div class="timeline-track-wrapper" id="track">
+      <canvas id="heatmap" width="600" height="12"></canvas>
+      <div id="segments"></div>
+      <div id="playhead"></div>
     </div>
   </div>
 
-  <!-- CONTEXTUAL CONTROLS DRAWER -->
   <div class="controls-drawer">
-
-    <!-- TAB 1: TRIM & SNIP -->
+    <!-- TRIM -->
     <div class="tab-pane active" id="tab-trim">
       <div class="pill-group">
-        <button class="pill-btn" id="btnSplitSeg">✂️ Split at Playhead</button>
-        <button class="pill-btn danger" id="btnDeleteSeg">🗑️ Delete Segment</button>
-        <button class="pill-btn" id="btnResetSegs">Reset Cuts</button>
+        <button class="pill-btn" id="btnSplit">✂️ Split</button>
+        <button class="pill-btn danger" id="btnDelete">🗑️ Delete</button>
+        <button class="pill-btn" id="btnResetCuts">Reset</button>
       </div>
-      <div style="font-size: 11px; color: var(--text-muted); line-height: 1.4;">
-        <b>Tip:</b> Drag the white handles on any segment to trim start/end, or scrub to a blurry middle section, tap <b>Split</b> twice, and tap <b>Delete Segment</b>. The top bar plots focus sharpness (<span style="color:var(--sharp-good)">green = sharp</span>, <span style="color:var(--sharp-bad)">red = blur dip</span>).
-      </div>
+      <div class="hint">Drag the white handles to trim. To cut out a blurry middle bit: scrub to it, <b>Split</b> at both ends, select it, <b>Delete</b>. After motion analysis the top strip shows focus: <span style="color:var(--good)">green = sharp</span>, <span style="color:var(--danger)">red = blur</span>.</div>
     </div>
 
-    <!-- TAB 2: STABILIZE -->
+    <!-- STABILISE -->
     <div class="tab-pane" id="tab-stab">
+      <div class="control-row">
+        <button class="btn-primary" id="btnAnalyse" style="flex:1;padding:10px">⚡ Analyse motion</button>
+      </div>
+      <div class="stat" id="stabStatus">Not analysed yet. Analysis tracks hundreds of points at sub-pixel accuracy; ~1–3× clip length on a phone.</div>
+      <div class="pill-group" id="stabMode">
+        <button class="pill-btn active" data-mode="smooth">〰️ Smooth</button>
+        <button class="pill-btn" data-mode="lock">📌 Tripod lock</button>
+        <button class="pill-btn" data-mode="off">Off</button>
+      </div>
+      <div class="control-row"><div class="control-label">Smoothing <b id="v-sigma"></b></div><input type="range" id="sigma" min="0.1" max="3" step="0.05" /></div>
+      <div class="control-row"><div class="control-label">Max crop <b id="v-maxCrop"></b></div><input type="range" id="maxCrop" min="0" max="0.5" step="0.01" /></div>
+      <div class="control-row">
+        <label class="toggle"><input type="checkbox" id="stabRot" /> Fix rotation</label>
+        <label class="toggle"><input type="checkbox" id="stabZoom" /> Fix focus breathing</label>
+      </div>
+      <div class="section-label">Track</div>
+      <div class="pill-group" id="roiMode">
+        <button class="pill-btn active" data-roi="all">Whole frame</button>
+        <button class="pill-btn" data-roi="tap">🎯 Tap a spot</button>
+      </div>
+      <div class="hint">Tripod lock pins the view (best when the spood sits still). Smooth keeps intentional moves and removes heartbeat/tremor. If the spider walks and the frame chases it, use <b>Tap a spot</b> on the substrate and re-analyse.</div>
+    </div>
+
+    <!-- FRAME -->
+    <div class="tab-pane" id="tab-frame">
+      <div class="control-row"><div class="control-label">Rotate <b id="v-rot"></b></div><input type="range" id="rot" min="-45" max="45" step="0.1" /></div>
       <div class="pill-group">
-        <button class="pill-btn active" id="modeSubstrate">🌿 Substrate Lock (Auto)</button>
-        <button class="pill-btn" id="modeSubject">🎯 Subject Lock (Tap Spider)</button>
+        <button class="pill-btn" id="btnRotL">⟲ 90°</button>
+        <button class="pill-btn" id="btnRotR">⟳ 90°</button>
+        <button class="pill-btn" id="btnFrameReset">Reset</button>
       </div>
-
-      <div class="control-row">
-        <button class="btn-primary" id="btnAnalyzeStab" style="width:100%; padding: 9px;">
-          ⚡ Run 2-Pass Macro Stabilization Analysis
-        </button>
-      </div>
-
-      <div class="control-row">
-        <div class="control-label">Tremor Smooth <b id="valSmooth">18</b></div>
-        <input type="range" id="slSmooth" min="1" max="60" value="18" />
-      </div>
-
-      <div class="control-row">
-        <div class="control-label">Max Crop Zoom <b id="valCrop">18%</b></div>
-        <input type="range" id="slCrop" min="0" max="35" value="18" />
-      </div>
-    </div>
-
-    <!-- TAB 3: MACRO GRADE (WebGL2 Shaders) -->
-    <div class="tab-pane" id="tab-grade">
-      <div class="control-row">
-        <div class="control-label">Macro-CAS Sharp <b id="valSharp">45%</b></div>
-        <input type="range" id="slSharp" min="0" max="100" value="45" />
-      </div>
-      <div class="control-row">
-        <div class="control-label">OKLCH Vibrance <b id="valVib">25%</b></div>
-        <input type="range" id="slVib" min="-50" max="100" value="25" />
-      </div>
-      <div class="control-row">
-        <div class="control-label">Shadow Lift <b id="valShadow">15%</b></div>
-        <input type="range" id="slShadow" min="-30" max="60" value="15" />
-      </div>
-      <div class="control-row">
-        <div class="control-label">Specular Tamer <b id="valSpec">20%</b></div>
-        <input type="range" id="slSpec" min="0" max="100" value="20" />
-      </div>
-      <div class="control-row">
-        <div class="control-label">Bokeh Denoise <b id="valDenoise">30%</b></div>
-        <input type="range" id="slDenoise" min="0" max="100" value="30" />
-      </div>
-    </div>
-
-    <!-- TAB 4: SPEED & ASPECT -->
-    <div class="tab-pane" id="tab-speed">
-      <div class="control-label" style="margin-bottom:2px;">Playback / Export Speed (Smooth Conform)</div>
-      <div class="pill-group" id="speedGroup">
-        <button class="pill-btn active" data-speed="1.0">1.0x</button>
-        <button class="pill-btn" data-speed="0.75">0.75x</button>
-        <button class="pill-btn" data-speed="0.5">0.5x</button>
-        <button class="pill-btn" data-speed="0.25">0.25x</button>
-      </div>
-
-      <div class="control-label" style="margin-top:6px; margin-bottom:2px;">Aspect Ratio Reframe</div>
+      <div class="control-row"><div class="control-label">Zoom <b id="v-zoom"></b></div><input type="range" id="zoom" min="1" max="4" step="0.01" /></div>
+      <div class="section-label">Aspect</div>
       <div class="pill-group" id="aspectGroup">
         <button class="pill-btn active" data-aspect="native">Original</button>
-        <button class="pill-btn" data-aspect="9:16">9:16 Shorts</button>
-        <button class="pill-btn" data-aspect="1:1">1:1 Square</button>
-        <button class="pill-btn" data-aspect="16:9">16:9 Wide</button>
+        <button class="pill-btn" data-aspect="9:16">9:16</button>
+        <button class="pill-btn" data-aspect="4:5">4:5</button>
+        <button class="pill-btn" data-aspect="1:1">1:1</button>
+        <button class="pill-btn" data-aspect="16:9">16:9</button>
       </div>
+      <div class="hint">On this tab: <b>drag</b> the picture to reposition, <b>pinch</b> to zoom and twist to rotate.</div>
     </div>
 
+    <!-- LOOK -->
+    <div class="tab-pane" id="tab-look">
+      <div class="pill-group" id="lookPresets">
+        <button class="pill-btn" data-preset="natural">Natural</button>
+        <button class="pill-btn" data-preset="pop">Spood pop</button>
+        <button class="pill-btn" data-preset="off">Off</button>
+      </div>
+      <div id="lookSliders" style="display:flex;flex-direction:column;gap:6px"></div>
+    </div>
+
+    <!-- SPEED -->
+    <div class="tab-pane" id="tab-speed">
+      <div class="pill-group" id="speedGroup">
+        <button class="pill-btn active" data-speed="1">1×</button>
+        <button class="pill-btn" data-speed="0.5">½×</button>
+        <button class="pill-btn" data-speed="0.25">¼×</button>
+        <button class="pill-btn" data-speed="0.125">⅛×</button>
+      </div>
+      <div class="stat" id="speedInfo"></div>
+    </div>
   </div>
 
-  <!-- BOTTOM NAVIGATION DOCK -->
   <div class="bottom-dock">
-    <button class="dock-item active" data-tab="tab-trim">
-      <span class="icon">✂️</span>
-      <span>Trim / Cut</span>
-    </button>
-    <button class="dock-item" data-tab="tab-stab">
-      <span class="icon">〰️</span>
-      <span>Stabilize</span>
-    </button>
-    <button class="dock-item" data-tab="tab-grade">
-      <span class="icon">🎨</span>
-      <span>Grade</span>
-    </button>
-    <button class="dock-item" data-tab="tab-speed">
-      <span class="icon">🐢</span>
-      <span>Speed / Crop</span>
-    </button>
+    <button class="dock-item active" data-tab="tab-trim"><span class="icon">✂️</span><span>Trim</span></button>
+    <button class="dock-item" data-tab="tab-stab"><span class="icon">〰️</span><span>Stabilise</span></button>
+    <button class="dock-item" data-tab="tab-frame"><span class="icon">📐</span><span>Frame</span></button>
+    <button class="dock-item" data-tab="tab-look"><span class="icon">🎨</span><span>Look</span></button>
+    <button class="dock-item" data-tab="tab-speed"><span class="icon">🐢</span><span>Speed</span></button>
   </div>
 
-  <!-- Hidden source video element (no crossorigin attribute so local Android blobs never block) -->
-  <video id="srcVideo" playsinline webkit-playsinline preload="auto" style="position:fixed; top:-9999px; left:-9999px; width:1px; height:1px; opacity:0; pointer-events:none;"></video>
-
-  <script>
-    if ('serviceWorker' in navigator) {
-      navigator.serviceWorker.register('sw.js').then(reg => reg.update()).catch(() => {});
-    }
-
-    const video = document.getElementById('srcVideo');
-    const glCanvas = document.getElementById('glCanvas');
-
-    // FIXED: Directly initialize WebGL2 without calling getContext('2d') first!
-    const gl = glCanvas.getContext('webgl2', { preserveDrawingBuffer: true, alpha: false })
-            || glCanvas.getContext('webgl', { preserveDrawingBuffer: true, alpha: false });
-
-    let duration = 0;
-    let isPlaying = false;
-    let isMuted = false;
-    let compareRaw = false;
-    let playbackRate = 1.0;
-    let aspectMode = 'native';
-    let currentVideoURL = null;
-
-    let segments = [];
-    let selectedSegIdx = 0;
-
-    let stabMode = 'substrate';
-    let subjectTargetNorm = { x: 0.5, y: 0.5 };
-    let rawMotionVectors = [];
-    let smoothedTransforms = [];
-    let isStabilized = false;
-
-    let audioCtx = null;
-    let audioSource = null;
-    let audioGain = null;
-    let audioDest = null;
-
-    // --- SHADER SETUP (WebGL1 / WebGL2 compatible) ---
-    const vsSource = `
-      attribute vec2 a_position;
-      attribute vec2 a_texCoord;
-      uniform vec2 u_translate;
-      uniform float u_angle;
-      uniform float u_scale;
-      uniform vec2 u_aspectScale;
-      varying vec2 v_texCoord;
-
-      void main() {
-        gl_Position = vec4(a_position, 0.0, 1.0);
-        vec2 uv = a_texCoord - 0.5;
-        uv *= u_aspectScale;
-        uv /= u_scale;
-        float c = cos(u_angle);
-        float s = sin(u_angle);
-        uv = vec2(uv.x * c - uv.y * s, uv.x * s + uv.y * c);
-        uv -= u_translate;
-        v_texCoord = uv + 0.5;
-      }
-    `;
-
-    const fsSource = `
-      precision highp float;
-      varying vec2 v_texCoord;
-      uniform sampler2D u_image;
-      uniform vec2 u_texSize;
-      uniform float u_sharp;
-      uniform float u_vibrance;
-      uniform float u_shadow;
-      uniform float u_specular;
-      uniform float u_denoise;
-      uniform int u_rawMode;
-
-      float luma(vec3 c) {
-        return dot(c, vec3(0.299, 0.587, 0.114));
-      }
-
-      void main() {
-        vec2 uv = clamp(v_texCoord, 0.001, 0.999);
-        vec3 center = texture2D(u_image, uv).rgb;
-        if (u_rawMode == 1) {
-          gl_FragColor = vec4(center, 1.0);
-          return;
-        }
-
-        vec2 px = 1.0 / max(u_texSize, vec2(1.0));
-        vec3 n = texture2D(u_image, uv + vec2(0.0, -px.y)).rgb;
-        vec3 s = texture2D(u_image, uv + vec2(0.0,  px.y)).rgb;
-        vec3 e = texture2D(u_image, uv + vec2( px.x, 0.0)).rgb;
-        vec3 w = texture2D(u_image, uv + vec2(-px.x, 0.0)).rgb;
-
-        float lc = luma(center);
-        float ln = luma(n), ls = luma(s), le = luma(e), lw = luma(w);
-        float grad = abs(ln - ls) + abs(le - lw) + abs(4.0 * lc - (ln + ls + le + lw));
-        float focusMask = smoothstep(0.015, 0.12, grad);
-
-        vec3 meanCross = (n + s + e + w + center) * 0.2;
-        vec3 col = mix(center, meanCross, u_denoise * (1.0 - focusMask) * 0.85);
-
-        vec3 minRGB = min(min(n, s), min(e, w));
-        vec3 maxRGB = max(max(n, s), max(e, w));
-        minRGB = min(minRGB, col);
-        maxRGB = max(maxRGB, col);
-        vec3 amp = clamp(min(minRGB, 1.0 - maxRGB) / max(maxRGB, vec3(0.0001)), 0.0, 1.0);
-        amp = sqrt(amp);
-        float peak = -1.0 / mix(8.0, 5.0, u_sharp);
-        vec3 wgt = amp * peak;
-        vec3 casCol = clamp((col + (n + s + e + w) * wgt) / (1.0 + 4.0 * wgt), 0.0, 1.0);
-        col = mix(col, casCol, u_sharp * (0.25 + 0.75 * focusMask));
-
-        float lum = luma(col);
-        if (u_shadow != 0.0) {
-          float shadowMask = pow(1.0 - lum, 2.2);
-          col += col * shadowMask * u_shadow * 1.4;
-        }
-        if (u_specular > 0.0) {
-          float hiMask = smoothstep(0.65, 0.98, lum);
-          col = mix(col, col * 0.82, hiMask * u_specular);
-        }
-
-        float maxC = max(col.r, max(col.g, col.b));
-        float minC = min(col.r, min(col.g, col.b));
-        float sat = maxC - minC;
-        float vibWeight = (1.0 - sat * sat) * u_vibrance;
-        vec3 gray = vec3(luma(col));
-        col = mix(gray, col, 1.0 + vibWeight * 1.35);
-
-        gl_FragColor = vec4(clamp(col, 0.0, 1.0), 1.0);
-      }
-    `;
-
-    function compileShader(type, src) {
-      const sh = gl.createShader(type);
-      gl.shaderSource(sh, src);
-      gl.compileShader(sh);
-      if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
-        console.error(gl.getShaderInfoLog(sh));
-      }
-      return sh;
-    }
-
-    const prog = gl.createProgram();
-    gl.attachShader(prog, compileShader(gl.VERTEX_SHADER, vsSource));
-    gl.attachShader(prog, compileShader(gl.FRAGMENT_SHADER, fsSource));
-    gl.linkProgram(prog);
-    gl.useProgram(prog);
-
-    const posBuf = gl.createBuffer();
-    gl.bindBuffer(gl.ARRAY_BUFFER, posBuf);
-    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
-      -1, -1,  0, 1,
-       1, -1,  1, 1,
-      -1,  1,  0, 0,
-       1,  1,  1, 0,
-    ]), gl.STATIC_DRAW);
-
-    const aPos = gl.getAttribLocation(prog, 'a_position');
-    const aTex = gl.getAttribLocation(prog, 'a_texCoord');
-    gl.enableVertexAttribArray(aPos);
-    gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 16, 0);
-    gl.enableVertexAttribArray(aTex);
-    gl.vertexAttribPointer(aTex, 2, gl.FLOAT, false, 16, 8);
-
-    const tex = gl.createTexture();
-    gl.bindTexture(gl.TEXTURE_2D, tex);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-
-    const uniforms = {
-      translate: gl.getUniformLocation(prog, 'u_translate'),
-      angle: gl.getUniformLocation(prog, 'u_angle'),
-      scale: gl.getUniformLocation(prog, 'u_scale'),
-      aspectScale: gl.getUniformLocation(prog, 'u_aspectScale'),
-      texSize: gl.getUniformLocation(prog, 'u_texSize'),
-      sharp: gl.getUniformLocation(prog, 'u_sharp'),
-      vibrance: gl.getUniformLocation(prog, 'u_vibrance'),
-      shadow: gl.getUniformLocation(prog, 'u_shadow'),
-      specular: gl.getUniformLocation(prog, 'u_specular'),
-      denoise: gl.getUniformLocation(prog, 'u_denoise'),
-      rawMode: gl.getUniformLocation(prog, 'u_rawMode'),
-    };
-
-    // --- UI & ROBUST MOBILE VIDEO LOADER ---
-    const fileInput = document.getElementById('fileInput');
-    const emptyState = document.getElementById('emptyState');
-    const metaBadge = document.getElementById('metaBadge');
-    const btnPlayPause = document.getElementById('btnPlayPause');
-    const btnExport = document.getElementById('btnExport');
-    const btnSaveStill = document.getElementById('btnSaveStill');
-    const statusToast = document.getElementById('statusToast');
-
-    let toastTimer = null;
-    function showToast(msg, ms = 0) {
-      if (toastTimer) clearTimeout(toastTimer);
-      statusToast.textContent = msg;
-      statusToast.style.display = 'block';
-      if (ms > 0) {
-        toastTimer = setTimeout(() => { statusToast.style.display = 'none'; }, ms);
-      }
-    }
-
-    document.getElementById('btnOpenTop').addEventListener('click', () => {
-      fileInput.value = '';
-      fileInput.click();
-    });
-    document.getElementById('btnOpenCenter').addEventListener('click', () => {
-      fileInput.value = '';
-      fileInput.click();
-    });
-
-    fileInput.addEventListener('change', async (e) => {
-      const file = e.target.files && e.target.files[0];
-      if (!file) return;
-
-      showToast(`Loading ${file.name}...`);
-      emptyState.style.display = 'none';
-
-      if (currentVideoURL) URL.revokeObjectURL(currentVideoURL);
-      currentVideoURL = URL.createObjectURL(file);
-
-      video.pause();
-      isPlaying = false;
-      btnPlayPause.textContent = '▶';
-      video.src = currentVideoURL;
-      video.load();
-
-      // Wake up mobile hardware decoder so frame 1 renders immediately
-      try {
-        video.muted = true;
-        await video.play();
-        video.pause();
-        video.muted = isMuted;
-        video.currentTime = 0.001;
-      } catch (err) {
-        video.muted = isMuted;
-      }
-    });
-
-    video.addEventListener('loadedmetadata', () => {
-      duration = video.duration || 0.1;
-      emptyState.style.display = 'none';
-      btnPlayPause.disabled = false;
-      btnExport.disabled = false;
-      btnSaveStill.disabled = false;
-
-      updateCanvasAspect();
-      metaBadge.textContent = `${video.videoWidth}×${video.videoHeight}`;
-      document.getElementById('durTimeTxt').textContent = formatTime(duration);
-
-      segments = [{ start: 0, end: duration }];
-      selectedSegIdx = 0;
-      isStabilized = false;
-      rawMotionVectors = [];
-      smoothedTransforms = [];
-
-      renderSegmentsUI();
-      clearHeatmap();
-      showToast('Clip Loaded!', 1500);
-    });
-
-    video.addEventListener('loadeddata', () => {
-      renderFrame();
-      updatePlayheadUI();
-    });
-
-    video.addEventListener('seeked', () => {
-      renderFrame();
-      updatePlayheadUI();
-    });
-
-    video.addEventListener('error', () => {
-      const code = video.error ? video.error.code : 'Unknown';
-      showToast(`Video Codec Error (${code}) — try standard MP4/H.264`, 4500);
-    });
-
-    function updateCanvasAspect() {
-      if (!video.videoWidth) return;
-      let w = video.videoWidth;
-      let h = video.videoHeight;
-      if (aspectMode === '9:16') {
-        w = Math.round(h * (9 / 16));
-      } else if (aspectMode === '1:1') {
-        w = h = Math.min(w, h);
-      } else if (aspectMode === '16:9') {
-        h = Math.round(w * (9 / 16));
-      }
-      glCanvas.width = w;
-      glCanvas.height = h;
-      gl.viewport(0, 0, w, h);
-    }
-
-    // --- INTERACTIVE TIMELINE & MULTI-SEGMENT SNIPPING ---
-    const segmentsContainer = document.getElementById('segmentsContainer');
-    const playheadLine = document.getElementById('playheadLine');
-    const timelineTrack = document.getElementById('timelineTrack');
-
-    function renderSegmentsUI() {
-      segmentsContainer.innerHTML = '';
-      if (!duration) return;
-
-      segments.forEach((seg, idx) => {
-        const el = document.createElement('div');
-        el.className = 'clip-segment' + (idx === selectedSegIdx ? ' selected' : '');
-        const leftPct = (seg.start / duration) * 100;
-        const widthPct = ((seg.end - seg.start) / duration) * 100;
-        el.style.left = `${leftPct}%`;
-        el.style.width = `${Math.max(widthPct, 1.5)}%`;
-
-        const hLeft = document.createElement('div');
-        hLeft.className = 'seg-handle';
-        const hRight = document.createElement('div');
-        hRight.className = 'seg-handle';
-
-        el.appendChild(hLeft);
-        el.appendChild(hRight);
-
-        el.addEventListener('pointerdown', (ev) => {
-          ev.stopPropagation();
-          selectedSegIdx = idx;
-          renderSegmentsUI();
-        });
-
-        setupHandleDrag(hLeft, idx, true);
-        setupHandleDrag(hRight, idx, false);
-
-        segmentsContainer.appendChild(el);
-      });
-    }
-
-    function setupHandleDrag(handleEl, segIdx, isLeft) {
-      handleEl.addEventListener('pointerdown', (ev) => {
-        ev.stopPropagation();
-        selectedSegIdx = segIdx;
-        const rect = timelineTrack.getBoundingClientRect();
-
-        const onMove = (moveEv) => {
-          const relX = Math.max(0, Math.min(1, (moveEv.clientX - rect.left) / rect.width));
-          const t = relX * duration;
-          const seg = segments[segIdx];
-          if (isLeft) {
-            const minStart = segIdx > 0 ? segments[segIdx - 1].end : 0;
-            seg.start = Math.max(minStart, Math.min(t, seg.end - 0.15));
-            video.currentTime = seg.start;
-          } else {
-            const maxEnd = segIdx < segments.length - 1 ? segments[segIdx + 1].start : duration;
-            seg.end = Math.min(maxEnd, Math.max(t, seg.start + 0.15));
-            video.currentTime = seg.end;
-          }
-          renderSegmentsUI();
-        };
-
-        const onUp = () => {
-          window.removeEventListener('pointermove', onMove);
-          window.removeEventListener('pointerup', onUp);
-        };
-        window.addEventListener('pointermove', onMove);
-        window.addEventListener('pointerup', onUp);
-      });
-    }
-
-    timelineTrack.addEventListener('pointerdown', (ev) => {
-      if (!duration) return;
-      const rect = timelineTrack.getBoundingClientRect();
-      const scrub = (clientX) => {
-        const pct = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
-        video.currentTime = pct * duration;
-        updatePlayheadUI();
-      };
-      scrub(ev.clientX);
-      const onMove = (mEv) => scrub(mEv.clientX);
-      const onUp = () => {
-        window.removeEventListener('pointermove', onMove);
-        window.removeEventListener('pointerup', onUp);
-      };
-      window.addEventListener('pointermove', onMove);
-      window.addEventListener('pointerup', onUp);
-    });
-
-    document.getElementById('btnSplitSeg').addEventListener('click', () => {
-      if (!duration) return;
-      const t = video.currentTime;
-      const idx = segments.findIndex(s => t > s.start + 0.12 && t < s.end - 0.12);
-      if (idx === -1) {
-        showToast('Move playhead inside a segment to split', 1800);
-        return;
-      }
-      const orig = segments[idx];
-      const segA = { start: orig.start, end: t };
-      const segB = { start: t, end: orig.end };
-      segments.splice(idx, 1, segA, segB);
-      selectedSegIdx = idx + 1;
-      renderSegmentsUI();
-    });
-
-    document.getElementById('btnDeleteSeg').addEventListener('click', () => {
-      if (segments.length <= 1) {
-        showToast('Split a segment first before deleting', 1800);
-        return;
-      }
-      segments.splice(selectedSegIdx, 1);
-      selectedSegIdx = Math.max(0, selectedSegIdx - 1);
-      video.currentTime = segments[selectedSegIdx].start;
-      renderSegmentsUI();
-    });
-
-    document.getElementById('btnResetSegs').addEventListener('click', () => {
-      if (!duration) return;
-      segments = [{ start: 0, end: duration }];
-      selectedSegIdx = 0;
-      renderSegmentsUI();
-    });
-
-    // --- 2-PASS MACRO STABILIZER & FOCUS HEATMAP ENGINE ---
-    const analysisCanvas = document.createElement('canvas');
-    analysisCanvas.width = 192;
-    analysisCanvas.height = 108;
-    const analysisCtx = analysisCanvas.getContext('2d', { willReadFrequently: true });
-
-    document.getElementById('modeSubstrate').addEventListener('click', (e) => {
-      stabMode = 'substrate';
-      e.target.classList.add('active');
-      document.getElementById('modeSubject').classList.remove('active');
-      document.getElementById('targetReticle').style.display = 'none';
-    });
-
-    document.getElementById('modeSubject').addEventListener('click', (e) => {
-      stabMode = 'subject';
-      e.target.classList.add('active');
-      document.getElementById('modeSubstrate').classList.remove('active');
-      document.getElementById('targetReticle').style.display = 'block';
-      document.getElementById('targetReticle').style.left = '50%';
-      document.getElementById('targetReticle').style.top = '50%';
-      showToast('Tap directly on the spider to set lock target', 2200);
-    });
-
-    glCanvas.addEventListener('pointerdown', (e) => {
-      if (stabMode !== 'subject') return;
-      const rect = glCanvas.getBoundingClientRect();
-      subjectTargetNorm.x = (e.clientX - rect.left) / rect.width;
-      subjectTargetNorm.y = (e.clientY - rect.top) / rect.height;
-
-      const vRect = document.getElementById('viewport').getBoundingClientRect();
-      const ret = document.getElementById('targetReticle');
-      ret.style.display = 'block';
-      ret.style.left = `${e.clientX - vRect.left}px`;
-      ret.style.top = `${e.clientY - vRect.top}px`;
-    });
-
-    document.getElementById('btnAnalyzeStab').addEventListener('click', async () => {
-      if (!duration) return;
-      video.pause();
-      isPlaying = false;
-      btnPlayPause.textContent = '▶';
-
-      const w = analysisCanvas.width;
-      const h = analysisCanvas.height;
-      const dt = 1 / 24;
-      rawMotionVectors = [];
-
-      let prevGray = null;
-      let targetPos = { x: Math.round(subjectTargetNorm.x * w), y: Math.round(subjectTargetNorm.y * h) };
-      let cumX = 0, cumY = 0;
-
-      let stepIdx = 0;
-      for (let t = 0; t < duration; t += dt) {
-        stepIdx++;
-        if (stepIdx % 6 === 0) {
-          showToast(`Pass 1 Optical Analysis: ${Math.round((t / duration) * 100)}%`);
-          await new Promise(r => setTimeout(r, 0));
-        }
-
-        const inSeg = segments.some(s => t >= s.start - 0.05 && t <= s.end + 0.05);
-        if (!inSeg && prevGray) {
-          rawMotionVectors.push({ t, cx: cumX, cy: cumY, sharp: 0 });
-          continue;
-        }
-
-        video.currentTime = t;
-        await new Promise(res => {
-          const timeout = setTimeout(res, 250);
-          const hnd = () => { clearTimeout(timeout); video.removeEventListener('seeked', hnd); res(); };
-          video.addEventListener('seeked', hnd);
-        });
-
-        analysisCtx.drawImage(video, 0, 0, w, h);
-        const imgData = analysisCtx.getImageData(0, 0, w, h).data;
-        const gray = new Float32Array(w * h);
-        for (let i = 0, j = 0; i < imgData.length; i += 4, j++) {
-          gray[j] = 0.299 * imgData[i] + 0.587 * imgData[i+1] + 0.114 * imgData[i+2];
-        }
-
-        const gradMap = new Float32Array(w * h);
-        let gradList = [];
-        for (let y = 2; y < h - 2; y++) {
-          for (let x = 2; x < w - 2; x++) {
-            const idx = y * w + x;
-            const lap = Math.abs(4 * gray[idx] - gray[idx - 1] - gray[idx + 1] - gray[idx - w] - gray[idx + w]);
-            gradMap[idx] = lap;
-            if ((x + y) % 3 === 0) gradList.push(lap);
-          }
-        }
-        gradList.sort((a, b) => a - b);
-        const sharp95 = gradList[Math.floor(gradList.length * 0.95)] || 1;
-
-        if (prevGray) {
-          let dx = 0, dy = 0;
-          if (stabMode === 'substrate') {
-            const dxs = [], dys = [];
-            for (let by = 14; by < h - 14; by += 14) {
-              for (let bx = 14; bx < w - 14; bx += 14) {
-                if (gradMap[by * w + bx] < sharp95 * 0.45) continue;
-                const match = matchBlock(prevGray, gray, w, h, bx, by, 10, 6);
-                dxs.push(match.dx);
-                dys.push(match.dy);
-              }
-            }
-            if (dxs.length >= 3) {
-              dxs.sort((a, b) => a - b);
-              dys.sort((a, b) => a - b);
-              dx = dxs[Math.floor(dxs.length / 2)] / w;
-              dy = dys[Math.floor(dys.length / 2)] / h;
-            }
-          } else {
-            const match = matchBlock(prevGray, gray, w, h, targetPos.x, targetPos.y, 16, 8);
-            targetPos.x = Math.max(20, Math.min(w - 20, targetPos.x + match.dx));
-            targetPos.y = Math.max(20, Math.min(h - 20, targetPos.y + match.dy));
-            dx = match.dx / w;
-            dy = match.dy / h;
-          }
-
-          const focusConfidence = Math.min(1.0, sharp95 / 12.0);
-          cumX += dx * focusConfidence;
-          cumY += dy * focusConfidence;
-        }
-
-        prevGray = gray;
-        rawMotionVectors.push({ t, cx: cumX, cy: cumY, sharp: sharp95 });
-      }
-
-      isStabilized = true;
-      recomputeSmoothedTrajectory();
-      drawFocusHeatmap();
-      showToast('Macro Stabilization Locked!', 2000);
-      video.currentTime = segments[0].start;
-    });
-
-    function matchBlock(prev, curr, w, h, cx, cy, halfB, rad) {
-      let bestSAD = Infinity;
-      let bestDx = 0, bestDy = 0;
-      for (let dy = -rad; dy <= rad; dy++) {
-        for (let dx = -rad; dx <= rad; dx++) {
-          let sad = 0;
-          for (let y = -halfB; y <= halfB; y += 2) {
-            const py = cy + y;
-            const qy = py + dy;
-            if (py < 0 || py >= h || qy < 0 || qy >= h) continue;
-            for (let x = -halfB; x <= halfB; x += 2) {
-              const px = cx + x;
-              const qx = px + dx;
-              if (px < 0 || px >= w || qx < 0 || qx >= w) continue;
-              sad += Math.abs(prev[py * w + px] - curr[qy * w + qx]);
-            }
-          }
-          sad += (Math.abs(dx) + Math.abs(dy)) * 0.5;
-          if (sad < bestSAD) {
-            bestSAD = sad;
-            bestDx = dx;
-            bestDy = dy;
-          }
-        }
-      }
-      return { dx: bestDx, dy: bestDy };
-    }
-
-    function recomputeSmoothedTrajectory() {
-      if (!rawMotionVectors.length) return;
-      const radius = parseInt(document.getElementById('slSmooth').value, 10);
-      const maxCropPct = parseInt(document.getElementById('slCrop').value, 10) / 100;
-      const maxShift = maxCropPct * 0.48;
-
-      smoothedTransforms = rawMotionVectors.map((pt, i) => {
-        if (stabMode === 'subject') {
-          const tx = Math.max(-maxShift, Math.min(maxShift, pt.cx));
-          const ty = Math.max(-maxShift, Math.min(maxShift, pt.cy));
-          return { t: pt.t, tx, ty };
-        }
-
-        let sumX = 0, sumY = 0, sumW = 0;
-        for (let k = -radius; k <= radius; k++) {
-          const idx = Math.max(0, Math.min(rawMotionVectors.length - 1, i + k));
-          const w = Math.exp(-(k * k) / (2 * (radius * 0.45) * (radius * 0.45)));
-          sumX += rawMotionVectors[idx].cx * w;
-          sumY += rawMotionVectors[idx].cy * w;
-          sumW += w;
-        }
-        const smoothX = sumX / sumW;
-        const smoothY = sumY / sumW;
-        const tx = Math.max(-maxShift, Math.min(maxShift, pt.cx - smoothX));
-        const ty = Math.max(-maxShift, Math.min(maxShift, pt.cy - smoothY));
-        return { t: pt.t, tx, ty };
-      });
-
-      renderFrame();
-    }
-
-    function drawFocusHeatmap() {
-      const cvs = document.getElementById('heatmapCanvas');
-      const ctx = cvs.getContext('2d');
-      ctx.clearRect(0, 0, cvs.width, cvs.height);
-      if (!rawMotionVectors.length) return;
-
-      const maxSharp = Math.max(...rawMotionVectors.map(v => v.sharp), 1);
-      const barW = cvs.width / rawMotionVectors.length;
-
-      rawMotionVectors.forEach((v, i) => {
-        const norm = Math.min(1, v.sharp / (maxSharp * 0.85));
-        if (norm > 0.6) ctx.fillStyle = '#2ed573';
-        else if (norm > 0.35) ctx.fillStyle = '#ffa502';
-        else ctx.fillStyle = '#ff4757';
-        const h = Math.max(3, norm * cvs.height);
-        ctx.fillRect(i * barW, cvs.height - h, Math.ceil(barW), h);
-      });
-    }
-
-    function clearHeatmap() {
-      const cvs = document.getElementById('heatmapCanvas');
-      cvs.getContext('2d').clearRect(0, 0, cvs.width, cvs.height);
-    }
-
-    // --- RENDER LOOP ---
-    function getTransformAtTime(t) {
-      if (!isStabilized || !smoothedTransforms.length) return { tx: 0, ty: 0 };
-      const idx = Math.min(
-        smoothedTransforms.length - 1,
-        Math.max(0, Math.round((t / duration) * (smoothedTransforms.length - 1)))
-      );
-      return smoothedTransforms[idx];
-    }
-
-    function renderFrame() {
-      if (!video.videoWidth || video.readyState < 2) return;
-
-      gl.bindTexture(gl.TEXTURE_2D, tex);
-      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, video);
-
-      const cropPct = parseInt(document.getElementById('slCrop').value, 10) / 100;
-      const scale = (!compareRaw && isStabilized) ? (1.0 + cropPct) : 1.0;
-      const tr = (!compareRaw && isStabilized) ? getTransformAtTime(video.currentTime) : { tx: 0, ty: 0 };
-
-      let ax = 1.0, ay = 1.0;
-      const srcAspect = video.videoWidth / video.videoHeight;
-      const dstAspect = glCanvas.width / glCanvas.height;
-      if (dstAspect < srcAspect) {
-        ax = dstAspect / srcAspect;
-      } else if (dstAspect > srcAspect) {
-        ay = srcAspect / dstAspect;
-      }
-
-      gl.uniform2f(uniforms.translate, tr.tx, tr.ty);
-      gl.uniform1f(uniforms.angle, 0.0);
-      gl.uniform1f(uniforms.scale, scale);
-      gl.uniform2f(uniforms.aspectScale, ax, ay);
-      gl.uniform2f(uniforms.texSize, video.videoWidth, video.videoHeight);
-
-      gl.uniform1f(uniforms.sharp, parseInt(document.getElementById('slSharp').value, 10) / 100);
-      gl.uniform1f(uniforms.vibrance, parseInt(document.getElementById('slVib').value, 10) / 100);
-      gl.uniform1f(uniforms.shadow, parseInt(document.getElementById('slShadow').value, 10) / 100);
-      gl.uniform1f(uniforms.specular, parseInt(document.getElementById('slSpec').value, 10) / 100);
-      gl.uniform1f(uniforms.denoise, parseInt(document.getElementById('slDenoise').value, 10) / 100);
-      gl.uniform1i(uniforms.rawMode, compareRaw ? 1 : 0);
-
-      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
-    }
-
-    function playbackTick() {
-      if (!isPlaying) return;
-      const t = video.currentTime;
-
-      const activeSegIdx = segments.findIndex(s => t >= s.start - 0.03 && t <= s.end);
-      if (activeSegIdx === -1) {
-        const nextSeg = segments.find(s => s.start > t);
-        if (nextSeg) {
-          video.currentTime = nextSeg.start;
-        } else {
-          video.pause();
-          isPlaying = false;
-          btnPlayPause.textContent = '▶';
-          video.currentTime = segments[0].start;
-          return;
-        }
-      }
-
-      renderFrame();
-      updatePlayheadUI();
-      requestAnimationFrame(playbackTick);
-    }
-
-    function updatePlayheadUI() {
-      if (!duration) return;
-      const pct = (video.currentTime / duration) * 100;
-      playheadLine.style.left = `${Math.max(0, Math.min(100, pct))}%`;
-      document.getElementById('curTimeTxt').textContent = formatTime(video.currentTime);
-    }
-
-    function formatTime(sec) {
-      const m = Math.floor(sec / 60).toString().padStart(2, '0');
-      const s = (sec % 60).toFixed(1).padStart(4, '0');
-      return `${m}:${s}`;
-    }
-
-    // --- CONTROLS & LISTENERS ---
-    btnPlayPause.addEventListener('click', () => {
-      if (!duration) return;
-      if (isPlaying) {
-        video.pause();
-        isPlaying = false;
-        btnPlayPause.textContent = '▶';
-      } else {
-        const t = video.currentTime;
-        const inValidSeg = segments.some(s => t >= s.start && t < s.end - 0.05);
-        if (!inValidSeg) video.currentTime = segments[0].start;
-        video.playbackRate = playbackRate;
-        video.play();
-        isPlaying = true;
-        btnPlayPause.textContent = '⏸';
-        requestAnimationFrame(playbackTick);
-      }
-    });
-
-    document.getElementById('btnMute').addEventListener('click', () => {
-      isMuted = !isMuted;
-      video.muted = isMuted;
-      const btn = document.getElementById('btnMute');
-      btn.classList.toggle('muted', isMuted);
-      document.getElementById('muteIcon').textContent = isMuted ? '🔇' : '🔊';
-      document.getElementById('muteLabel').textContent = isMuted ? 'Muted' : 'Audio';
-    });
-
-    const btnCompare = document.getElementById('btnCompare');
-    btnCompare.addEventListener('pointerdown', () => { compareRaw = true; renderFrame(); });
-    window.addEventListener('pointerup', () => { if (compareRaw) { compareRaw = false; renderFrame(); } });
-
-    document.getElementById('btnResetAll').addEventListener('click', () => {
-      document.getElementById('slSharp').value = 45;
-      document.getElementById('slVib').value = 25;
-      document.getElementById('slShadow').value = 15;
-      document.getElementById('slSpec').value = 20;
-      document.getElementById('slDenoise').value = 30;
-      updateSliderLabels();
-      renderFrame();
-    });
-
-    function updateSliderLabels() {
-      document.getElementById('valSmooth').textContent = document.getElementById('slSmooth').value;
-      document.getElementById('valCrop').textContent = document.getElementById('slCrop').value + '%';
-      document.getElementById('valSharp').textContent = document.getElementById('slSharp').value + '%';
-      document.getElementById('valVib').textContent = document.getElementById('slVib').value + '%';
-      document.getElementById('valShadow').textContent = document.getElementById('slShadow').value + '%';
-      document.getElementById('valSpec').textContent = document.getElementById('slSpec').value + '%';
-      document.getElementById('valDenoise').textContent = document.getElementById('slDenoise').value + '%';
-    }
-
-    ['slSharp', 'slVib', 'slShadow', 'slSpec', 'slDenoise'].forEach(id => {
-      document.getElementById(id).addEventListener('input', () => {
-        updateSliderLabels();
-        renderFrame();
-      });
-    });
-
-    ['slSmooth', 'slCrop'].forEach(id => {
-      document.getElementById(id).addEventListener('input', () => {
-        updateSliderLabels();
-        recomputeSmoothedTrajectory();
-      });
-    });
-
-    document.querySelectorAll('#speedGroup .pill-btn').forEach(btn => {
-      btn.addEventListener('click', () => {
-        document.querySelectorAll('#speedGroup .pill-btn').forEach(b => b.classList.remove('active'));
-        btn.classList.add('active');
-        playbackRate = parseFloat(btn.dataset.speed);
-        video.playbackRate = playbackRate;
-      });
-    });
-
-    document.querySelectorAll('#aspectGroup .pill-btn').forEach(btn => {
-      btn.addEventListener('click', () => {
-        document.querySelectorAll('#aspectGroup .pill-btn').forEach(b => b.classList.remove('active'));
-        btn.classList.add('active');
-        aspectMode = btn.dataset.aspect;
-        updateCanvasAspect();
-        renderFrame();
-      });
-    });
-
-    document.querySelectorAll('.dock-item').forEach(btn => {
-      btn.addEventListener('click', () => {
-        document.querySelectorAll('.dock-item').forEach(b => b.classList.remove('active'));
-        document.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
-        btn.classList.add('active');
-        document.getElementById(btn.dataset.tab).classList.add('active');
-      });
-    });
-
-    btnSaveStill.addEventListener('click', () => {
-      renderFrame();
-      glCanvas.toBlob((blob) => {
-        const a = document.createElement('a');
-        a.href = URL.createObjectURL(blob);
-        a.download = `MacroCut_Frame_${Date.now()}.png`;
-        a.click();
-        showToast('Saved full-res PNG frame!', 1800);
-      }, 'image/png');
-    });
-
-    btnExport.addEventListener('click', async () => {
-      if (!duration) return;
-      video.pause();
-      isPlaying = false;
-
-      const stream = glCanvas.captureStream(60);
-
-      if (!isMuted) {
-        try {
-          if (!audioCtx) {
-            audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-            audioSource = audioCtx.createMediaElementSource(video);
-            audioGain = audioCtx.createGain();
-            audioDest = audioCtx.createMediaStreamDestination();
-            audioSource.connect(audioGain);
-            audioGain.connect(audioDest);
-            audioGain.connect(audioCtx.destination);
-          }
-          if (audioCtx.state === 'suspended') await audioCtx.resume();
-          const aTrack = audioDest.stream.getAudioTracks()[0];
-          if (aTrack) stream.addTrack(aTrack);
-        } catch (e) {}
-      }
-
-      const mimeTypes = [
-        'video/mp4;codecs=avc1.42E01E,mp4a.40.2',
-        'video/mp4',
-        'video/webm;codecs=vp9,opus',
-        'video/webm'
-      ];
-      const mimeType = mimeTypes.find(m => MediaRecorder.isTypeSupported(m)) || '';
-      const ext = mimeType.includes('mp4') ? 'mp4' : 'webm';
-
-      const recorder = new MediaRecorder(stream, {
-        mimeType,
-        videoBitsPerSecond: 28000000
-      });
-
-      const chunks = [];
-      recorder.ondataavailable = e => { if (e.data.size > 0) chunks.push(e.data); };
-
-      recorder.onstop = () => {
-        const blob = new Blob(chunks, { type: mimeType });
-        const a = document.createElement('a');
-        a.href = URL.createObjectURL(blob);
-        a.download = `MacroCut_${Date.now()}.${ext}`;
-        a.click();
-        showToast('Export Complete!', 2500);
-        btnExport.disabled = false;
-      };
-
-      btnExport.disabled = true;
-      showToast('Rendering & Encoding Macro Video...');
-      recorder.start();
-
-      video.playbackRate = playbackRate;
-      for (let i = 0; i < segments.length; i++) {
-        const seg = segments[i];
-        video.currentTime = seg.start;
-        await new Promise(r => {
-          const timeout = setTimeout(r, 300);
-          const h = () => { clearTimeout(timeout); video.removeEventListener('seeked', h); r(); };
-          video.addEventListener('seeked', h);
-        });
-        await video.play();
-
-        await new Promise(resolveSeg => {
-          const tick = () => {
-            renderFrame();
-            updatePlayheadUI();
-            if (video.currentTime >= seg.end || video.ended) {
-              video.pause();
-              resolveSeg();
-            } else {
-              requestAnimationFrame(tick);
-            }
-          };
-          requestAnimationFrame(tick);
-        });
-      }
-
-      recorder.stop();
-    });
-  </script>
+  <div class="sheet-backdrop" id="exportSheet">
+    <div class="sheet">
+      <h2>Export</h2>
+      <div id="exportOptions" style="display:flex;flex-direction:column;gap:10px">
+        <div class="section-label">Resolution</div>
+        <div class="pill-group" id="resGroup"></div>
+        <div class="section-label">Frame rate</div>
+        <div class="pill-group" id="fpsGroup">
+          <button class="pill-btn" data-fps="auto">Auto</button>
+          <button class="pill-btn" data-fps="30">30</button>
+          <button class="pill-btn" data-fps="60">60</button>
+        </div>
+        <label class="toggle"><input type="checkbox" id="expAudio" /> Keep audio (1× speed only)</label>
+        <div class="hint" id="exportSummary"></div>
+      </div>
+      <div id="exportProgress" style="display:none;flex-direction:column;gap:8px">
+        <div class="bar"><div id="exportBar"></div></div>
+        <div class="hint" id="exportMsg">Rendering…</div>
+      </div>
+      <div class="row-end">
+        <button class="btn-ghost" id="btnExportCancel">Close</button>
+        <button class="btn-ghost" id="btnShare" style="display:none">Share</button>
+        <button class="btn-primary" id="btnExportGo">Render MP4</button>
+        <button class="btn-primary" id="btnSave" style="display:none">Save</button>
+      </div>
+    </div>
+  </div>
+
+  <video id="video" playsinline muted preload="auto" style="position:fixed;left:-9999px;top:-9999px;width:2px;height:2px;opacity:0;pointer-events:none"></video>
+  <script type="module" src="js/app.js?v=3"></script>
 </body>
 </html>
