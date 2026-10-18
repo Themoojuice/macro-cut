@@ -187,6 +187,11 @@ class Base {
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
     this.srcInfo = null;
   }
+  // Free the GPU context now instead of waiting for GC (phones cap live WebGL contexts and
+  // kill the oldest one, which would be the preview).
+  dispose() {
+    try { const ext = this.gl.getExtension('WEBGL_lose_context'); if (ext) ext.loseContext(); } catch (e) { /* ignore */ }
+  }
   // info: { texW, texH, dispW, dispH, rot (0..3 quarter turns CW) }
   upload(source, info, mip = false) {
     const gl = this.gl;
