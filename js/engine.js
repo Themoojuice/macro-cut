@@ -21,33 +21,77 @@ export function analysisSize(clip) {
   return A >= 1 ? [Math.round(short * A / 2) * 2, short] : [short, Math.round(short / A / 2) * 2];
 }
 
+// Tracks motion on a background thread (falls back to this thread if workers are unavailable).
+function makeTrackerChannel(w, h, roi) {
+  return new Promise(resolve => {
+    let worker = null;
+    try { worker = new Worker(new URL('./track-worker.js', import.meta.url), { type: 'module' }); } catch (e) { worker = null; }
+    if (!worker) return resolve(makeInline());
+    const handlers = { result: null };
+    const free = [];
+    let ready = false;
+    const t = setTimeout(() => { if (!ready) { worker.terminate(); worker = null; resolve(makeInline()); } }, 4000);
+    function makeInline() {
+      const tr = new MotionTracker(w, h, { roi }), g = new Float32Array(w * h);
+      return { inline: true, push(i, px, onResult) { for (let k = 0; k < g.length; k++) g[k] = px[k]; const r = tr.push(g); onResult({ i, C: r.C, ok: r.ok, inliers: r.inliers, sharp: frameSharpness(g, w, h) }); }, close() {} };
+    }
+    worker.onmessage = e => {
+      const m = e.data;
+      if (m.type === 'ready') { ready = true; clearTimeout(t); resolve(chan); }
+      else if (m.type === 'result') { free.push(m.buf); handlers.result && handlers.result(m); }
+    };
+    worker.onerror = e => {
+      if (!ready) { clearTimeout(t); resolve(makeInline()); return; }
+      chan.failed = (e && e.message) || 'motion tracker crashed';
+      handlers.result && handlers.result(null);
+    };
+    const chan = {
+      inline: false,
+      push(i, px, onResult) {
+        handlers.result = onResult;
+        const buf = free.pop() || new ArrayBuffer(w * h);
+        new Uint8Array(buf).set(px);
+        worker.postMessage({ type: 'frame', i, buf }, [buf]);
+      },
+      close() { worker.terminate(); },
+    };
+    worker.postMessage({ type: 'init', w, h, roi });
+  });
+}
+
 // Returns { C: Array<[a,b,tx,ty]>, ok: Uint8Array, sharp: Float32Array, inliers: Uint16Array }
 export async function analyseClip(clip, { roi = null, onProgress = () => {}, signal } = {}) {
   const [w, h] = analysisSize(clip);
   const ds = new Downscaler(w, h);
-  const tracker = new MotionTracker(w, h, { roi });
+  const chan = await makeTrackerChannel(w, h, roi);
   const N = clip.times.length;
   const idx = new Map();
   clip.times.forEach((t, i) => idx.set(Math.round(t * 1e6), i));
   const C = new Array(N).fill(null), ok = new Uint8Array(N), sharp = new Float32Array(N), inl = new Uint16Array(N);
-  const gray = new Float32Array(w * h);
-  let done = 0, last = performance.now();
-  try {
-  await decodeRange(clip, {
-    signal,
-    onFrame: async f => {
-      const i = idx.get(f.timestamp);
-      ds.grab(f, frameInfo(clip, f), gray);
-      f.close();
-      if (i === undefined) return;
-      const r = tracker.push(gray);
-      C[i] = r.C; ok[i] = r.ok ? 1 : 0; inl[i] = r.inliers;
-      sharp[i] = frameSharpness(gray, w, h);
-      done++;
-      if (performance.now() - last > 120) { last = performance.now(); onProgress(done / N); await tick(); }
-    },
+  const px = new Uint8Array(w * h);
+  let sent = 0, done = 0, last = performance.now(), wake = null;
+  const onResult = r => {
+    if (r) { C[r.i] = r.C; ok[r.i] = r.ok ? 1 : 0; inl[r.i] = r.inliers; sharp[r.i] = r.sharp; done++; }
+    if (wake) { const f = wake; wake = null; f(); }
+  };
+  const waitFor = cond => new Promise((res, rej) => {
+    const chk = () => (chan.failed ? rej(new Error(chan.failed)) : cond() ? res() : (wake = chk)); chk();
   });
-  } finally { ds.dispose(); }
+  try {
+    await decodeRange(clip, {
+      signal,
+      onFrame: async f => {
+        const i = idx.get(f.timestamp);
+        ds.grabBytes(f, frameInfo(clip, f), px);
+        f.close();
+        if (i === undefined) return;
+        chan.push(i, px, onResult); sent++;
+        if (sent - done > 6) await waitFor(() => sent - done <= 3);   // keep the worker fed, not flooded
+        if (performance.now() - last > 120) { last = performance.now(); onProgress(done / N); if (chan.inline) await tick(); }
+      },
+    });
+    await waitFor(() => done >= sent);
+  } finally { ds.dispose(); chan.close(); }
   if (signal && signal.aborted) return null;
   // any frame the decoder never produced: hold previous camera
   for (let i = 0; i < N; i++) if (!C[i]) { C[i] = i ? C[i - 1].slice() : [1, 0, 0, 0]; ok[i] = 0; }
@@ -142,7 +186,11 @@ export async function exportClip(clip, plan, { onProgress = () => {}, signal } =
       f.close();
       R.render(m, plan.look, { pxScale: 1 });
       for (const ts of outs) {
-        while (encoder.encodeQueueSize > 3 && !encErr) await new Promise(r => { wake = r; setTimeout(r, 50); });
+        const waitStart = performance.now();
+        while (encoder.encodeQueueSize > 3 && !encErr) {
+          if (performance.now() - waitStart > 20000) throw new Error('The video encoder stopped responding');
+          await new Promise(r => { wake = r; setTimeout(r, 50); });
+        }
         if (encErr) throw encErr;
         const vf = new VideoFrame(canvas, { timestamp: ts, duration: Math.round(1e6 / fps) });
         encoder.encode(vf, { keyFrame: emitted % keyEvery === 0 });

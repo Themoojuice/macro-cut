@@ -173,3 +173,9 @@ details#stabMore summary { font-size: 13px; color: var(--text-muted); cursor: po
 .more-body { display: flex; flex-direction: column; gap: 10px; padding-top: 8px; }
 
 .stat a { color: var(--accent); font-weight: 600; margin-left: 6px; }
+
+.shots-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; max-height: 52vh; overflow-y: auto; }
+.shot { background: var(--bg-elevated); border: 1px solid #2b323f; border-radius: 8px; overflow: hidden; display: flex; flex-direction: column; }
+.shot canvas { width: 100%; height: auto; display: block; cursor: pointer; }
+.shot .shot-row { display: flex; align-items: center; justify-content: space-between; padding: 6px 8px; font-size: 11px; color: var(--text-muted); }
+.shot button { background: var(--accent); color: #041214; border: none; border-radius: 6px; font-weight: 700; font-size: 11px; padding: 4px 10px; }
