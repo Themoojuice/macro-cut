@@ -159,3 +159,17 @@ input[type="range"] { flex: 1; accent-color: var(--accent); min-width: 0; height
 .sheet .row-end { display: flex; gap: 8px; justify-content: flex-end; }
 .bar { height: 8px; background: var(--bg-elevated); border-radius: 4px; overflow: hidden; }
 .bar > div { height: 100%; width: 0; background: var(--accent); }
+
+.big-switch { display: flex; align-items: center; gap: 12px; cursor: pointer; padding: 2px 0; }
+.big-switch input { display: none; }
+.big-switch .knob { width: 52px; height: 30px; border-radius: 15px; background: var(--bg-elevated); border: 1px solid #2b323f; position: relative; flex-shrink: 0; transition: background 0.15s; }
+.big-switch .knob::after { content: ''; position: absolute; top: 3px; left: 3px; width: 22px; height: 22px; border-radius: 50%; background: var(--text-muted); transition: transform 0.15s, background 0.15s; }
+.big-switch input:checked + .knob { background: var(--accent-dim); border-color: var(--accent); }
+.big-switch input:checked + .knob::after { transform: translateX(22px); background: var(--accent); }
+.big-switch-text { display: flex; flex-direction: column; font-size: 15px; }
+.big-switch-text span { font-size: 12px; color: var(--text-muted); }
+details#stabMore { border-top: 1px solid var(--line); padding-top: 8px; }
+details#stabMore summary { font-size: 13px; color: var(--text-muted); cursor: pointer; padding: 4px 0; }
+.more-body { display: flex; flex-direction: column; gap: 10px; padding-top: 8px; }
+
+.stat a { color: var(--accent); font-weight: 600; margin-left: 6px; }

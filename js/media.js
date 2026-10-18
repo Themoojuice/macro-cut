@@ -34,6 +34,12 @@ export function matrixRotation(m) {
 }
 
 // Sliding-window reader: sequential decode only ever holds ~16 MB of the file in memory.
+// Reject if a promise takes too long, so nothing on the load path can hang silently.
+export function withTimeout(p, ms, what) {
+  let t;
+  return Promise.race([p, new Promise((_, rej) => { t = setTimeout(() => rej(new Error(`${what} timed out`)), ms); })]).finally(() => clearTimeout(t));
+}
+
 export class WindowReader {
   constructor(file, win = 16 << 20) { this.file = file; this.win = win; this.start = 0; this.buf = null; }
   async read(off, len) {
@@ -106,9 +112,14 @@ export async function openClip(file, onStatus = () => {}) {
   const codedW = entry.width, codedH = entry.height;
   const dispW = rotation % 180 ? codedH : codedW, dispH = rotation % 180 ? codedW : codedH;
 
+  onStatus('Checking this phone can decode it…');
   let support;
-  try { support = await VideoDecoder.isConfigSupported(decoderConfig); } catch (e) { support = { supported: false }; }
-  if (!support.supported) throw new Error(`This browser can't decode ${codec}. Try recording in H.264 (turn off "High efficiency video").`);
+  try { support = await withTimeout(VideoDecoder.isConfigSupported(decoderConfig), 8000, 'decoder check'); }
+  catch (e) { support = { supported: false, why: e.message }; }
+  if (!support.supported) {
+    if (support.why && /timed out/.test(support.why)) throw new Error('The phone\'s video decoder didn\'t respond. Close other apps or tabs that are playing video, then try again.');
+    throw new Error(`This browser can't decode this video format (${codec.split('.')[0]}). In Camera settings, turn off "High efficiency video" and record again.`);
+  }
 
   // fps estimate (median frame interval)
   const iv = []; for (let i = 1; i < times.length; i++) iv.push(times[i] - times[i - 1]);
@@ -144,7 +155,7 @@ export async function chunkFor(clip, s, reader = clip.reader) {
  * Decode frames in presentation order between [fromUs, toUs]. onFrame(frame) may be async and MUST close the frame.
  * Frames outside the range are closed automatically. Returns when done or aborted (signal.aborted).
  */
-export async function decodeRange(clip, { fromUs = 0, toUs = Infinity, onFrame, signal, maxQueue = 3 }) {
+export async function decodeRange(clip, { fromUs = 0, toUs = Infinity, onFrame, signal, maxQueue = 3, stallMs = 15000 }) {
   const S = clip.samples;
   // decode-order start: last keyframe whose ts <= fromUs (search decode order)
   let start = 0;
@@ -153,13 +164,15 @@ export async function decodeRange(clip, { fromUs = 0, toUs = Infinity, onFrame, 
   let end = S.length - 1;
   for (let i = start; i < S.length; i++) { if (S[i].key && S[i].ts > toUs) { end = i - 1; break; } }
   const pending = [];
-  let err = null, wake = null;
-  const poke = () => { if (wake) { const w = wake; wake = null; w(); } };
+  let err = null, wake = null, lastProgress = performance.now();
+  const poke = () => { lastProgress = performance.now(); if (wake) { const w = wake; wake = null; w(); } };
   const dec = new VideoDecoder({
     output: f => { pending.push(f); poke(); },
     error: e => { err = e; poke(); },
   });
   dec.addEventListener('dequeue', poke);
+  // A hardware decoder that is busy elsewhere (e.g. the preview) can accept work and never answer.
+  const stalled = () => performance.now() - lastProgress > stallMs;
   dec.configure(clip.decoderConfig);
   const reader = new WindowReader(clip.file); // own window: decodes may run alongside each other
   let i = start, flushed = false;
@@ -175,14 +188,15 @@ export async function decodeRange(clip, { fromUs = 0, toUs = Infinity, onFrame, 
     while (true) {
       if (err) throw err;
       if (signal && signal.aborted) break;
-      if (pending.length) { await drain(); continue; }
+      if (pending.length) { await drain(); lastProgress = performance.now(); continue; }
       if (i <= end) {
-        if (dec.decodeQueueSize < 4 && pending.length < maxQueue) { const ch = await chunkFor(clip, S[i++], reader); if (dec.state === 'configured') dec.decode(ch); continue; }
+        if (dec.decodeQueueSize < 4 && pending.length < maxQueue) { const ch = await chunkFor(clip, S[i++], reader); if (dec.state === 'configured') dec.decode(ch); lastProgress = Math.max(lastProgress, performance.now() - stallMs / 2); continue; }
       } else if (!flushed) {
         flushed = true;
-        await dec.flush();
+        await withTimeout(dec.flush(), stallMs, 'Video decoder');
         continue;
       } else break;
+      if (stalled()) throw new Error('The video decoder stopped responding');
       await new Promise(r => { wake = r; setTimeout(r, 30); });
     }
     await drain();
