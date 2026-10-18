@@ -64,6 +64,17 @@ function bilin(d, w, h, x, y) {
 }
 
 // ───────────────────────── features (Shi–Tomasi, grid-spread) ─────────────────────────
+// Expected min-eigenvalue score of pure sensor noise (5×5 window), from a robust noise estimate.
+function noiseFloor(img, w, h) {
+  const v = [];
+  for (let y = 2; y < h - 2; y += 3) for (let x = 2; x < w - 2; x += 3) {
+    const i = y * w + x;
+    v.push(Math.abs(4 * img[i] - img[i - 1] - img[i + 1] - img[i - w] - img[i + w]));
+  }
+  v.sort((a, b) => a - b);
+  const sigma = 1.4826 * v[v.length >> 1] / Math.sqrt(20);       // Laplacian of white noise has σ·√20
+  return Math.max(12, 25 * 0.5 * sigma * sigma * 3);               // ~3× the noise-only score
+}
 // mask(x, y) → boolean (optional). Returns Float32Array [x0,y0,x1,y1,…] in level-0 pixels.
 export function detectFeatures(img, w, h, maxN = 160, mask = null, margin = 12, rect = null) {
   const gx = new Float32Array(w * h), gy = new Float32Array(w * h);
@@ -116,7 +127,8 @@ export function detectFeatures(img, w, h, maxN = 160, mask = null, margin = 12, 
   // Robust threshold: relative to the typical cell, not the single strongest point
   // (a specular catch-light in a spider's eye would otherwise wipe out all substrate texture).
   const med = best.map(b => b[0]).sort((a, b) => a - b)[best.length >> 1] || 0;
-  const floor = Math.max(150, 0.1 * med, 0.002 * maxScore);
+  // Absolute floor tied to sensor noise, so low-contrast (HDR, smooth bokeh) footage still gets points.
+  const floor = Math.max(noiseFloor(img, w, h), 0.1 * med, 0.002 * maxScore);
   const sel = best.filter(b => b[0] > floor).sort((a, b) => b[0] - a[0]).slice(0, maxN);
   const out = new Float32Array(sel.length * 2);
   sel.forEach(([, i], k) => { out[2 * k] = i % w; out[2 * k + 1] = (i / w) | 0; });
@@ -236,7 +248,7 @@ function countInliers(M, S, D, idx, thr2, out) {
   return c;
 }
 
-export function ransacSimilarity(S, D, idx, thr = 1.2, iters = 160, seed = 1) {
+export function ransacSimilarity(S, D, idx, thr = 1.2, iters = 160, seed = 1, prior = null) {
   if (idx.length < 4) return null;
   let s = seed >>> 0 || 1;
   const rnd = () => { s ^= s << 13; s >>>= 0; s ^= s >>> 17; s ^= s << 5; s >>>= 0; return s / 4294967296; };
@@ -253,6 +265,15 @@ export function ransacSimilarity(S, D, idx, thr = 1.2, iters = 160, seed = 1) {
     const M = [a, b, D[2 * i] - (a * S[2 * i] - b * S[2 * i + 1]), D[2 * i + 1] - (b * S[2 * i] + a * S[2 * i + 1])];
     const c = countInliers(M, S, D, idx, thr2, tmp);
     if (c > bestC) { bestC = c; best = M; bestIn = tmp.slice(); }
+  }
+  // Temporal stickiness: when two motion layers compete (spider vs leaf), keep following the one the
+  // prediction points at unless the other clearly dominates. Flipping layers frame-to-frame is jitter.
+  if (prior) {
+    const pin = []; countInliers(prior, S, D, idx, (thr * 2.5) ** 2, pin);
+    if (pin.length >= 6 && pin.length >= 0.6 * bestC) {
+      const Mp = lsqSimilarity(S, D, pin);
+      if (Mp) { const t = []; const c = countInliers(Mp, S, D, idx, thr2, t); if (c >= 4) { best = Mp; bestIn = t; bestC = c; } }
+    }
   }
   if (!best || bestC < 4) return null;
   let M = best, inl = bestIn;
@@ -324,9 +345,28 @@ export class MotionTracker {
     }
     const { pts, status } = trackLK(key.tpl, key.feats, pyr, guess);
     const idx = []; for (let i = 0; i < n; i++) if (status[i]) idx.push(i);
-    const fit = ransacSimilarity(key.feats, pts, idx, 1.2, 160, this.seed++);
+    const fit = ransacSimilarity(key.feats, pts, idx, 1.2, 160, this.seed++, guessM);
     if (!fit) return null;
     fit.tracked = idx.length;
+    // Rotation/scale are only trustworthy if the inliers are spread out. A tight cluster (e.g. only the
+    // spider has texture) pins translation but not rotation/scale: keep those from the prediction instead.
+    let mx = 0, my = 0;
+    for (const i of fit.inlierIdx) { mx += key.feats[2 * i]; my += key.feats[2 * i + 1]; }
+    mx /= fit.inliers; my /= fit.inliers;
+    let sp = 0;
+    for (const i of fit.inlierIdx) sp += (key.feats[2 * i] - mx) ** 2 + (key.feats[2 * i + 1] - my) ** 2;
+    sp = Math.sqrt(sp / fit.inliers);
+    fit.spread = sp / this.h;
+    if (fit.spread < 0.14) {
+      const a = guessM[0], b = guessM[1];
+      let tx = 0, ty = 0;
+      for (const i of fit.inlierIdx) {
+        tx += pts[2 * i] - (a * key.feats[2 * i] - b * key.feats[2 * i + 1]);
+        ty += pts[2 * i + 1] - (b * key.feats[2 * i] + a * key.feats[2 * i + 1]);
+      }
+      fit.M = [a, b, tx / fit.inliers, ty / fit.inliers];
+      fit.transOnly = true;
+    }
     return fit;
   }
 
@@ -368,36 +408,51 @@ export class MotionTracker {
     }
     const kf = this.kf;
     let C = null, ok = false, inliers = 0, Q = null;
-    const minIn = Math.max(10, Math.round(0.35 * kf.n0));
+    const minIn = Math.max(8, Math.round(0.2 * kf.n0));
     const good = f => f && f.inliers >= minIn;
-    let fit = this._estimate(kf, pyr, kf.Q);
+    // constant-velocity prediction (handles deliberate follow-pans)
+    let pred = kf.Q;
+    if (kf.Qp) pred = [kf.Q[0], kf.Q[1], 2 * kf.Q[2] - kf.Qp[2], 2 * kf.Q[3] - kf.Qp[3]];
+    let fit = this._estimate(kf, pyr, pred);
+    if (!good(fit) && kf.Qp) fit = this._estimate(kf, pyr, kf.Q) || fit;
     if (!good(fit) && kf.n0 >= 12) fit = this._estimate(kf, pyr, this._globalGuess(kf, pyr, kf.Q)) || fit;
     if (good(fit)) {
       Q = fit.M; inliers = fit.inliers; ok = true;
       C = compose(kf.C, invert(pixToNorm(Q, this.w, this.h)));
-    } else if (this.prev.ok) {
-      // frame-to-frame fallback, only from a frame we trust
+    } else {
+      // Frame-to-frame fallback. If the previous frame was itself lost its camera is a placeholder,
+      // but relative motion is still right and the gap gets re-interpolated afterwards.
       const pk = this._makeKey(this.prev.pyr, this.prev.C);
-      const f2 = this._estimate(pk, pyr, IDENT);
-      if (f2 && f2.inliers >= Math.max(8, 0.35 * pk.feats.length / 2)) {
+      const vel = this.prev.vel || IDENT;
+      let f2 = this._estimate(pk, pyr, vel);
+      if (!(f2 && f2.inliers >= 8) && pk.feats.length >= 24) f2 = this._estimate(pk, pyr, this._globalGuess(pk, pyr, vel)) || f2;
+      if (f2 && f2.inliers >= Math.max(8, 0.2 * pk.feats.length / 2)) {
         C = compose(this.prev.C, invert(pixToNorm(f2.M, this.w, this.h)));
-        ok = true; inliers = f2.inliers;
+        ok = this.prev.ok; inliers = f2.inliers; this._f2 = f2.M;
+        if (!ok) { this.relock = true; }
       }
     }
+    // Physically implausible single-frame rotation/zoom jumps are tracking errors, not camera motion.
+    if (C && this.prev.ok) {
+      const d = toParams(compose(invert(this.prev.C), C));
+      if (Math.abs(d.th) > 0.04 || Math.abs(d.ls) > 0.03) { C = null; Q = null; ok = false; }
+    }
     let rekey = false;
-    if (ok) {
-      this.fails = 0;
+    const f2ok = !Q && C !== null;   // recovered via frame-to-frame
+    if (ok || f2ok) {
+      if (ok) this.fails = 0;
       if (Q) {
         const p = toParams(Q);
         rekey = inliers < 0.6 * kf.n0 || Math.abs(p.th) > 0.06 || Math.abs(p.ls) > 0.05;
-        kf.Q = Q;
+        kf.Qp = kf.Q; kf.Q = Q;
       } else rekey = true;
+      if (!ok) this.fails++;
     } else {
       // Lost (blur, occlusion). Keep the last good keyframe so we can re-acquire against it;
-      // only give up on it if it was poor or we've been lost for a long time.
+      // only give up on it if it was poor or we've been lost for a while.
       this.fails++;
       C = this.prev.C.slice();
-      if (kf.n0 < 12 || this.fails > 90) rekey = true;
+      if (kf.n0 < 12 || this.fails > 20) rekey = true;
     }
     if (rekey) {
       const cand = this._makeKey(pyr, C); cand.n0 = cand.feats.length / 2;
@@ -405,10 +460,13 @@ export class MotionTracker {
       // last sharp anchor and re-acquire against it when focus returns.
       const kfBad = kf.n0 < 12;
       const candOk = cand.n0 >= Math.max(12, 0.3 * kf.n0) && cand.sharp >= 0.65 * kf.sharp;
-      if ((kfBad && cand.n0 > kf.n0) || candOk || (this.fails > 90 && cand.n0 >= 12)) this.kf = cand;
+      if ((kfBad && cand.n0 > kf.n0) || candOk || (f2ok && cand.n0 >= 12) || (this.fails > 20 && cand.n0 >= 12)) this.kf = cand;
       else rekey = false;
     }
-    this.prev = { pyr, C, ok };
+    // per-frame velocity in pixel space (for predicting the next frame-to-frame step)
+    let vel = IDENT;
+    if (C && this.prev.C) { const d = compose(invert(C), this.prev.C); vel = [1, 0, d[2] * this.h, d[3] * this.h]; }
+    this.prev = { pyr, C, ok, vel };
     return { C, ok, inliers, rekey };
   }
 }

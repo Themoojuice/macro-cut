@@ -1,5 +1,5 @@
 import { openClip, decodeRange } from './media.js';
-import { Renderer, Downscaler, DEFAULT_LOOK } from './gpu.js';
+import { Renderer, DEFAULT_LOOK } from './gpu.js';
 import { computeStabilisation, clampPan, frameAt } from './core.js';
 import { analyseClip, exportClip, frameInfo } from './engine.js';
 
@@ -15,7 +15,7 @@ const LOOK_PRESETS = {
 const state = {
   clip: null, segments: [], sel: 0,
   analysis: null, analysing: null,
-  stab: { mode: 'smooth', sigma: 0.8, maxCrop: 0.2, rotation: true, zoom: true, roiMode: 'all', roi: null },
+  stab: { mode: 'smooth', sigma: 0.8, maxCrop: 0.25, rotation: true, zoom: true, roiMode: 'all', roi: null },
   frame: { aspect: 'native', rot: 0, quarter: 0, zoom: 1, panX: 0, panY: 0 },
   look: { ...DEFAULT_LOOK },
   speed: 1,
@@ -138,15 +138,16 @@ async function loadFile(file) {
     video.muted = true;
     await new Promise((res, rej) => { video.onloadeddata = res; video.onerror = () => rej(new Error('The browser could not play this file.')); });
     video.currentTime = 0;
-    state.previewInfo = await detectPreviewOrientation(clip);
+    state.previewInfo = await detectPreview(clip);
     video.muted = state.muted;
-    $('metaBadge').textContent = `${clip.dispW}×${clip.dispH} · ${Math.round(clip.fps)}fps · ${clip.codec.split('.')[0]}`;
+    $('metaBadge').textContent = `${clip.dispW}×${clip.dispH} · ${Math.round(clip.fps)}fps · ${clip.codec.split('.')[0]}${clip.hdr ? ' · HDR' : ''}`;
     $('durTime').textContent = fmt(clip.duration);
     for (const id of ['btnPlay', 'btnPrev', 'btnNext', 'btnExport', 'btnStill']) $(id).disabled = false;
     clearHeatmap(); renderSegments(); syncControls(); updateSpeedInfo();
     recompute();
     uploadVideo(); draw();
-    hideToast(); toast('Loaded. Next: Stabilise → Analyse motion', 2500);
+    hideToast();
+    toast(clip.hdr ? `HDR (${clip.hdr.toUpperCase()}) clip: converting to standard colour. Next: Stabilise → Analyse motion` : 'Loaded. Next: Stabilise → Analyse motion', 3500);
   } catch (e) {
     console.error(e);
     toast(e.message || String(e), 6000);
@@ -154,25 +155,33 @@ async function loadFile(file) {
   }
 }
 
-const corr = (a, b) => {
-  let ma = 0, mb = 0; for (let i = 0; i < a.length; i++) { ma += a[i]; mb += b[i]; } ma /= a.length; mb /= b.length;
-  let s = 0, sa = 0, sb = 0; for (let i = 0; i < a.length; i++) { const x = a[i] - ma, y = b[i] - mb; s += x * y; sa += x * x; sb += y * y; }
-  return s / Math.sqrt(sa * sb + 1e-9);
-};
-// Browsers differ on whether <video> textures arrive already rotated. Measure it against a decoded frame.
-async function detectPreviewOrientation(clip) {
-  const disp = { texW: clip.dispW, texH: clip.dispH, dispW: clip.dispW, dispH: clip.dispH, rot: 0 };
-  if (!clip.rotation) return disp;
-  const alt = { texW: clip.codedW, texH: clip.codedH, dispW: clip.dispW, dispH: clip.dispH, rot: clip.rotation / 90 };
+// Browsers differ on whether <video> textures arrive rotated, and on whether HDR is colour-managed on upload.
+// Measure it: render the first frame from the decoder (whose handling we know) and from <video> under each
+// candidate interpretation, and keep the one that matches.
+async function detectPreview(clip) {
+  const base = { texW: clip.dispW, texH: clip.dispH, dispW: clip.dispW, dispH: clip.dispH, rot: 0, hdr: 0 };
+  if (!clip.rotation && !clip.hdr) return base;
+  const cands = [base];
+  if (clip.rotation) cands.push({ texW: clip.codedW, texH: clip.codedH, dispW: clip.dispW, dispH: clip.dispH, rot: clip.rotation / 90, hdr: 0 });
+  if (clip.hdr) for (const c of cands.slice()) cands.push({ ...c, hdr: clip.hdr === 'hlg' ? 1 : 2 });
+  let R = null;
   try {
     await new Promise(r => { if (video.readyState >= 2 && !video.seeking) r(); else video.addEventListener('seeked', r, { once: true }); setTimeout(r, 800); });
-    const ds = new Downscaler(48, 48);
+    const tw = 64, th = Math.max(8, Math.round(64 * clip.dispH / clip.dispW));
+    const cv = typeof OffscreenCanvas !== 'undefined' ? new OffscreenCanvas(tw, th) : Object.assign(document.createElement('canvas'), { width: tw, height: th });
+    R = new Renderer(cv); R.setSize(tw, th);
     let ref = null;
-    await decodeRange(clip, { fromUs: 0, toUs: 0, onFrame: f => { if (!ref) ref = ds.grab(f, frameInfo(clip, f)).slice(); f.close(); } });
-    const a = ds.grab(video, disp).slice(), b = ds.grab(video, alt).slice();
-    ds.dispose();
-    return corr(a, ref) >= corr(b, ref) ? disp : alt;
-  } catch (e) { console.warn('orientation probe failed', e); return disp; }
+    await decodeRange(clip, { fromUs: 0, toUs: 0, onFrame: f => { if (!ref) { R.upload(f, frameInfo(clip, f)); ref = R.thumb().slice(); } f.close(); } });
+    if (!ref) return base;
+    let best = base, bestD = Infinity;
+    for (const c of cands) {
+      R.upload(video, c); const t = R.thumb();
+      let d = 0; for (let i = 0; i < t.length; i += 4) d += Math.abs(t[i] - ref[i]) + Math.abs(t[i + 1] - ref[i + 1]) + Math.abs(t[i + 2] - ref[i + 2]);
+      if (d < bestD) { bestD = d; best = c; }
+    }
+    return best;
+  } catch (e) { console.warn('preview probe failed', e); return base; }
+  finally { if (R) R.dispose(); }
 }
 
 function uploadVideo() {

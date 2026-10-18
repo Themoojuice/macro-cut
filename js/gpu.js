@@ -36,10 +36,40 @@ void main(){
   o = vec4(l, l, l, 1.0);
 }`;
 
+// Undo a BT.709 interpretation of an HDR (BT.2020 HLG/PQ) signal, then convert to SDR BT.709:
+// HLG inverse OETF + OOTF (1000 nit) or PQ EOTF, ref-white 203 nit → 1.0, 2020→709 gamut,
+// Möbius highlight roll-off on the max channel (hue/saturation preserving), sRGB encode.
+const HDR = `
+uniform int u_hdr;
+vec3 hdrFix(vec3 n) {
+  float Y = dot(n, vec3(0.2126, 0.7152, 0.0722));
+  float Cb = (n.b - Y) / 1.8556, Cr = (n.r - Y) / 1.5748;
+  float R = Y + 1.4746 * Cr, B = Y + 1.8814 * Cb, G = (Y - 0.2627 * R - 0.0593 * B) / 0.6780;
+  vec3 E = clamp(vec3(R, G, B), 0.0, 1.0), lin;
+  if (u_hdr == 1) {
+    const float a = 0.17883277, b = 0.28466892, c = 0.55991073;
+    lin = mix(E * E / 3.0, (exp((E - c) / a) + b) / 12.0, step(0.5, E));
+    float Ys = dot(lin, vec3(0.2627, 0.6780, 0.0593));
+    lin = 1000.0 * pow(max(Ys, 1e-6), 0.2) * lin / 203.0;
+  } else {
+    const float m1 = 0.1593017578125, m2 = 78.84375, c1 = 0.8359375, c2 = 18.8515625, c3 = 18.6875;
+    vec3 p = pow(E, vec3(1.0 / m2));
+    lin = 10000.0 * pow(max(p - c1, 0.0) / (c2 - c3 * p), vec3(1.0 / m1)) / 203.0;
+  }
+  vec3 rgb = max(mat3(1.6605, -0.1246, -0.0182, -0.5876, 1.1329, -0.1006, -0.0728, -0.0083, 1.1187) * lin, 0.0);
+  const float P = 1000.0 / 203.0, j = 0.3;
+  float sig = max(max(rgb.r, max(rgb.g, rgb.b)), 1e-6);
+  float aa = -j * j * (P - 1.0) / (j * j - 2.0 * j + P), bb = (j * j - 2.0 * j * P + P) / (P - 1.0);
+  float m = sig <= j ? sig : (bb * bb + 2.0 * bb * j + j * j) / (bb - aa) * (sig + aa) / (sig + bb);
+  rgb = clamp(rgb * (m / sig), 0.0, 1.0);
+  return mix(rgb * 12.92, 1.055 * pow(rgb, vec3(1.0 / 2.4)) - 0.055, step(0.0031308, rgb));
+}`;
+
 const FS_WARP = `#version 300 es
 precision highp float;
 uniform sampler2D u_src; uniform vec2 u_out; uniform mat2 u_L; uniform vec2 u_t; uniform int u_cubic;
 ${ORIENT}
+${HDR}
 out vec4 o;
 vec4 cubic(vec2 uv) {
   vec2 sp = uv * u_texSize, t1 = floor(sp - 0.5) + 0.5, f = sp - t1;
@@ -63,8 +93,9 @@ void main(){
   vec2 on = vec2((q.x / u_out.x - 0.5) * (u_out.x / u_out.y), q.y / u_out.y - 0.5);
   vec2 uv = dispToUV(u_L * on + u_t);
   if (any(lessThan(uv, vec2(-0.002))) || any(greaterThan(uv, vec2(1.002)))) { o = vec4(0.06, 0.07, 0.08, 1.0); return; }
-  vec3 c = u_cubic == 1 ? cubic(uv).rgb : texture(u_src, uv).rgb;
-  o = vec4(clamp(c, 0.0, 1.0), 1.0);
+  vec3 c = clamp(u_cubic == 1 ? cubic(uv).rgb : texture(u_src, uv).rgb, 0.0, 1.0);
+  if (u_hdr > 0) c = hdrFix(c);
+  o = vec4(c, 1.0);
 }`;
 
 const FS_BLUR = `#version 300 es
@@ -266,6 +297,14 @@ export class Renderer extends Base {
     this.A = makeTex(gl, w, h); this.B = makeTex(gl, w, h); this.Cc = makeTex(gl, w, h);
     this.size = [w, h];
   }
+  // Small RGB thumbnail of the current source (whole frame, no look), for calibration probes.
+  thumb() {
+    const gl = this.gl, [w, h] = this.size;
+    this.render([1, 0, 0, 0], null, { raw: true });
+    const px = new Uint8Array(w * h * 4);
+    gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, px);
+    return px;
+  }
   // M: [a,b,tx,ty] output-norm → source display-norm. look: params. opts: { raw, pxScale }
   render(M, look, opts = {}) {
     const gl = this.gl, [w, h] = this.size, info = this.srcInfo;
@@ -280,6 +319,7 @@ export class Renderer extends Base {
     gl.uniformMatrix2fv(this.warp.u.u_L, false, [M[0], M[1], -M[1], M[0]]);
     gl.uniform2f(this.warp.u.u_t, M[2], M[3]);
     gl.uniform1i(this.warp.u.u_cubic, !this.mip && scale < 1.25 ? 1 : 0);
+    gl.uniform1i(this.warp.u.u_hdr, info.hdr || 0);
     this.setOrient(this.warp, info);
     this.draw(this.A.fb, w, h);
     const raw = !!opts.raw;

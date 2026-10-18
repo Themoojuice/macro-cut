@@ -1,6 +1,6 @@
 // Analysis (motion tracking) and export (frame-accurate WebCodecs render → MP4).
 /* global Mp4Muxer */
-import { decodeRange, WindowReader } from './media.js';
+import { decodeRange, WindowReader, hdrMode } from './media.js';
 import { Downscaler, Renderer } from './gpu.js';
 import { MotionTracker, frameSharpness, frameAt, fillGaps } from './core.js';
 
@@ -10,6 +10,7 @@ export function frameInfo(clip, f) {
     texW: f.displayWidth, texH: f.displayHeight,
     dispW: odd ? f.displayHeight : f.displayWidth, dispH: odd ? f.displayWidth : f.displayHeight,
     rot: clip.rotation / 90,
+    hdr: hdrMode(clip, f.colorSpace),
   };
 }
 
