@@ -17,6 +17,15 @@ function audioDescription(entry) {
   return undefined;
 }
 
+// HDR handling per frame source. If the browser already knows the frame is HDR it colour-manages the
+// upload itself (0). If the container says HDR but the browser doesn't, it uploads the HDR signal as if it
+// were ordinary BT.709 video (washed out), and the shader undoes that and converts properly (1 = HLG, 2 = PQ).
+export function hdrMode(clip, cs) {
+  const t = cs && cs.transfer;
+  if (t === 'hlg' || t === 'pq' || t === 'smpte2084' || t === 'arib-std-b67') return 0;
+  return clip.hdr === 'hlg' ? 1 : clip.hdr === 'pq' ? 2 : 0;
+}
+
 // Clockwise display rotation (0/90/180/270) from a tkhd matrix (16.16 fixed point).
 export function matrixRotation(m) {
   if (!m || m.length < 5) return 0;
@@ -90,6 +99,10 @@ export async function openClip(file, onStatus = () => {}) {
   const decoderConfig = { codec, codedWidth: entry.width, codedHeight: entry.height };
   if (desc) decoderConfig.description = desc;
   const rotation = matrixRotation(vt.matrix);
+  // HDR transfer from the container's colour box (nclx): 18 = HLG, 16 = PQ
+  const colr = entry.colr || (entry.boxes || []).find(b => b.type === 'colr');
+  const trc = colr && colr.colour_type === 'nclx' ? colr.transfer_characteristics : null;
+  const hdr = trc === 18 ? 'hlg' : trc === 16 ? 'pq' : null;
   const codedW = entry.width, codedH = entry.height;
   const dispW = rotation % 180 ? codedH : codedW, dispH = rotation % 180 ? codedW : codedH;
 
@@ -117,7 +130,7 @@ export async function openClip(file, onStatus = () => {}) {
   }
   const duration = times[times.length - 1] + (iv.length ? iv[iv.length >> 1] : 1 / 30);
   return {
-    file, reader: new WindowReader(file), codec, decoderConfig, samples, times, fps, rotation,
+    file, reader: new WindowReader(file), codec, decoderConfig, samples, times, fps, rotation, hdr,
     codedW, codedH, dispW, dispH, duration, audio,
     name: file.name,
   };
