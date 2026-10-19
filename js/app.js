@@ -284,15 +284,59 @@ document.addEventListener('visibilitychange', () => {
 });
 
 // Free the preview's hardware decoder while analysis/export decode the file, then bring it back.
+let parked = 0;
 async function parkVideo() {
   const t = state.mediaTime;
-  pause(); video.removeAttribute('src'); video.load();
+  parked++; pause(); video.removeAttribute('src'); video.load();
   return async () => {
     video.src = videoURL;
     try { await waitVideo('loadeddata', 15000); video.currentTime = t; await waitVideo('seeked', 3000).catch(() => {}); }
     catch (e) { toast('Preview reload failed: ' + e.message, 4000); }
+    finally { parked = Math.max(0, parked - 1); }
   };
 }
+
+// Phones reclaim the hardware video decoder (app switch, memory pressure, many tabs). The <video> then sits on
+// "waiting" forever. Detect that and reattach the file at the same spot, then carry on as if nothing happened.
+let reviving = null;
+function reviveVideo(why) {
+  if (reviving || parked || !state.clip || !videoURL) return reviving;
+  const t = state.mediaTime, wasPlaying = state.playing;
+  console.warn('reviving preview:', why);
+  toast('Video stalled, restarting the preview…', 2500);
+  reviving = (async () => {
+    try {
+      video.pause(); video.removeAttribute('src'); video.load();
+      video.src = videoURL; video.muted = state.muted;
+      await waitVideo('loadeddata', 15000);
+      video.currentTime = t; await waitVideo('seeked', 4000).catch(() => {});
+      showFrame(video.currentTime);
+      if (wasPlaying && state.playing) { applyPreviewRate(); await video.play(); }
+      hideToast(); return true;
+    } catch (e) {
+      if (e.name === 'AbortError') return true;
+      pause();
+      toast('The phone\'s video player stopped responding. Close other tabs that play video, or reload MacroCut; your edit is saved.', 8000);
+      return false;
+    } finally { reviving = null; playProgress.at = performance.now(); }
+  })();
+  return reviving;
+}
+const playProgress = { t: -1, at: 0, revives: 0 };
+function watchPlayback() {
+  if (!state.playing || reviving || parked) return;
+  const now = performance.now(), t = video.currentTime;
+  if (Math.abs(t - playProgress.t) > 1e-4) { playProgress.t = t; playProgress.at = now; return; }
+  if (now - playProgress.at > 3000 && document.visibilityState === 'visible') {
+    if (playProgress.revives >= 2) { pause(); toast('The phone\'s video player stopped responding. Close other tabs that play video, or reload MacroCut; your edit is saved.', 8000); return; }
+    playProgress.revives++; reviveVideo('no progress for 3 s');
+  }
+}
+video.addEventListener('error', () => { if (state.clip && !parked && video.getAttribute('src')) reviveVideo('media error ' + (video.error && video.error.code)); });
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && state.clip && !parked && video.getAttribute('src') && (video.readyState < 2 || video.error)) reviveVideo('decoder lost while in background');
+  playProgress.at = performance.now();
+});
 
 function uploadVideo() {
   if (!state.clip || !state.previewInfo || video.readyState < 2) return;
@@ -336,7 +380,10 @@ function seek(t) {
   if (!state.clip) return;
   t = Math.max(0, Math.min(state.clip.duration - 1e-3, t));
   video.currentTime = t; state.mediaTime = t; updatePlayhead();
+  clearTimeout(seekGuard);
+  seekGuard = setTimeout(() => { if (!state.playing && !parked && video.seeking && state.clip) reviveVideo('seek never completed'); }, 4000);
 }
+let seekGuard = null;
 
 // ───────────── playback ─────────────
 function checkSegmentBounds() {
@@ -351,9 +398,14 @@ function play() {
   const t = video.currentTime;
   if (!state.segments.some(s => t >= s.start && t < s.end - 0.05)) video.currentTime = state.segments[0].start;
   applyPreviewRate();
-  video.play().catch(e => { state.playing = false; $('btnPlay').textContent = '▶'; toast('Playback blocked: ' + e.message, 3000); });
+  Object.assign(playProgress, { t: -1, at: performance.now(), revives: 0 });
+  if (video.readyState < 2 || video.error) reviveVideo('not ready on play');
+  else video.play().catch(e => {
+    if (e.name === 'AbortError') return;   // play() cancelled by a pause/seek: harmless, not an error
+    state.playing = false; $('btnPlay').textContent = '▶'; toast('Playback blocked: ' + e.message, 3000);
+  });
   state.playing = true; $('btnPlay').textContent = '⏸';
-  const tickLoop = () => { if (!state.playing) return; checkSegmentBounds(); applyPreviewRate(); requestAnimationFrame(tickLoop); };
+  const tickLoop = () => { if (!state.playing) return; if (!reviving) checkSegmentBounds(); applyPreviewRate(); watchPlayback(); requestAnimationFrame(tickLoop); };
   requestAnimationFrame(tickLoop);
 }
 function pause() { video.pause(); state.playing = false; $('btnPlay').textContent = '▶'; }
@@ -1102,4 +1154,4 @@ updateSpeedInfo();
 if (!('VideoDecoder' in window)) toast('This browser lacks WebCodecs. Use Chrome on Android/desktop.', 8000);
 window.addEventListener('resize', () => updateReticle());
 if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
-window.__macrocut = { state, loadFile, recompute, setStabOn, setSpeed, seek }; // debugging / tests
+window.__macrocut = { state, loadFile, recompute, setStabOn, setSpeed, seek, video }; // debugging / tests
