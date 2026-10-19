@@ -13,6 +13,8 @@ A phone-first video editor for handheld macro footage (jumping spiders, mostly).
 5. **Export** → Render MP4 → Save / Share. Slowed parts get smooth slow motion (Speed tab switch, on by default). Tick **✨ Extra clean** for grainy (low-light) footage.
 6. **📸** → *Find the sharpest shots* for full-resolution stills (for iNaturalist), or save the current frame. **Stack this moment** fuses the frames within ±0.3 s into one still, taking each region from whichever frame had it sharpest (tap the result to compare with the single frame).
 
+**↶ / ↷** (top bar, or Ctrl+Z / Ctrl+Shift+Z) undo and redo any edit: cuts, looks, framing, speed, stabilise settings. One slider drag or pinch is one step; the shake measurement is never thrown away.
+
 Your edit saves automatically on the phone; open the same clip again and it's all back (Trim → *Start this clip over* to reset).
 
 ## What's under the hood
@@ -53,4 +55,4 @@ vendor/                   mp4box.js (BSD-3), mp4-muxer (MIT)
 test/                     synthetic clip generators, Node scoring, headless-browser end-to-end tests
 ```
 
-Tests: `test/make_hard.py` (realistic hard synthetic clip with ground truth) + `test/score.mjs` (tracking error and jitter), `test/real_track.mjs` (real footage), `test/features.py` (every control measured on exported files), `test/e2e.py`, `test/hdr_e2e.py`, `test/hang.py` (simulated dead decoders), `test/upgrades.py` (auto-cut + best shots), `test/parts.py` (per-part look/speed), `test/flow.test.mjs` + `test/slowmo.py` (in-between frames vs real 60 fps frames), `test/save.py` (save/restore), `test/stall.py` (preview recovers when the phone takes the video decoder away), `test/denoise.proto.py` + `test/clean.py` (Extra clean vs noise-free truth), `test/make_focus.py` + `test/stack.py` (stacked still vs all-sharp truth), `test/stackreal.py` + `test/stackui.py` (stacking on real footage).
+Tests: `test/make_hard.py` (realistic hard synthetic clip with ground truth) + `test/score.mjs` (tracking error and jitter), `test/real_track.mjs` (real footage), `test/features.py` (every control measured on exported files), `test/e2e.py`, `test/hdr_e2e.py`, `test/hang.py` (simulated dead decoders), `test/upgrades.py` (auto-cut + best shots), `test/parts.py` (per-part look/speed), `test/flow.test.mjs` + `test/slowmo.py` (in-between frames vs real 60 fps frames), `test/save.py` (save/restore), `test/undo.py` (undo/redo steps), `test/stall.py` (preview recovers when the phone takes the video decoder away), `test/denoise.proto.py` + `test/clean.py` (Extra clean vs noise-free truth), `test/make_focus.py` + `test/stack.py` (stacked still vs all-sharp truth), `test/stackreal.py` + `test/stackui.py` (stacking on real footage).

@@ -6,7 +6,7 @@
   <meta name="theme-color" content="#0b0d10" />
   <title>MacroCut</title>
   <link rel="manifest" href="manifest.json" />
-  <link rel="stylesheet" href="css/app.css?v=12" />
+  <link rel="stylesheet" href="css/app.css?v=13" />
   <script src="vendor/mp4box.all.min.js"></script>
   <script src="vendor/mp4-muxer.js"></script>
 </head>
@@ -18,6 +18,10 @@
       <span class="badge-pill" id="metaBadge">No clip</span>
     </div>
     <div class="top-right">
+      <div class="undo-group">
+        <button class="icon-btn" id="btnUndo" title="Undo (Ctrl+Z)" aria-label="Undo" disabled>↶</button>
+        <button class="icon-btn" id="btnRedo" title="Redo (Ctrl+Shift+Z)" aria-label="Redo" disabled>↷</button>
+      </div>
       <button class="icon-btn" id="btnStill" title="Stills: this frame or the sharpest shots" disabled>📸</button>
       <button class="btn-primary" id="btnExport" disabled>Export</button>
     </div>
@@ -232,6 +236,6 @@
   </div>
 
   <video id="video" playsinline muted preload="auto" style="position:fixed;left:-9999px;top:-9999px;width:2px;height:2px;opacity:0;pointer-events:none"></video>
-  <script type="module" src="js/app.js?v=12"></script>
+  <script type="module" src="js/app.js?v=13"></script>
 </body>
 </html>
