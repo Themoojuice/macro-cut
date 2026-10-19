@@ -166,6 +166,94 @@ void main() {
   o = vec4(acc.rgb / acc.a, 1.0);
 }`;
 
+// Focus stacking (texture space of the centre frame), one pass per frame, ping-pong accumulation:
+// each frame is lined up on the centre frame along measured motion and added with weight
+// (local sharpness)² × (agrees with the centre at coarse scale), so the sharpest frame wins each region
+// while anything that moved (legs) only comes from frames where it matches the centre.
+const FS_STACK = `#version 300 es
+precision highp float;
+uniform sampler2D u_frame, u_flow, u_cgray, u_centre; uniform highp sampler2D u_prev, u_emax;
+uniform float u_eps, u_tol, u_lod, u_noise, u_pow, u_bias; uniform int u_first, u_mode;
+${ORIENT}
+out vec4 o;
+vec2 uvToDisp(vec2 uv) {
+  vec2 pc = (uv - 0.5) * u_texSize, pd;
+  if (u_rot == 0) pd = pc; else if (u_rot == 1) pd = vec2(-pc.y, pc.x); else if (u_rot == 2) pd = -pc; else pd = vec2(pc.y, -pc.x);
+  return pd / u_dispSize.y;
+}
+vec4 cubic(sampler2D src, vec2 uv) {
+  vec2 sp = uv * u_texSize, t1 = floor(sp - 0.5) + 0.5, f = sp - t1;
+  vec2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f)), w1 = 1.0 + f * f * (-2.5 + 1.5 * f);
+  vec2 w2 = f * (0.5 + f * (2.0 - 1.5 * f)), w3 = f * f * (-0.5 + 0.5 * f);
+  vec2 w12 = w1 + w2, t12 = (t1 + w2 / w12) / u_texSize, t0 = (t1 - 1.0) / u_texSize, t3 = (t1 + 2.0) / u_texSize;
+  vec4 r = vec4(0.0);
+  r += textureLod(src, vec2(t0.x, t0.y), 0.0) * w0.x * w0.y;   r += textureLod(src, vec2(t12.x, t0.y), 0.0) * w12.x * w0.y;
+  r += textureLod(src, vec2(t3.x, t0.y), 0.0) * w3.x * w0.y;   r += textureLod(src, vec2(t0.x, t12.y), 0.0) * w0.x * w12.y;
+  r += textureLod(src, vec2(t12.x, t12.y), 0.0) * w12.x * w12.y; r += textureLod(src, vec2(t3.x, t12.y), 0.0) * w3.x * w12.y;
+  r += textureLod(src, vec2(t0.x, t3.y), 0.0) * w0.x * w3.y;   r += textureLod(src, vec2(t12.x, t3.y), 0.0) * w12.x * w3.y;
+  r += textureLod(src, vec2(t3.x, t3.y), 0.0) * w3.x * w3.y;
+  return r;
+}
+float lum(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }
+// detail energy in the 2–6 px band (difference of two blur levels), averaged over a ~13×13 neighbourhood.
+// Pixel-scale "detail" is left out on purpose: in phone video it's mostly compression artefacts and grain,
+// which would otherwise win the "sharpest view" contest.
+float focusEnergy(sampler2D t, vec2 uv) {
+  vec2 p = 1.0 / u_texSize; float e = 0.0;
+  for (int j = -2; j <= 2; j++) for (int i = -2; i <= 2; i++) {
+    vec2 q = uv + vec2(float(i), float(j)) * 3.0 * p;
+    float l = lum(textureLod(t, q, 0.7).rgb) - lum(textureLod(t, q, 2.2).rgb);
+    e += l * l;
+  }
+  return e / 25.0;
+}
+void main() {
+  ivec2 P = ivec2(gl_FragCoord.xy);
+  vec4 prev = u_first == 1 ? vec4(0.0) : texelFetch(u_prev, P, 0);
+  vec2 uv = gl_FragCoord.xy / u_texSize, s = uvToDisp(uv);
+  float A = u_dispSize.x / u_dispSize.y;
+  vec2 g = vec2(s.x / A + 0.5, s.y + 0.5);
+  vec2 un = dispToUV(s + texture(u_flow, g).rg);
+  if (any(lessThan(un, vec2(0.0))) || any(greaterThan(un, vec2(1.0)))) { o = prev; return; }
+  // compare with the centre frame at an 8 px scale: a blurry and a sharp view of the same thing agree there,
+  // a leg that moved a few pixels doesn't
+  float d = (lum(textureLod(u_frame, un, 3.0).rgb) - lum(textureLod(u_centre, uv, 3.0).rgb)) / u_tol;
+  // …and the same structure in the same place: correlation of the 4 px-scale pattern over ~25 px. Blur lowers
+  // contrast but keeps the correlation; a leg that's shifted or a different leg kills it.
+  float sa = 0.0, sb = 0.0, saa = 0.0, sbb = 0.0, sab = 0.0; vec2 p = 1.0 / u_texSize;
+  for (int j = -2; j <= 2; j++) for (int i = -2; i <= 2; i++) {
+    vec2 o2 = vec2(float(i), float(j)) * 5.0 * p;
+    float a = lum(textureLod(u_frame, un + o2, 2.0).rgb), b = lum(textureLod(u_centre, uv + o2, 2.0).rgb);
+    sa += a; sb += b; saa += a * a; sbb += b * b; sab += a * b;
+  }
+  float va = saa / 25.0 - sa * sa / 625.0, vb = sbb / 25.0 - sb * sb / 625.0, cv = sab / 25.0 - sa * sb / 625.0;
+  float ncc = cv / sqrt(max(va * vb, 1e-12));
+  float ok = exp(-d * d) * (max(va, vb) < 4e-5 ? 1.0 : smoothstep(0.7, 0.9, ncc));
+  // sharpness above what grain alone would produce
+  float e = max(focusEnergy(u_frame, un) - u_noise, 0.0) * 1000.0;   // ×1000 keeps it in half-float's comfortable range
+  if (u_mode == 0) { o = vec4(max(prev.r, ok > 0.5 ? e : 0.0), 0.0, 0.0, 1.0); return; }   // pass 1: sharpest agreeing view
+  // pass 2: weight relative to the sharpest view of this spot (scale-free, can't saturate);
+  // the floor stops grain-level differences in flat areas from picking a "winner"
+  float emax = texelFetch(u_emax, P, 0).r, k = u_eps * 1000.0;
+  float r = min((e + k) / (emax + k), 1.0);
+  float w;
+  if (u_bias > 1.5) w = 1.0;   // the centre frame itself
+  else {
+    // do no harm: another view only counts where it is clearly sharper than the centre frame here
+    float ec = max(focusEnergy(u_centre, uv) - u_noise, 0.0) * 1000.0;
+    float gain = (e + k) / (ec + k);
+    w = pow(r, u_pow) * ok * smoothstep(1.2, 1.8, gain) * 8.0;
+  }
+  w += 1e-4;
+  vec3 col = clamp(cubic(u_frame, un).rgb, 0.0, 1.0);
+  o = prev + vec4(col * w, w);
+}`;
+const FS_STACKNORM = `#version 300 es
+precision highp float;
+uniform highp sampler2D u_acc;
+out vec4 o;
+void main() { vec4 a = texelFetch(u_acc, ivec2(gl_FragCoord.xy), 0); o = vec4(a.rgb / max(a.a, 1e-6), 1.0); }`;
+
 const FS_BLUR = `#version 300 es
 precision highp float;
 uniform sampler2D u_tex; uniform vec2 u_dir; uniform float u_sigma; uniform int u_rad;
@@ -356,6 +444,57 @@ class Base {
     if (mip) { gl.generateMipmap(gl.TEXTURE_2D); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR); }
     else gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
   }
+  // ── focus stacking ──
+  stackBegin(w, h) {
+    const gl = this.gl;
+    if (!gl.getExtension('EXT_color_buffer_float')) throw new Error('This phone\'s graphics chip can\'t do stacking (no float render targets).');
+    if (!this.stk) { this.stk = compile(gl, VS, FS_STACK); this.stkN = compile(gl, VS, FS_STACKNORM); }
+    const mk = () => {
+      const t = this.makeTex(); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+      gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA16F, w, h);
+      const fb = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, t, 0);
+      return { t, fb, w, h };
+    };
+    this.acc = [mk(), mk()]; this.accI = 0; this.accFirst = true; this.accMk = mk;
+  }
+  // after pass 1 (mode 0): keep the max-sharpness map aside and start a fresh accumulation for pass 2
+  stackCentre(tex) { this.centreTex = tex; }
+  stackSecondPass() {
+    this.emax = this.acc[this.accI]; const other = this.acc[1 - this.accI];
+    const gl = this.gl; gl.deleteTexture(other.t); gl.deleteFramebuffer(other.fb);
+    this.acc = [this.accMk(), this.accMk()]; this.accI = 0; this.accFirst = true;
+  }
+  setGrayTex(tex, w, h, bytes) {
+    const gl = this.gl;
+    gl.bindTexture(gl.TEXTURE_2D, tex); gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.R8, w, h, 0, gl.RED, gl.UNSIGNED_BYTE, bytes);
+    gl.generateMipmap(gl.TEXTURE_2D); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+  }
+  stackAdd(frameTex, flowTex, grayTex, info, { eps, tol, lod, noise = 0, pow = 2, mode = 1, bias = 1 }) {
+    const gl = this.gl, u = this.stk.u, src = this.acc[this.accI], dst = this.acc[1 - this.accI];
+    gl.useProgram(this.stk.p);
+    const bind = (unit, tex, name) => { gl.activeTexture(gl.TEXTURE0 + unit); gl.bindTexture(gl.TEXTURE_2D, tex); gl.uniform1i(u[name], unit); };
+    bind(0, frameTex, 'u_frame'); bind(1, flowTex, 'u_flow'); bind(2, grayTex, 'u_cgray'); bind(3, src.t, 'u_prev');
+    bind(4, this.emax ? this.emax.t : src.t, 'u_emax'); bind(5, this.centreTex, 'u_centre');
+    gl.activeTexture(gl.TEXTURE0);
+    gl.uniform1i(u.u_mode, mode); gl.uniform1f(u.u_bias, bias);
+    gl.uniform1f(u.u_eps, eps); gl.uniform1f(u.u_tol, tol); gl.uniform1f(u.u_noise, noise); gl.uniform1f(u.u_pow, pow); gl.uniform1f(u.u_lod, lod); gl.uniform1i(u.u_first, this.accFirst ? 1 : 0);
+    this.setOrient(this.stk, info);
+    this.draw(dst.fb, dst.w, dst.h);
+    this.accI = 1 - this.accI; this.accFirst = false;
+  }
+  stackFinish(target, mip) {
+    const gl = this.gl;
+    gl.useProgram(this.stkN.p);
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, this.acc[this.accI].t); gl.uniform1i(this.stkN.u.u_acc, 0);
+    this.draw(target.fb, target.w, target.h);
+    gl.bindTexture(gl.TEXTURE_2D, target.t);
+    if (mip) { gl.generateMipmap(gl.TEXTURE_2D); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR); }
+    for (const a of [...this.acc, ...(this.emax ? [this.emax] : [])]) { gl.deleteTexture(a.t); gl.deleteFramebuffer(a.fb); }
+    this.acc = null; this.emax = null;
+  }
+  mipTex(tex) { const gl = this.gl; gl.bindTexture(gl.TEXTURE_2D, tex); gl.generateMipmap(gl.TEXTURE_2D); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR); }
   useSrc(tex, info, mip) { this.src = tex; this.srcInfo = info; this.mip = mip; }
   useSrcB(tex) { this.srcB = tex; }
   // Motion field from frame A to frame B: grid of [dx, dy] in display-normalised units (height = 1).

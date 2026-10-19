@@ -402,3 +402,116 @@ export async function exportClip(clip, plan, { onProgress = () => {}, signal } =
   onProgress(1);
   return { blob: new Blob([target.buffer], { type: 'video/mp4' }), codec: enc.cfg.codec, frames: emitted, hasAudio: withAudio, duration, interpolated: interpCount, cleaned: !!plan.denoise };
 }
+
+
+// Grain level of a decoded frame (sampled at full resolution in 7 patches; second-quietest = grain, not texture).
+let _gcv = null;
+export function grainOfFrame(f) {
+  const sz = 192;
+  if (!_gcv) _gcv = typeof OffscreenCanvas !== 'undefined' ? new OffscreenCanvas(sz, sz) : Object.assign(document.createElement('canvas'), { width: sz, height: sz });
+  const ctx = _gcv.getContext('2d', { willReadFrequently: true }), W = f.displayWidth, H = f.displayHeight, est = [];
+  for (const [fx, fy] of [[0.08, 0.08], [0.92, 0.08], [0.08, 0.92], [0.92, 0.92], [0.5, 0.5], [0.5, 0.1], [0.1, 0.5]]) {
+    ctx.drawImage(f, Math.round(fx * (W - sz)), Math.round(fy * (H - sz)), sz, sz, 0, 0, sz, sz);
+    est.push(grainSigma(ctx.getImageData(0, 0, sz, sz).data, sz, sz));
+  }
+  est.sort((a, b) => a - b);
+  return est[1];
+}
+
+/**
+ * Stacked still: frames within ±radius of frame c are lined up on it and fused, keeping the sharpest version
+ * of each region. Returns { blob, before, frames }. opts: { M, look, outW, outH, radius, maxFrames, onProgress, signal }
+ */
+export async function stackStill(clip, c, opts) {
+  const { M, look, outW, outH, radius = 0.3, maxFrames = 20, onProgress = () => {}, signal } = opts;
+  const T = clip.times, near = [];
+  for (let i = 0; i < T.length; i++) if (Math.abs(T[i] - T[c]) <= radius + 1e-6) near.push(i);
+  const step = Math.max(1, Math.ceil(near.length / maxFrames));
+  const keep = new Set(near.filter(i => (i - c) % step === 0));
+  const lo = Math.min(...keep), hi = Math.max(...keep);
+  const tsIndex = new Map(); T.forEach((t, i) => tsIndex.set(Math.round(t * 1e6), i));
+  const [aw, ah] = analysisSize(clip);
+  const ds = new Downscaler(aw, ah), gb = new Uint8Array(aw * ah);
+  const pyr = new Map(); let cGray = null, sigma = 0.004, sharpC = 0;
+  const range = { fromUs: Math.round(T[lo] * 1e6) - 1, toUs: Math.round(T[hi] * 1e6) + 1, signal };
+  const canvas = typeof OffscreenCanvas !== 'undefined' ? new OffscreenCanvas(outW, outH) : Object.assign(document.createElement('canvas'), { width: outW, height: outH });
+  const R = new Renderer(canvas); R.setSize(outW, outH);
+  const centreTex = R.makeTex();
+  // pass 1: small greyscale copies → motion of every frame relative to the centre; full-size centre kept on the GPU
+  try {
+    await decodeRange(clip, { ...range, onFrame: f => {
+      const i = tsIndex.get(f.timestamp);
+      if (keep.has(i)) {
+        ds.grabBytes(f, frameInfo(clip, f), gb);
+        pyr.set(i, buildPyramid(Float32Array.from(gb), aw, ah, 4));
+        if (i === c) { cGray = gb.slice(); R.uploadTex(centreTex, f); R.mipTex(centreTex); try { sigma = grainOfFrame(f); } catch (e) { /* keep default */ } }
+      }
+      f.close();
+    } });
+  } catch (e) { R.dispose(); throw e; } finally { ds.dispose(); }
+  if (signal && signal.aborted) { R.dispose(); return null; }
+  if (!pyr.has(c)) { R.dispose(); throw new Error('Couldn\'t read the chosen frame.'); }
+  sharpC = frameSharpness(pyr.get(c)[0].d, aw, ah);
+  const flows = new Map(), order = [...keep].sort((a, b) => Math.abs(a - c) - Math.abs(b - c));
+  let n = 0;
+  for (const i of order) {
+    if (!pyr.has(i)) continue;
+    if (i === c) { flows.set(i, null); continue; }
+    const F = denseFlow(null, null, aw, ah, { pyrA: pyr.get(c), pyrB: pyr.get(i), guess: globalShift(pyr.get(c), pyr.get(i), 16) });
+    if (F.validFrac >= 0.2) flows.set(i, F);
+    onProgress(0.4 * (++n) / order.length);
+    await tick();
+  }
+  // pass 2: line every frame up on the centre and fuse
+  const toBlob = () => canvas.convertToBlob ? canvas.convertToBlob({ type: 'image/png' }) : new Promise(r => canvas.toBlob(r, 'image/png'));
+  let before = null, used = 0, info = null;
+  try {
+    const frameTex = R.makeTex(), flowTex = R.makeTex(), grayTex = R.makeTex();
+    R.setGrayTex(grayTex, aw, ah, cGray); R.stackCentre(centreTex);
+    const zero = new Float32Array(4);
+    // grain sets the floor below which "sharpness" is just noise; tolerance for "agrees with centre" at coarse scale
+    // grain's own contribution to the band-pass sharpness measure (≈0.2σ² for white noise) is subtracted
+    // 8-bit footage can't have less than ~half a code value of noise (a flat patch can measure 0)
+    sigma = Math.max(sigma, 0.002);
+    const noise = 0.2 * sigma * sigma * (opts.noiseScale ?? 1), eps = Math.max((opts.epsScale ?? 4) * noise, opts.epsMin ?? 1e-4), tol = opts.tol ?? 0.06, pw = opts.pow ?? 8;
+    let started = false;
+    // two passes over the frames: (0) the sharpest agreeing view of every spot, (1) blend weighted relative to it
+    for (const mode of [0, 1]) {
+      if (mode === 1) R.stackSecondPass();
+      used = 0;
+      await decodeRange(clip, { ...range, onFrame: async f => {
+        const i = tsIndex.get(f.timestamp);
+        if (!flows.has(i)) { f.close(); return; }
+        info = frameInfo(clip, f);
+        if (!started) { R.stackBegin(info.texW, info.texH); started = true; }
+        R.uploadTex(frameTex, f); f.close(); R.mipTex(frameTex);
+        const F = flows.get(i);
+        if (F) {
+          const d = new Float32Array(F.gw * F.gh * 2);
+          for (let k = 0; k < F.gw * F.gh; k++) { d[2 * k] = F.fx[k] / ah; d[2 * k + 1] = F.fy[k] / ah; }
+          R.setFlowTex(flowTex, F.gw, F.gh, d);
+        } else R.setFlowTex(flowTex, 2, 1, zero);
+        const lod = Math.max(0, Math.log2(info.dispH / ah));
+        // the centre frame gets a head start: where views are equally sharp, the unwarped original is the safest
+        R.stackAdd(frameTex, flowTex, grayTex, info, { eps, tol, lod, noise, pow: pw, mode, bias: i === c ? 2 : 1 });
+        used++;
+        if (mode === 1 && i === c) {   // the plain centre frame, for before/after
+          R.useSrc(frameTex, info, Math.hypot(M[0], M[1]) * info.dispH / outH > 1.25);
+          R.render(M, look, { pxScale: 1 }); before = await toBlob();
+        }
+        onProgress(0.4 + 0.3 * mode + 0.3 * used / flows.size);
+        await tick();
+      } });
+      if (signal && signal.aborted) return null;
+    }
+    if (signal && signal.aborted) return null;
+    const mip = Math.hypot(M[0], M[1]) * info.dispH / outH > 1.25;
+    const out = R.makeTarget(info.texW, info.texH);
+    R.stackFinish(out, mip);
+    R.useSrc(out.t, info, mip);
+    R.render(M, look, { pxScale: 1 });
+    const blob = await toBlob();
+    onProgress(1);
+    return { blob, before, frames: used, sharpC, sigma };
+  } finally { R.dispose(); }
+}

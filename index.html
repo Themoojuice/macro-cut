@@ -6,7 +6,7 @@
   <meta name="theme-color" content="#0b0d10" />
   <title>MacroCut</title>
   <link rel="manifest" href="manifest.json" />
-  <link rel="stylesheet" href="css/app.css?v=10" />
+  <link rel="stylesheet" href="css/app.css?v=11" />
   <script src="vendor/mp4box.all.min.js"></script>
   <script src="vendor/mp4-muxer.js"></script>
 </head>
@@ -192,6 +192,7 @@
         <button class="pill-btn" id="btnThisFrame">Save this frame</button>
         <button class="pill-btn active" id="btnFindBest">✨ Find the sharpest shots</button>
       </div>
+      <button class="pill-btn" id="btnStackHere" style="flex:none">📚 Stack this moment: combine nearby frames for more in focus</button>
       <div class="hint" id="shotsMsg">Full resolution, with your steadying, colour and sharpening applied. Great for iNaturalist.</div>
       <div class="shots-grid" id="shotsGrid"></div>
       <div class="row-end">
@@ -231,6 +232,6 @@
   </div>
 
   <video id="video" playsinline muted preload="auto" style="position:fixed;left:-9999px;top:-9999px;width:2px;height:2px;opacity:0;pointer-events:none"></video>
-  <script type="module" src="js/app.js?v=10"></script>
+  <script type="module" src="js/app.js?v=11"></script>
 </body>
 </html>
