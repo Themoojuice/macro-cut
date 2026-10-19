@@ -197,3 +197,8 @@ details#stabMore summary { font-size: 13px; color: var(--text-muted); cursor: po
 .shot .shot-btns { display: flex; gap: 6px; }
 .shot button.ghost { background: var(--bg-panel); color: var(--text-main); border: 1px solid #2b323f; }
 .shot .shot-prog { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; background: rgba(5,6,8,0.7); font-size: 12px; font-weight: 700; color: var(--text-main); text-align: center; padding: 8px; }
+.undo-group { display: flex; background: var(--bg-elevated); border: 1px solid #2b323f; border-radius: 9px; overflow: hidden; flex-shrink: 0; }
+.undo-group .icon-btn { width: 40px; height: 34px; border-radius: 0; font-size: 20px; font-weight: 700; color: var(--accent); }
+.undo-group .icon-btn + .icon-btn { border-left: 1px solid #2b323f; }
+.undo-group .icon-btn:active { background: var(--accent-dim); }
+.undo-group .icon-btn:disabled { color: var(--text-muted); opacity: 0.4; }

@@ -222,7 +222,7 @@ async function loadFile(file) {
     $('durTime').textContent = fmt(clip.duration);
     for (const id of ['btnPlay', 'btnPrev', 'btnNext', 'btnExport', 'btnStill']) $(id).disabled = false;
     clearHeatmap(); recompute(); renderSegments(); syncControls(); updateSpeedInfo();
-    uploadVideo(); draw();
+    uploadVideo(); draw(); resetHistory();
     if (state.analysis) drawHeatmap();
     hideToast();
     if (restored) toast(`Welcome back: your edit from ${new Date(restored.savedAt).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' })} is restored. (Trim → Start this clip over to reset.)`, 5000);
@@ -1060,9 +1060,94 @@ $('btnShare').onclick = async () => {
   catch (e) { if (e.name !== 'AbortError') toast('Share failed: ' + e.message, 2500); }
 };
 
+// ───────────── undo / redo ─────────────
+// Snapshots of the edit (cuts, per-part look/speed, framing, look, speed, stabilise settings). Every edit already
+// passes through scheduleSave(), so it notes a change; the snapshot is committed once the edit settles (no finger
+// down, ~0.45 s quiet), so one slider drag or pinch = one undo step. The shake measurement itself is never undone.
+const HIST_MAX = 100;
+let histCur = null, undoStack = [], redoStack = [], histTimer = null, restoring = false, fingersDown = 0;
+function editState() {
+  const st = state.stab;
+  return JSON.stringify({
+    segments: state.segments.map(x => ({ start: x.start, end: x.end, speed: x.speed, look: x.look })),
+    frame: state.frame, look: state.look, speed: state.speed, smoothSlow: state.smoothSlow,
+    stab: { on: st.on, level: st.level, maxCrop: st.maxCrop, rotation: st.rotation, zoom: st.zoom },
+  });
+}
+function resetHistory() { clearTimeout(histTimer); undoStack = []; redoStack = []; histCur = state.clip ? editState() : null; updateUndoButtons(); }
+function noteEdit() {
+  if (restoring || !state.clip) return;
+  clearTimeout(histTimer); histTimer = setTimeout(commitEdit, 450);
+}
+function commitEdit() {
+  clearTimeout(histTimer);
+  if (!state.clip || histCur == null) return;
+  if (fingersDown) { histTimer = setTimeout(commitEdit, 250); return; }
+  const now = editState();
+  if (now === histCur) return;
+  undoStack.push(histCur); if (undoStack.length > HIST_MAX) undoStack.shift();
+  redoStack = []; histCur = now; updateUndoButtons();
+}
+function describeChange(a, b) {
+  const A = JSON.parse(a), B = JSON.parse(b), eq = k => JSON.stringify(A[k]) === JSON.stringify(B[k]), what = [];
+  if (!eq('segments')) {
+    const sa = A.segments, sb = B.segments, cuts = sa.length !== sb.length || sa.some((x, i) => x.start !== sb[i].start || x.end !== sb[i].end);
+    what.push(cuts ? 'trim' : sa.some((x, i) => JSON.stringify(x.look) !== JSON.stringify(sb[i].look)) ? 'look' : 'speed');
+  }
+  if (!eq('frame')) what.push('framing'); if (!eq('look')) what.push('look'); if (!eq('stab')) what.push('stabilise');
+  if (!eq('speed') || !eq('smoothSlow')) what.push('speed');
+  return [...new Set(what)].join(' + ') || 'edit';
+}
+function applyEditState(json) {
+  const p = JSON.parse(json), wasOn = state.stab.on;
+  restoring = true;
+  try {
+    state.segments = p.segments.map(x => { const o = { start: x.start, end: x.end }; if (x.speed != null) o.speed = x.speed; if (x.look) o.look = { ...x.look }; return o; });
+    state.sel = Math.min(state.sel, state.segments.length - 1);
+    state.frame = { ...p.frame }; state.look = { ...p.look }; state.speed = p.speed; state.smoothSlow = p.smoothSlow;
+    Object.assign(state.stab, p.stab);
+    if (undoSegs) clearUndo();   // the auto-cut button's own one-shot undo is superseded
+    renderSegments(); syncControls(); syncPartControls(); applyPreviewRate();
+    if (state.stab.on !== wasOn) setStabOn(state.stab.on); else invalidate();
+    updateStabChip(); pills('lookPresets', 'preset', '');
+    const t = state.mediaTime;
+    if (!state.segments.some(s => t >= s.start && t <= s.end)) seek(state.segments[0].start);
+  } finally { restoring = false; }
+  histCur = json;
+  try { localStorage.setItem(STORE, JSON.stringify({ look: state.look, stab: state.stab, exp: state.exp, smoothSlow: state.smoothSlow })); } catch (e) { /* ignore */ }
+  scheduleSave(); clearTimeout(histTimer);
+}
+function undo() {
+  commitEdit();   // bank any edit still settling, so it's the one undone
+  if (!undoStack.length) return toast('Nothing to undo', 1200);
+  const prev = undoStack.pop(), label = describeChange(prev, histCur);
+  redoStack.push(histCur); applyEditState(prev); updateUndoButtons();
+  toast(`↶ Undid ${label}`, 1400);
+}
+function redo() {
+  commitEdit();
+  if (!redoStack.length) return toast('Nothing to redo', 1200);
+  const next = redoStack.pop(), label = describeChange(histCur, next);
+  undoStack.push(histCur); applyEditState(next); updateUndoButtons();
+  toast(`↷ Redid ${label}`, 1400);
+}
+function updateUndoButtons() { $('btnUndo').disabled = !undoStack.length; $('btnRedo').disabled = !redoStack.length; }
+$('btnUndo').onclick = undo; $('btnRedo').onclick = redo;
+window.addEventListener('pointerdown', () => { fingersDown++; }, true);
+const fingerUp = () => { fingersDown = Math.max(0, fingersDown - 1); };
+window.addEventListener('pointerup', fingerUp, true); window.addEventListener('pointercancel', fingerUp, true);
+window.addEventListener('blur', () => { fingersDown = 0; });
+window.addEventListener('keydown', e => {
+  if (!(e.ctrlKey || e.metaKey) || e.target.tagName === 'INPUT' && e.target.type === 'text') return;
+  const k = e.key.toLowerCase();
+  if (k === 'z' && !e.shiftKey) { e.preventDefault(); undo(); }
+  else if (k === 'y' || (k === 'z' && e.shiftKey)) { e.preventDefault(); redo(); }
+});
+
 // ───────────── saved edits ─────────────
 let saveTimer = null;
 function scheduleSave() {
+  noteEdit();
   if (!state.clip || !state.key) return;
   clearTimeout(saveTimer); saveTimer = setTimeout(doSave, 900);
 }
