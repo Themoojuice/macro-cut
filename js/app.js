@@ -1,7 +1,7 @@
 import { openClip, decodeRange, withTimeout } from './media.js';
 import { Renderer, DEFAULT_LOOK } from './gpu.js';
 import { computeStabilisation, clampPan, frameAt, suggestCuts, lookAt, speedAt, segmentAt } from './core.js';
-import { analyseClip, exportClip, frameInfo } from './engine.js';
+import { analyseClip, exportClip, frameInfo, stackStill } from './engine.js';
 import { clipKey, loadProject, saveProject, deleteProject, savedLooks, setSavedLooks } from './store.js';
 
 const $ = id => document.getElementById(id);
@@ -807,22 +807,85 @@ $('btnFindBest').onclick = async () => {
         } });
         if (!got) continue;
         const blob = cv.convertToBlob ? await cv.convertToBlob({ type: 'image/png' }) : await new Promise(r => cv.toBlob(r, 'image/png'));
-        const bmp = await createImageBitmap(cv, { resizeWidth: 360, resizeHeight: Math.round(360 * h / w), resizeQuality: 'high' });
         const shot = { i, t: T[i], blob, name: `MacroCut_${stem()}_${fmt(T[i]).replace(/[:.]/g, '-')}.png` };
         shots.push(shot);
-        const card = document.createElement('div'); card.className = 'shot';
-        const tc = document.createElement('canvas'); tc.width = bmp.width; tc.height = bmp.height; tc.getContext('2d').drawImage(bmp, 0, 0);
-        tc.title = 'Show this moment'; tc.onclick = () => { $('shotsSheet').classList.remove('open'); seek(shot.t + 0.0005); };
-        const row = document.createElement('div'); row.className = 'shot-row';
-        row.innerHTML = `<span>${fmt(shot.t)}</span>`;
-        const sv = document.createElement('button'); sv.textContent = 'Save'; sv.onclick = () => download(shot.blob, shot.name);
-        row.appendChild(sv); card.append(tc, row); grid.appendChild(card);
+        await renderShotCard(shot, false);
       }
     } finally { R.dispose(); awake(); await resume(); }
-    msg.textContent = shots.length ? `${shots.length} sharpest moments (${w}×${h}). Tap a picture to jump to it.` : 'No frames found.';
+    msg.textContent = shots.length ? `${shots.length} sharpest moments (${w}×${h}). Tap a picture to jump to it; 📚 Stack combines nearby frames for more in focus.` : 'No frames found.';
     if (shots.length) $('btnShotsSaveAll').style.display = '';
   } catch (e) { console.error(e); msg.textContent = 'Couldn\'t make the stills: ' + e.message; }
   finally { shotsBusy = false; }
+};
+// ── stills cards (plain or stacked) ──
+const thumbOf = async blob => {
+  const bmp = await createImageBitmap(blob);
+  const tw = 360, th = Math.round(360 * bmp.height / bmp.width), c = document.createElement('canvas');
+  c.width = tw; c.height = th; c.getContext('2d').drawImage(bmp, 0, 0, tw, th); bmp.close && bmp.close();
+  return c;
+};
+async function renderShotCard(shot, prepend) {
+  const grid = $('shotsGrid');
+  const card = shot.card || document.createElement('div');
+  card.className = 'shot'; card.innerHTML = '';
+  shot.card = card;
+  const after = await thumbOf(shot.blob), before = shot.before ? await thumbOf(shot.before) : null;
+  let showing = 'after';
+  const holder = document.createElement('div'); holder.style.position = 'relative'; holder.appendChild(after);
+  const tag = document.createElement('span'); tag.className = 'shot-tag';
+  if (before) {
+    tag.textContent = `STACKED ×${shot.frames} · tap to compare`; holder.appendChild(tag);
+    holder.onclick = () => {
+      showing = showing === 'after' ? 'before' : 'after';
+      holder.replaceChild(showing === 'after' ? after : before, holder.firstChild);
+      tag.textContent = showing === 'after' ? `STACKED ×${shot.frames} · tap to compare` : 'SINGLE FRAME · tap to compare';
+      tag.classList.toggle('before', showing === 'before');
+    };
+  } else {
+    holder.title = 'Show this moment';
+    holder.onclick = () => { $('shotsSheet').classList.remove('open'); seek(shot.t + 0.0005); };
+  }
+  const row = document.createElement('div'); row.className = 'shot-row';
+  row.innerHTML = `<span>${fmt(shot.t)}</span>`;
+  const btns = document.createElement('div'); btns.className = 'shot-btns';
+  if (!before) {
+    const st = document.createElement('button'); st.className = 'ghost'; st.textContent = '📚 Stack';
+    st.onclick = () => stackShot(shot);
+    btns.appendChild(st);
+  }
+  const sv = document.createElement('button'); sv.textContent = 'Save'; sv.onclick = () => download(shot.blob, shot.name);
+  btns.appendChild(sv); row.appendChild(btns);
+  card.append(holder, row);
+  if (!card.parentNode) { if (prepend) grid.prepend(card); else grid.appendChild(card); }
+}
+async function stackShot(shot) {
+  if (shotsBusy || !state.clip) return toast('One thing at a time: wait for the current stills job', 2000);
+  shotsBusy = true;
+  const msg = $('shotsMsg'), c = state.clip, i = shot.i;
+  let prog = null;
+  if (shot.card) { prog = document.createElement('div'); prog.className = 'shot-prog'; prog.textContent = 'Stacking…'; shot.card.appendChild(prog); }
+  msg.textContent = 'Stacking: lining up the frames around this moment…';
+  const resume = await parkVideo(), awake = await keepAwake();
+  try {
+    if (planDirty) recompute();
+    const [w, h] = outputDims(4320);
+    const res = await stackStill(c, i, {
+      M: Array.from(state.plan.M.subarray(4 * i, 4 * i + 4)), look: lookAtTime(c.times[i]), outW: w, outH: h,
+      onProgress: p => { const t = `Stacking… ${Math.round(p * 100)}%`; msg.textContent = t; if (prog) prog.textContent = t; },
+    });
+    if (!res) return;
+    Object.assign(shot, { blob: res.blob, before: res.before, frames: res.frames, name: shot.name.replace(/\.png$/, '') + '_stacked.png' });
+    if (!shots.includes(shot)) shots.unshift(shot);
+    await renderShotCard(shot, true);
+    $('btnShotsSaveAll').style.display = '';
+    msg.textContent = `Stacked ${res.frames} frames into one ${w}×${h} still. Tap the picture to compare with the single frame.`;
+  } catch (e) { console.error(e); msg.textContent = 'Couldn\'t stack: ' + e.message; if (prog) prog.remove(); }
+  finally { awake(); await resume(); shotsBusy = false; }
+}
+$('btnStackHere').onclick = () => {
+  if (!state.clip) return;
+  const i = currentIndex();
+  stackShot({ i, t: state.clip.times[i], name: `MacroCut_${stem()}_${fmt(state.clip.times[i]).replace(/[:.]/g, '-')}.png` });
 };
 $('btnShotsSaveAll').onclick = async () => {
   const files = shots.map(x => new File([x.blob], x.name, { type: 'image/png' }));

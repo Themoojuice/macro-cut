@@ -8,7 +8,7 @@ Two features that use detail from neighbouring frames to improve each frame. Bot
 | Where it lives | Export sheet switch: **Extra clean (slower export)** | Stills sheet: each "sharpest shot" gets a **Stack** button, plus **Stack this moment** |
 | Frames used | 5 (the frame ±2) | 8–20 around the chosen moment |
 | How pixels combine | Weighted average (noise cancels) | Pick-the-sharpest per region (focus fusion), then light averaging |
-| Status | **Built** (see results below) | Next |
+| Status | **Built** (see results below) | **Built** (see results below) |
 
 ---
 
@@ -67,6 +67,19 @@ Two features that use detail from neighbouring frames to improve each frame. Bot
 - Subject movement within ±0.3 s: per-region consistency test falls back to the centre frame.
 - This is the same engine as the planned standalone salticid focus stacker; build it once, reuse it for burst photos later.
 
-### Acceptance tests
-- Synthetic focus-sweep clip (different depth bands sharp in different frames): the fused still must be sharper than the best single frame in every band.
-- Real clip: eyes, carapace and leg tips all sharp in one still, with no double edges.
+### As built (what changed from the plan, and why)
+The first version followed the plan literally and **failed on real footage**: the stacked still was blurrier than a single frame. Three causes, three fixes:
+1. **Weights saturated → plain averaging.** Grain measured 0 on clean 8-bit daylight footage, so the "sharpness above grain" floor collapsed and every textured pixel hit the weight cap. Fix: two passes. Pass 1 records the sharpest *agreeing* view of every spot; pass 2 weights each view relative to that (scale-free, can't saturate), with an absolute floor.
+2. **"Sharpness" was mostly compression artefacts.** A pixel-scale Laplacian rewards HEVC blocking and grain, giving a stippled, crunchy mosaic. Fix: measure detail in the 2–6 px band (difference of two blur levels), which tracks real focus.
+3. **Moving legs were rebuilt from the wrong place.** The motion field is coarse (one vector per ~48 px at 1080p), so an independently moving leg is misaligned, and a brightness check at 8 px doesn't notice. Fix: a structure check, correlation of the 4 px-scale pattern over ~25 px against the full-size centre frame. Blur keeps the correlation; a shifted leg kills it.
+
+Plus a **do-no-harm rule**: the centre frame is the base, and another frame only contributes where it is locally ≥1.2–1.8× sharper *and* passes both checks. Worst case you get the single frame back.
+
+### Results
+- **Synthetic focus sweep** (thin-line texture, depth bands sharp in different frames, grain): stacked beats the centre frame by **+0.4 to +3.6 dB** in every band, but is **~1.5–2 dB short of the best single frame per band** (an oracle that picks a different frame per band). Likely limit: sub-pixel alignment of 1 px lines with a grid motion field. The original acceptance bar ("sharper than the best single frame in every band") is **not met**.
+- **Real HDR spider clip** (frame already well focused, handheld, legs moving): detail on the subject +15%, background grain unchanged, legs that were soft in the centre frame come out sharper, no mosaic or holes. Mild edge ghosting on a moving leg outline is the remaining artefact.
+- Cost: frames are decoded twice (plus a small greyscale pass); about 3–4 min for 16 frames at 1080p in the software-GPU test browser. Phone time unmeasured.
+
+### Acceptance tests (revised)
+- Synthetic focus sweep: stacked ≥ centre frame in every band (✔); stretch goal ≥ best single frame per band (✘, see above).
+- Real clip: never worse than the single frame (no holes, no mosaic, no added grain) (✔ on the test clip); visibly sharper where the centre frame was soft (✔, modest).
