@@ -796,14 +796,26 @@ export function denseFlow(grayA, grayB, w, h, opts = {}) {
     return arr[i] * (1 - ax) * (1 - ay) + arr[i + 1] * ax * (1 - ay) + arr[i + gw] * (1 - ax) * ay + arr[i + gw + 1] * ax * ay;
   };
   const tol = opts.tol || 1.0;
-  for (let k = 0; k < n; k++) {
-    if (!fwd.status[k] || !bwd.status[k]) continue;
-    const x = pts[2 * k] + fx[k], y = pts[2 * k + 1] + fy[k];
-    if (x < 0 || y < 0 || x > w - 1 || y > h - 1) continue;
-    const ex = fx[k] + sampleB(x, y, bx), ey = fy[k] + sampleB(x, y, by);
-    if (ex * ex + ey * ey < tol * tol) valid[k] = 1;
-  }
-  // fill: start from the median of reliable vectors (the camera motion), then diffuse from neighbours
+  // consistency: following a vector forward then the other field back should return to the start
+  const check = (ux, uy, vx, vy, okA, okB, valid) => {
+    for (let k = 0; k < n; k++) {
+      if (!okA[k] || !okB[k]) continue;
+      const x = pts[2 * k] + ux[k], y = pts[2 * k + 1] + uy[k];
+      if (x < 0 || y < 0 || x > w - 1 || y > h - 1) continue;
+      const ex = ux[k] + sampleB(x, y, vx), ey = uy[k] + sampleB(x, y, vy);
+      if (ex * ex + ey * ey < tol * tol) valid[k] = 1;
+    }
+  };
+  const vb = new Uint8Array(n);
+  check(fx, fy, bx, by, fwd.status, bwd.status, valid);
+  check(bx, by, fx, fy, bwd.status, fwd.status, vb);
+  const F = fillField(fx, fy, valid, gw, gh, g0), B = fillField(bx, by, vb, gw, gh, [-g0[0], -g0[1]]);
+  return { gw, gh, fx: F.fx, fy: F.fy, bx: B.fx, by: B.fy, valid, validFrac: F.frac, w, h };
+}
+
+// Fill unreliable vectors from reliable neighbours (start at the median = camera motion, then diffuse), then 3×3 median.
+function fillField(fxIn, fyIn, valid, gw, gh, g0) {
+  const n = gw * gh, fx = Float32Array.from(fxIn), fy = Float32Array.from(fyIn);
   const vals = [], vy = [];
   for (let k = 0; k < n; k++) if (valid[k]) { vals.push(fx[k]); vy.push(fy[k]); }
   const med = a => { if (!a.length) return 0; const s = a.slice().sort((p, q) => p - q); return s[s.length >> 1]; };
@@ -818,7 +830,6 @@ export function denseFlow(grayA, grayB, w, h, opts = {}) {
       fx[k] = sx / c; fy[k] = sy / c;
     }
   }
-  // light 3×3 median on everything to knock out isolated outliers that slipped through
   const mf = (src) => {
     const out = new Float32Array(n), b = new Array(9);
     for (let gy = 0; gy < gh; gy++) for (let gx = 0; gx < gw; gx++) {
@@ -830,7 +841,28 @@ export function denseFlow(grayA, grayB, w, h, opts = {}) {
     }
     return out;
   };
-  return { gw, gh, fx: mf(fx), fy: mf(fy), valid, validFrac: vals.length / n };
+  return { fx: mf(fx), fy: mf(fy), frac: vals.length / n };
+}
+
+// Bilinear sample of a motion grid at pixel-index position (x, y) of a w×h image.
+export function sampleField(F, fx, fy, x, y) {
+  const { gw, gh, w, h } = F;
+  const u = Math.min(gw - 1.001, Math.max(0, (x + 0.5) * gw / w - 0.5)), v = Math.min(gh - 1.001, Math.max(0, (y + 0.5) * gh / h - 0.5));
+  const x0 = u | 0, y0 = v | 0, ax = u - x0, ay = v - y0, i = y0 * gw + x0;
+  return [
+    fx[i] * (1 - ax) * (1 - ay) + fx[i + 1] * ax * (1 - ay) + fx[i + gw] * (1 - ax) * ay + fx[i + gw + 1] * ax * ay,
+    fy[i] * (1 - ax) * (1 - ay) + fy[i + 1] * ax * (1 - ay) + fy[i + gw] * (1 - ax) * ay + fy[i + gw + 1] * ax * ay,
+  ];
+}
+// Motion A→C from A→B then B→C:  F(p) = F1(p) + F2(p + F1(p)). Fields as {gw,gh,w,h,x,y}.
+export function chainField(F1, F2) {
+  const { gw, gh, w, h } = F1, n = gw * gh, x = new Float32Array(n), y = new Float32Array(n);
+  for (let gy = 0; gy < gh; gy++) for (let gx = 0; gx < gw; gx++) {
+    const k = gy * gw + gx, px = (gx + 0.5) * w / gw - 0.5, py = (gy + 0.5) * h / gh - 0.5;
+    const [ux, uy] = [F1.x[k], F1.y[k]], [vx, vy] = sampleField(F2, F2.x, F2.y, px + ux, py + uy);
+    x[k] = ux + vx; y[k] = uy + vy;
+  }
+  return { gw, gh, w, h, x, y };
 }
 
 // Coarse whole-frame shift between two frames (for a good starting guess when the camera jolts).
@@ -851,4 +883,17 @@ export function globalShift(pyrA, pyrB, radius = 12) {
     if (s < best) { best = s; bx = dx; by = dy; }
   }
   return [bx * sc, by * sc];
+}
+
+// Grain level of a full-resolution RGBA image patch (0..1 units of mean-RGB), from the median absolute
+// Laplacian (robust: texture and edges are the minority in out-of-focus-heavy macro frames).
+export function grainSigma(rgba, w, h) {
+  const L = new Float32Array(w * h);
+  for (let i = 0, j = 0; j < L.length; i += 4, j++) L[j] = (rgba[i] + rgba[i + 1] + rgba[i + 2]) / 765;
+  const v = [];
+  for (let y = 1; y < h - 1; y++) for (let x = 1; x < w - 1; x++) {
+    const i = y * w + x; v.push(Math.abs(4 * L[i] - L[i - 1] - L[i + 1] - L[i - w] - L[i + w]));
+  }
+  v.sort((a, b) => a - b);
+  return 1.4826 * v[v.length >> 1] / Math.sqrt(20);
 }

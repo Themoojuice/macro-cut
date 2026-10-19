@@ -20,7 +20,7 @@ const state = {
   frame: { aspect: 'native', rot: 0, quarter: 0, zoom: 1, panX: 0, panY: 0 },
   look: { ...DEFAULT_LOOK },
   speed: 1, scope: 'part', smoothSlow: true,
-  exp: { res: 'source', fps: 'auto', audio: true },
+  exp: { res: 'source', fps: 'auto', audio: true, clean: false },
   muted: false, playing: false, compare: false,
   mediaTime: 0, plan: null, planRaw: null, previewInfo: null, tab: 'tab-trim',
 };
@@ -879,13 +879,15 @@ function renderExportOptions() {
   }
   pills('fpsGroup', 'fps', state.exp.fps);
   $('expAudio').checked = state.exp.audio;
+  $('expClean').checked = !!state.exp.clean;
   $('expAudio').disabled = anySlow() || !state.clip.audio;
   const total = state.segments.reduce((s, x) => s + (x.end - x.start) / (x.speed != null ? x.speed : state.speed), 0);
   const speeds = new Set(state.segments.map(x => x.speed != null ? x.speed : state.speed));
-  $('exportSummary').textContent = `${total.toFixed(1)} s · ${exportFps()} fps · ${state.analysis && state.stab.on ? `steadied (${LEVELS[state.stab.level].label})` : 'not steadied'} · ${speeds.size > 1 ? 'mixed speeds' : speedLabel([...speeds][0]) + ' speed'}${state.segments.some(x => x.look) ? ' · per-part looks' : ''}`;
+  $('exportSummary').textContent = `${total.toFixed(1)} s · ${exportFps()} fps · ${state.analysis && state.stab.on ? `steadied (${LEVELS[state.stab.level].label})` : 'not steadied'} · ${state.exp.clean ? 'extra clean · ' : ''}${speeds.size > 1 ? 'mixed speeds' : speedLabel([...speeds][0]) + ' speed'}${state.segments.some(x => x.look) ? ' · per-part looks' : ''}`;
 }
 document.querySelectorAll('#fpsGroup .pill-btn').forEach(b => b.onclick = () => { state.exp.fps = b.dataset.fps; persist(); renderExportOptions(); });
 $('expAudio').onchange = e => { state.exp.audio = e.target.checked; persist(); };
+$('expClean').onchange = e => { state.exp.clean = e.target.checked; persist(); renderExportOptions(); };
 function setExportUI(mode) {
   $('exportOptions').style.display = mode === 'options' ? 'flex' : 'none';
   $('exportProgress').style.display = mode === 'options' ? 'none' : 'flex';
@@ -919,14 +921,14 @@ $('btnExportGo').onclick = async () => {
     const baseLook = { ...state.look };
     const res = await exportClip(state.clip, {
       segments: expSegs, speed: state.speed, fps, outW: w, outH: h,
-      M: state.plan.M, look: t => lookAt(expSegs, baseLook, t), audio: state.exp.audio, interp: state.smoothSlow,
+      M: state.plan.M, look: t => lookAt(expSegs, baseLook, t), audio: state.exp.audio, interp: state.smoothSlow, denoise: !!state.exp.clean,
     }, {
       signal: exportAbort.signal,
       onProgress: p => { $('exportBar').style.width = `${Math.round(p * 100)}%`; $('exportMsg').textContent = `Rendering ${w}×${h} @ ${fps} fps… ${Math.round(p * 100)}%`; },
     });
     if (!res) { setExportUI('options'); exportAbort = null; awake(); await resume(); return; }
     exportResult = { blob: res.blob, name: `MacroCut_${stem()}.mp4` };
-    $('exportMsg').textContent = `Done in ${((performance.now() - t0) / 1000).toFixed(0)} s: ${(res.blob.size / 1e6).toFixed(1)} MB, ${res.frames} frames, ${res.codec.startsWith('avc') ? 'H.264' : 'VP9'}${res.hasAudio ? ' + audio' : ''}${res.interpolated ? `, ${res.interpolated} in-between frames created` : ''}.`;
+    $('exportMsg').textContent = `Done in ${((performance.now() - t0) / 1000).toFixed(0)} s: ${(res.blob.size / 1e6).toFixed(1)} MB, ${res.frames} frames, ${res.codec.startsWith('avc') ? 'H.264' : 'VP9'}${res.hasAudio ? ' + audio' : ''}${res.interpolated ? `, ${res.interpolated} in-between frames created` : ''}${res.cleaned ? ', extra clean' : ''}.`;
     setExportUI('done');
   } catch (e) {
     console.error(e); $('exportMsg').textContent = 'Export failed: ' + (e.message || e); setExportUI('error');

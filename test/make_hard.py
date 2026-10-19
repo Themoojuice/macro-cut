@@ -77,7 +77,8 @@ for k in range(N):
     img = cv2.warpAffine(wk, Mw, (W, H), flags=cv2.INTER_AREA | cv2.WARP_INVERSE_MAP, borderMode=cv2.BORDER_REFLECT)
     for (b0, b1) in blurspans:
         if b0 <= k < b1: img = cv2.GaussianBlur(img, (0, 0), 7)
-    img = img + rng.normal(0, 0.012, img.shape)
+    NOISE = float(sys.argv[9]) if len(sys.argv) > 9 else 0.012
+    img = img + NOISE * rng.normal(0, 1.0, img.shape)
     frames[k] = np.clip(img * 255, 0, 255).astype(np.uint8)[..., ::-1]
     gts.append([float(a), float(b), float(px[k]), float(py[k])])
 np.save(out + '.npy', frames)
