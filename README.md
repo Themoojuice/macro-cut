@@ -9,9 +9,11 @@ A phone-first video editor for handheld macro footage (jumping spiders, mostly).
 1. **Open** a clip (MP4/MOV straight from the phone camera; H.264 or HEVC, HDR is fine).
 2. **Trim** → **✨ Cut out the blurry & searching bits** to keep only the good part in one tap (Undo if you disagree), or drag the white handles / Split + Delete yourself.
 3. **Stabilise** → switch on, pick **Mild**, **Medium** or **Max**. Tap **❖** to flip between before and after.
-4. **Frame** (rotate, crop, zoom, aspect), **Look** (sharpen, colour), **Speed** (0.1×–2×) as you like. Settings are remembered.
-5. **Export** → Render MP4 → Save / Share.
+4. **Frame** (rotate, crop, zoom, aspect), **Look** (sharpen, colour), **Speed** (0.1×–2×) as you like. Once you split the clip, Look and Speed change just the part under the playhead (or flip to *Whole clip*). Save looks you like under **My looks**.
+5. **Export** → Render MP4 → Save / Share. Slowed parts get smooth slow motion (Speed tab switch, on by default).
 6. **📸** → *Find the sharpest shots* for full-resolution stills (for iNaturalist), or save the current frame.
+
+Your edit saves automatically on the phone; open the same clip again and it's all back (Trim → *Start this clip over* to reset).
 
 ## What's under the hood
 
@@ -23,12 +25,14 @@ A phone-first video editor for handheld macro footage (jumping spiders, mostly).
 | Look | Bicubic warp → contrast-adaptive sharpening + halo-limited fine detail + background smoothing → grading in OKLab. |
 | Auto-cut | Keeps stretches that are in focus and not mid-sweep (sweep = camera motion well above the clip's normal handheld following). Gaps under 0.6 s are kept to avoid jump cuts. |
 | Best shots | Ranks frames by focus (Laplacian on a noise-robust half-res grid), picks the 6 sharpest well-separated moments, renders each at full resolution with all settings applied. |
+| Smooth slow motion | For parts slowed below the source frame rate, the export measures how every part of the picture moves between two real frames (grid Lucas–Kanade both ways, consistency-checked, gaps filled) and creates the in-between frames by moving both frames along that motion and blending. On a 60 fps ground truth, created frames are within ~1 dB of real ones (vs ~4.5 dB worse when repeating frames). |
+| Saving | Each clip's edit (cuts, per-part looks and speeds, framing, stabilisation and the shake measurement) autosaves to IndexedDB on the phone. |
 | Export | Offline, frame-accurate render → H.264 MP4 (VP9 fallback), constant frame rate, original audio passed through at normal speed. Screen kept awake while working. |
 
 ## Limits
 
 - Needs WebCodecs + WebGL2 (Chrome/Edge on Android or desktop).
-- Slow motion repeats frames (no frame interpolation): film at 60/120 fps for silky slow-mo.
+- Smooth slow motion is created on export (the preview shows the real frames). Very fast movement, like a jump, can smear slightly in created frames; filming at 60/120 fps always helps.
 - Sound is only kept at normal speed.
 - Rolling-shutter wobble isn't corrected.
 
@@ -41,9 +45,10 @@ js/core.js                tracking, stabilisation, auto-cut maths (pure, Node-te
 js/track-worker.js        background-thread tracker
 js/gpu.js                 WebGL2: orientation, HDR, warp, sharpen, grade
 js/media.js               mp4box demux (header only, streamed reads) + WebCodecs decode
-js/engine.js              analysis + export pipelines
+js/engine.js              analysis + export pipelines (incl. in-between frames)
+js/store.js               saved edits (IndexedDB) and saved looks
 vendor/                   mp4box.js (BSD-3), mp4-muxer (MIT)
 test/                     synthetic clip generators, Node scoring, headless-browser end-to-end tests
 ```
 
-Tests: `test/make_hard.py` (realistic hard synthetic clip with ground truth) + `test/score.mjs` (tracking error and jitter), `test/real_track.mjs` (real footage), `test/features.py` (every control measured on exported files), `test/e2e.py`, `test/hdr_e2e.py`, `test/hang.py` (simulated dead decoders), `test/upgrades.py` (auto-cut + best shots).
+Tests: `test/make_hard.py` (realistic hard synthetic clip with ground truth) + `test/score.mjs` (tracking error and jitter), `test/real_track.mjs` (real footage), `test/features.py` (every control measured on exported files), `test/e2e.py`, `test/hdr_e2e.py`, `test/hang.py` (simulated dead decoders), `test/upgrades.py` (auto-cut + best shots), `test/parts.py` (per-part look/speed), `test/flow.test.mjs` + `test/slowmo.py` (in-between frames vs real 60 fps frames), `test/save.py` (save/restore).

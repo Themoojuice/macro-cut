@@ -2,6 +2,7 @@ import { openClip, decodeRange, withTimeout } from './media.js';
 import { Renderer, DEFAULT_LOOK } from './gpu.js';
 import { computeStabilisation, clampPan, frameAt, suggestCuts, lookAt, speedAt, segmentAt } from './core.js';
 import { analyseClip, exportClip, frameInfo } from './engine.js';
+import { clipKey, loadProject, saveProject, deleteProject, savedLooks, setSavedLooks } from './store.js';
 
 const $ = id => document.getElementById(id);
 const video = $('video'), view = $('view');
@@ -39,7 +40,7 @@ try {
     if (typeof s.smoothSlow === 'boolean') state.smoothSlow = s.smoothSlow;
   }
 } catch (e) { /* storage unavailable */ }
-const persist = () => { try { localStorage.setItem(STORE, JSON.stringify({ look: state.look, stab: state.stab, exp: state.exp, smoothSlow: state.smoothSlow })); } catch (e) { /* ignore */ } };
+const persist = () => { scheduleSave(); try { localStorage.setItem(STORE, JSON.stringify({ look: state.look, stab: state.stab, exp: state.exp, smoothSlow: state.smoothSlow })); } catch (e) { /* ignore */ } };
 
 // ───────────── toast / progress ─────────────
 let toastTimer = null;
@@ -106,7 +107,7 @@ function recompute() {
   updateStabStatus(); updateStabChip(); drawMotionGraph();
   planDirty = false;
 }
-function invalidate() { planDirty = true; requestDraw(); }
+function invalidate() { planDirty = true; requestDraw(); scheduleSave(); }
 
 let drawQueued = false;
 function requestDraw() {
@@ -158,7 +159,7 @@ function currentM() {
   return P.M.subarray(4 * i, 4 * i + 4);
 }
 function draw() {
-  if (!state.clip || !renderer || !renderer.srcInfo) return;
+  if (!state.clip || !renderer || !renderer.srcInfo || (!state.plan && !planDirty)) return;
   state.draws = (state.draws || 0) + 1;
   if (planDirty) recompute();
   const [, eh] = exportDims();
@@ -185,7 +186,7 @@ async function loadFile(file) {
   try {
     $('emptyState').style.display = 'none';
     pause();
-    state.previewInfo = null; state.clip = null;
+    state.previewInfo = null; state.clip = null; state.plan = state.planRaw = null; state.analysis = null;
     video.removeAttribute('src'); video.load();
     const clip = await openClip(file, msg => toast(msg));
     state.analysis = null; state.stab.roi = null; state.stab.on = false;
@@ -213,14 +214,20 @@ async function loadFile(file) {
     state.previewInfo = probe ? matchPreview(clip, probe) : defaultPreview(clip);
     video.muted = state.muted;
     state.clip = clip;
+    state.key = clipKey(file);
+    let restored = null;
+    try { restored = await withTimeout(loadProject(state.key), 4000, 'saved edit'); } catch (e) { console.warn('no saved edit', e); }
+    if (restored) { try { applyProject(restored); } catch (e) { console.warn('saved edit unreadable', e); restored = null; } }
     $('metaBadge').textContent = `${clip.dispW}×${clip.dispH} · ${Math.round(clip.fps)}fps${clip.hdr ? ' · HDR' : ''}`;
     $('durTime').textContent = fmt(clip.duration);
     for (const id of ['btnPlay', 'btnPrev', 'btnNext', 'btnExport', 'btnStill']) $(id).disabled = false;
-    clearHeatmap(); renderSegments(); syncControls(); updateSpeedInfo();
-    recompute();
+    clearHeatmap(); recompute(); renderSegments(); syncControls(); updateSpeedInfo();
     uploadVideo(); draw();
+    if (state.analysis) drawHeatmap();
     hideToast();
-    toast(clip.hdr ? 'Loaded. HDR colour is converted automatically.' : 'Loaded', 2500);
+    if (restored) toast(`Welcome back: your edit from ${new Date(restored.savedAt).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' })} is restored. (Trim → Start this clip over to reset.)`, 5000);
+    else toast(clip.hdr ? 'Loaded. HDR colour is converted automatically.' : 'Loaded', 2500);
+    $('saveState').textContent = restored ? '✓ Restored from this phone. Changes keep saving automatically.' : 'Your edits save automatically on this phone. Open the same clip again to carry on.';
   } catch (e) {
     console.error(e);
     const hevc = state.clip === null && /hevc|hvc|hev1/i.test(e.message + (file.type || ''));
@@ -398,6 +405,7 @@ function updatePlayhead() {
   $('curTime').textContent = fmt(state.mediaTime);
 }
 function renderSegments() {
+  scheduleSave();
   segEl.innerHTML = '';
   const D = state.clip ? state.clip.duration : 0; if (!D) return;
   state.segments.forEach((seg, idx) => {
@@ -562,6 +570,7 @@ function syncControls() {
 
 function updateStabStatus() {
   const el = $('stabStatus'), a = state.analysis, p = state.plan, st = state.stab;
+  if (!p && state.clip) return;
   $('stabSub').textContent = st.on ? `On · ${LEVELS[st.level].label}` : 'Off';
   if (state.analysing) return;
   if (!state.clip) { el.textContent = 'Open a clip, then switch this on.'; return; }
@@ -592,7 +601,7 @@ async function analyse() {
       onProgress: p => { progress(p); const s = el.querySelector('span') || el; el.innerHTML = `Measuring the shake… ${Math.round(p * 100)}% <a href="#" id="cancelAnalyse">cancel</a>`; $('cancelAnalyse').onclick = ev => { ev.preventDefault(); ac.abort(); }; void s; },
     });
     if (res) {
-      state.analysis = res; drawHeatmap();
+      state.analysis = res; drawHeatmap(); scheduleSave();
       toast(state.stab.on ? `✓ Steadied (${((performance.now() - t0) / 1000).toFixed(0)} s). Tap ❖ to compare before/after` : `✓ Clip measured (${((performance.now() - t0) / 1000).toFixed(0)} s)`, 3500);
     } else if (state.stab.on && !state.analysis) { state.stab.on = false; }
   } catch (e) {
@@ -705,6 +714,7 @@ document.querySelectorAll('#lookPresets .pill-btn').forEach(b => b.onclick = () 
 // ───────────── speed ─────────────
 function speedLabel(v) { return Math.abs(v - 1) < 1e-6 ? 'normal' : `${+v.toFixed(2)}×`; }
 function setSpeed(v) {
+  scheduleSave();
   v = Math.round(v * 100) / 100;
   if (partMode()) { state.segments[activeSeg()].speed = v; renderSegments(); }
   else state.speed = v;
@@ -932,6 +942,94 @@ $('btnShare').onclick = async () => {
   try { if (navigator.canShare({ files: [file] })) await navigator.share({ files: [file], title: exportResult.name }); else toast('Sharing not supported here, use Save', 2000); }
   catch (e) { if (e.name !== 'AbortError') toast('Share failed: ' + e.message, 2500); }
 };
+
+// ───────────── saved edits ─────────────
+let saveTimer = null;
+function scheduleSave() {
+  if (!state.clip || !state.key) return;
+  clearTimeout(saveTimer); saveTimer = setTimeout(doSave, 900);
+}
+function snapshot() {
+  const a = state.analysis;
+  let ana = null;
+  if (a) {
+    const C = new Float64Array(a.C.length * 4);
+    a.C.forEach((m, i) => C.set(m, 4 * i));
+    ana = { C, ok: a.ok, sharp: a.sharp, inliers: a.inliers, w: a.w, h: a.h };
+  }
+  const st = state.stab;
+  return {
+    v: 1, savedAt: Date.now(), name: state.clip.name,
+    segments: state.segments.map(x => ({ start: x.start, end: x.end, speed: x.speed, look: x.look ? { ...x.look } : undefined })),
+    frame: { ...state.frame }, look: { ...state.look }, speed: state.speed,
+    stab: { on: st.on, level: st.level, maxCrop: st.maxCrop, rotation: st.rotation, zoom: st.zoom, roi: st.roi, roiMode: st.roiMode },
+    analysis: ana,
+  };
+}
+async function doSave() {
+  if (!state.clip || !state.key || state.analysing) { if (state.analysing) scheduleSave(); return; }
+  try {
+    await saveProject(state.key, snapshot());
+    $('saveState').textContent = `✓ Saved on this phone at ${new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}. Open the same clip again to carry on.`;
+  } catch (e) { $('saveState').textContent = `Couldn't save on this phone (${e.message}). Your edit still exports fine.`; }
+}
+function applyProject(p) {
+  const D = state.clip.duration;
+  const segs = (p.segments || []).filter(x => x.end > x.start && x.start < D).map(x => ({ ...x, end: Math.min(x.end, D) }));
+  if (segs.length) state.segments = segs;
+  for (const x of state.segments) { if (x.speed == null) delete x.speed; if (!x.look) delete x.look; }
+  if (p.frame) state.frame = { ...state.frame, ...p.frame };
+  if (p.look) state.look = { ...DEFAULT_LOOK, ...p.look };
+  if (typeof p.speed === 'number') state.speed = p.speed;
+  if (p.stab) Object.assign(state.stab, p.stab);
+  const a = p.analysis;
+  if (a && a.C && a.C.length === state.clip.times.length * 4) {
+    const C = []; for (let i = 0; i < a.C.length; i += 4) C.push([a.C[i], a.C[i + 1], a.C[i + 2], a.C[i + 3]]);
+    state.analysis = { C, ok: a.ok, sharp: a.sharp, inliers: a.inliers, w: a.w, h: a.h };
+  } else if (state.stab.on) state.stab.on = false;   // measurement missing: switch on again to re-measure
+}
+$('btnStartOver').onclick = async () => {
+  if (!state.clip) return;
+  pause();
+  try { await deleteProject(state.key); } catch (e) { /* nothing saved */ }
+  state.segments = [{ start: 0, end: state.clip.duration }]; state.sel = 0; clearUndo();
+  state.frame = { aspect: 'native', rot: 0, quarter: 0, zoom: 1, panX: 0, panY: 0 };
+  state.look = { ...LOOK_PRESETS.natural }; state.speed = 1; state.stab.on = false; state.stab.roi = null; state.stab.roiMode = 'all';
+  renderSegments(); syncControls(); updateStabChip(); invalidate();
+  toast('Started over. The shake measurement is kept, so switching Stabilise on is instant.', 3500);
+};
+
+// ───────────── my looks ─────────────
+function renderMyLooks() {
+  const box = $('myLooks'); box.innerHTML = '';
+  for (const [n, item] of savedLooks().entries()) {
+    const b = document.createElement('button'); b.className = 'pill-btn'; b.textContent = item.name;
+    let held = false, timer = null;
+    b.onpointerdown = () => { held = false; timer = setTimeout(() => {
+      held = true; const list = savedLooks(); list.splice(n, 1); setSavedLooks(list); renderMyLooks(); toast(`Deleted "${item.name}"`, 1800);
+    }, 650); };
+    b.onpointerup = b.onpointerleave = b.onpointercancel = () => clearTimeout(timer);
+    b.onclick = () => {
+      if (held) return;
+      Object.assign(editableLook(), { ...DEFAULT_LOOK, ...item.look }); pills('lookPresets', 'preset', '');
+      lookSync.forEach(f => f()); renderScope(); requestDraw(); persist();
+      toast(`Applied "${item.name}"${partMode() ? ' to this part' : ''}`, 1500);
+    };
+    box.appendChild(b);
+  }
+  const add = document.createElement('button'); add.className = 'pill-btn'; add.textContent = '＋ Save current look';
+  add.onclick = () => { $('saveLookRow').style.display = 'flex'; $('lookName').value = ''; $('lookName').focus(); };
+  box.appendChild(add);
+}
+$('btnSaveLookGo').onclick = () => {
+  const name = $('lookName').value.trim() || `Look ${savedLooks().length + 1}`;
+  const list = savedLooks().filter(x => x.name !== name);
+  list.push({ name, look: { ...effLook() } }); setSavedLooks(list);
+  $('saveLookRow').style.display = 'none'; renderMyLooks();
+  toast(`Saved "${name}". Tap it on any clip to use it`, 2200);
+};
+$('lookName').addEventListener('keydown', e => { if (e.key === 'Enter') $('btnSaveLookGo').click(); });
+renderMyLooks();
 
 // ───────────── boot ─────────────
 syncControls();
