@@ -179,3 +179,9 @@ details#stabMore summary { font-size: 13px; color: var(--text-muted); cursor: po
 .shot canvas { width: 100%; height: auto; display: block; cursor: pointer; }
 .shot .shot-row { display: flex; align-items: center; justify-content: space-between; padding: 6px 8px; font-size: 11px; color: var(--text-muted); }
 .shot button { background: var(--accent); color: #041214; border: none; border-radius: 6px; font-weight: 700; font-size: 11px; padding: 4px 10px; }
+
+.scope-bar { display: none; flex-direction: column; gap: 6px; padding-bottom: 8px; border-bottom: 1px solid var(--line); }
+.scope-bar.show { display: flex; }
+.scope-bar .btn-ghost { font-size: 12px; padding: 6px 10px; align-self: flex-start; }
+.seg-badge { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); font-size: 11px; font-weight: 700; color: var(--text-main);
+  background: rgba(0,0,0,0.55); padding: 1px 5px; border-radius: 4px; pointer-events: none; white-space: nowrap; }
