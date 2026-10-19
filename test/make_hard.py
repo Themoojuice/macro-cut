@@ -57,9 +57,11 @@ def smooth_noise(sig, scale):
     x = cv2.GaussianBlur(x.reshape(-1, 1), (1, 0), k).ravel() if k > 0 else x
     return x / (np.std(x) + 1e-9) * scale
 hb = np.array([math.exp(-(((tk * 1.15) % 1 - 0.1) / 0.06) ** 2) - 0.6 * math.exp(-(((tk * 1.15) % 1 - 0.25) / 0.07) ** 2) for tk in t])
-px = WS * smooth_noise(1.2, 0.07 * W) + 9 * hb + 1.5 * rng.standard_normal(N) + 2 * np.sin(2 * math.pi * 9 * t)
-py = WS * smooth_noise(1.0, 0.06 * H * 1.6) + 12 * hb + 1.5 * rng.standard_normal(N) + 2 * np.sin(2 * math.pi * 8 * t + 1)
-rot = np.deg2rad(WS * smooth_noise(1.5, 1.8) + 0.6 * hb + 0.15 * rng.standard_normal(N))
+SMOOTH = len(sys.argv) > 8 and sys.argv[8] == 'smooth'   # smooth camera only (for interpolation ground truth)
+J = 0.0 if SMOOTH else 1.0
+px = WS * smooth_noise(1.2, 0.07 * W) + J * (9 * hb + 1.5 * rng.standard_normal(N) + 2 * np.sin(2 * math.pi * 9 * t))
+py = WS * smooth_noise(1.0, 0.06 * H * 1.6) + J * (12 * hb + 1.5 * rng.standard_normal(N) + 2 * np.sin(2 * math.pi * 8 * t + 1))
+rot = np.deg2rad(WS * smooth_noise(1.5, 1.8) + J * (0.6 * hb + 0.15 * rng.standard_normal(N)))
 scl = 1 + WS * smooth_noise(2.0, 0.02) + 0.004 * hb
 blurspans = [(int(N * 0.30), int(N * 0.30) + int(0.5 * FPS)), (int(N * 0.72), int(N * 0.72) + int(0.3 * FPS))]
 frames = np.zeros((N, H, W, 3), np.uint8); gts = []

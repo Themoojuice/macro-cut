@@ -6,7 +6,7 @@
   <meta name="theme-color" content="#0b0d10" />
   <title>MacroCut</title>
   <link rel="manifest" href="manifest.json" />
-  <link rel="stylesheet" href="css/app.css?v=7" />
+  <link rel="stylesheet" href="css/app.css?v=9" />
   <script src="vendor/mp4box.all.min.js"></script>
   <script src="vendor/mp4-muxer.js"></script>
 </head>
@@ -67,6 +67,8 @@
         <button class="pill-btn danger" id="btnDelete">🗑️ Delete</button>
         <button class="pill-btn" id="btnResetCuts">Reset</button>
       </div>
+      <div class="hint" id="saveState">Your edits save automatically on this phone. Open the same clip again to carry on.</div>
+      <button class="btn-ghost" id="btnStartOver" style="align-self:flex-start">Start this clip over</button>
       <div class="hint">Drag the white handles to trim. To cut out a blurry middle bit: scrub to it, <b>Split</b> at both ends, select it, <b>Delete</b>. After motion analysis the top strip shows focus: <span style="color:var(--good)">green = sharp</span>, <span style="color:var(--danger)">red = blur</span>.</div>
     </div>
 
@@ -142,7 +144,13 @@
         <button class="pill-btn" data-preset="pop">Spood pop</button>
         <button class="pill-btn" data-preset="off">Off</button>
       </div>
-      <div class="hint">Double-tap any slider to reset it.</div>
+      <div class="section-label">My looks</div>
+      <div class="pill-group my-looks" id="myLooks"></div>
+      <div class="save-look-row" id="saveLookRow" style="display:none">
+        <input type="text" id="lookName" maxlength="24" placeholder="Name this look" />
+        <button class="btn-primary" id="btnSaveLookGo">Save</button>
+      </div>
+      <div class="hint">Double-tap any slider to reset it. Press and hold a saved look to delete it.</div>
       <div id="lookSliders" style="display:flex;flex-direction:column;gap:6px"></div>
     </div>
 
@@ -164,6 +172,7 @@
         <button class="pill-btn active" data-speed="1">Normal</button>
         <button class="pill-btn" data-speed="2">2×</button>
       </div>
+      <label class="toggle"><input type="checkbox" id="smoothSlow" /> Smooth slow motion: create in-between frames when exporting</label>
       <div class="stat" id="speedInfo"></div>
     </div>
   </div>
@@ -221,6 +230,6 @@
   </div>
 
   <video id="video" playsinline muted preload="auto" style="position:fixed;left:-9999px;top:-9999px;width:2px;height:2px;opacity:0;pointer-events:none"></video>
-  <script type="module" src="js/app.js?v=7"></script>
+  <script type="module" src="js/app.js?v=9"></script>
 </body>
 </html>

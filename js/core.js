@@ -762,3 +762,93 @@ export function lookAt(segments, base, t, blend = 0.25) {
   if (prev && Math.abs(seg.start - prev.end) < 1e-3 && t < seg.start + h) return lerpLook(L(prev), L(seg), 0.5 + (t - seg.start) / blend);
   return L(seg);
 }
+
+// ───────────────────────── dense motion (for in-between frames) ─────────────────────────
+// Motion of every part of the picture from frame A to frame B, on a grid.
+// Pyramidal Lucas–Kanade at grid points in both directions; vectors that don't agree both ways
+// (occlusions, flat bokeh, legs crossing) are rejected and filled in from reliable neighbours.
+// Returns { gw, gh, fx, fy, valid } in pixels at the given image size; grid cell (gx, gy) is centred at
+// continuous position ((gx + 0.5) * w / gw, (gy + 0.5) * h / gh).
+export function denseFlow(grayA, grayB, w, h, opts = {}) {
+  const step = opts.step || 16, half = opts.half || 5, levels = opts.levels || 4;
+  const pyrA = opts.pyrA || buildPyramid(grayA, w, h, levels), pyrB = opts.pyrB || buildPyramid(grayB, w, h, levels);
+  const gw = Math.max(2, Math.round(w / step)), gh = Math.max(2, Math.round(h / step)), n = gw * gh;
+  const pts = new Float32Array(n * 2);
+  for (let gy = 0; gy < gh; gy++) for (let gx = 0; gx < gw; gx++) {
+    const k = gy * gw + gx; pts[2 * k] = (gx + 0.5) * w / gw - 0.5; pts[2 * k + 1] = (gy + 0.5) * h / gh - 0.5;
+  }
+  // global (camera) motion as the starting guess, from a coarse-level shift search
+  const g0 = opts.guess || [0, 0];
+  const guess = new Float32Array(n * 2);
+  for (let k = 0; k < n; k++) { guess[2 * k] = pts[2 * k] + g0[0]; guess[2 * k + 1] = pts[2 * k + 1] + g0[1]; }
+  const fwd = trackLK(makeTemplates(pyrA, pts, half), pts, pyrB, guess, 1e9);
+  const gb = new Float32Array(n * 2);
+  for (let k = 0; k < n; k++) { gb[2 * k] = pts[2 * k] - g0[0]; gb[2 * k + 1] = pts[2 * k + 1] - g0[1]; }
+  const bwd = trackLK(makeTemplates(pyrB, pts, half), pts, pyrA, gb, 1e9);
+  const fx = new Float32Array(n), fy = new Float32Array(n), bx = new Float32Array(n), by = new Float32Array(n), valid = new Uint8Array(n);
+  for (let k = 0; k < n; k++) {
+    fx[k] = fwd.pts[2 * k] - pts[2 * k]; fy[k] = fwd.pts[2 * k + 1] - pts[2 * k + 1];
+    bx[k] = bwd.pts[2 * k] - pts[2 * k]; by[k] = bwd.pts[2 * k + 1] - pts[2 * k + 1];
+  }
+  const sampleB = (x, y, arr) => {   // bilinear sample of a grid field at pixel-index position
+    const u = Math.min(gw - 1.001, Math.max(0, (x + 0.5) * gw / w - 0.5)), v = Math.min(gh - 1.001, Math.max(0, (y + 0.5) * gh / h - 0.5));
+    const x0 = u | 0, y0 = v | 0, ax = u - x0, ay = v - y0, i = y0 * gw + x0;
+    return arr[i] * (1 - ax) * (1 - ay) + arr[i + 1] * ax * (1 - ay) + arr[i + gw] * (1 - ax) * ay + arr[i + gw + 1] * ax * ay;
+  };
+  const tol = opts.tol || 1.0;
+  for (let k = 0; k < n; k++) {
+    if (!fwd.status[k] || !bwd.status[k]) continue;
+    const x = pts[2 * k] + fx[k], y = pts[2 * k + 1] + fy[k];
+    if (x < 0 || y < 0 || x > w - 1 || y > h - 1) continue;
+    const ex = fx[k] + sampleB(x, y, bx), ey = fy[k] + sampleB(x, y, by);
+    if (ex * ex + ey * ey < tol * tol) valid[k] = 1;
+  }
+  // fill: start from the median of reliable vectors (the camera motion), then diffuse from neighbours
+  const vals = [], vy = [];
+  for (let k = 0; k < n; k++) if (valid[k]) { vals.push(fx[k]); vy.push(fy[k]); }
+  const med = a => { if (!a.length) return 0; const s = a.slice().sort((p, q) => p - q); return s[s.length >> 1]; };
+  const mx = vals.length ? med(vals) : g0[0], my = vals.length ? med(vy) : g0[1];
+  for (let k = 0; k < n; k++) if (!valid[k]) { fx[k] = mx; fy[k] = my; }
+  for (let it = 0; it < 60; it++) {
+    for (let gy = 0; gy < gh; gy++) for (let gx = 0; gx < gw; gx++) {
+      const k = gy * gw + gx; if (valid[k]) continue;
+      let sx = 0, sy = 0, c = 0;
+      if (gx > 0) { sx += fx[k - 1]; sy += fy[k - 1]; c++; } if (gx < gw - 1) { sx += fx[k + 1]; sy += fy[k + 1]; c++; }
+      if (gy > 0) { sx += fx[k - gw]; sy += fy[k - gw]; c++; } if (gy < gh - 1) { sx += fx[k + gw]; sy += fy[k + gw]; c++; }
+      fx[k] = sx / c; fy[k] = sy / c;
+    }
+  }
+  // light 3×3 median on everything to knock out isolated outliers that slipped through
+  const mf = (src) => {
+    const out = new Float32Array(n), b = new Array(9);
+    for (let gy = 0; gy < gh; gy++) for (let gx = 0; gx < gw; gx++) {
+      let c = 0;
+      for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+        const x = Math.min(gw - 1, Math.max(0, gx + dx)), y = Math.min(gh - 1, Math.max(0, gy + dy)); b[c++] = src[y * gw + x];
+      }
+      b.sort((p, q) => p - q); out[gy * gw + gx] = b[4];
+    }
+    return out;
+  };
+  return { gw, gh, fx: mf(fx), fy: mf(fy), valid, validFrac: vals.length / n };
+}
+
+// Coarse whole-frame shift between two frames (for a good starting guess when the camera jolts).
+export function globalShift(pyrA, pyrB, radius = 12) {
+  const L = Math.min(pyrA.length, pyrB.length) - 1, A = pyrA[L], B = pyrB[L], sc = 1 << L;
+  let best = Infinity, bx = 0, by = 0;
+  for (let dy = -radius; dy <= radius; dy++) for (let dx = -radius; dx <= radius; dx++) {
+    let sad = 0, sd = 0, c = 0;
+    for (let y = 2; y < A.h - 2; y += 2) {
+      const qy = y + dy; if (qy < 0 || qy >= B.h) continue;
+      for (let x = 2; x < A.w - 2; x += 2) {
+        const qx = x + dx; if (qx < 0 || qx >= B.w) continue;
+        const d = B.d[qy * B.w + qx] - A.d[y * A.w + x]; sad += Math.abs(d); sd += d; c++;
+      }
+    }
+    if (c < 20) continue;
+    const s = (sad - Math.abs(sd)) / c;
+    if (s < best) { best = s; bx = dx; by = dy; }
+  }
+  return [bx * sc, by * sc];
+}

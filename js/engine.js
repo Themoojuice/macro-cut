@@ -2,7 +2,7 @@
 /* global Mp4Muxer */
 import { decodeRange, WindowReader, hdrMode } from './media.js';
 import { Downscaler, Renderer } from './gpu.js';
-import { MotionTracker, frameSharpness, frameAt, fillGaps } from './core.js';
+import { MotionTracker, frameSharpness, frameAt, fillGaps, denseFlow, buildPyramid, globalShift } from './core.js';
 
 export function frameInfo(clip, f) {
   const odd = (clip.rotation / 90) & 1;
@@ -100,24 +100,38 @@ export async function analyseClip(clip, { roi = null, onProgress = () => {}, sig
 }
 
 // Output timeline: which source frame feeds each output tick.
-export function buildTimeline(clip, segments, speed, fps) {
-  const ticks = []; // [frameIndex, tsUs]
-  let outT = 0, j = 0;
+// ticks: [frameIndex, tsUs, u]; u > 0 means "u of the way from frameIndex to the next frame" (in-between frame).
+// opts.interp: create in-between frames for parts slowed below the source frame rate.
+export function buildTimeline(clip, segments, speed, fps, opts = {}) {
+  const ticks = [], T = clip.times;
+  let outT = 0, j = 0, interpCount = 0;
   for (const seg of segments) {
     const sp = seg.speed != null ? seg.speed : speed;
     const len = (seg.end - seg.start) / sp;
-    let first = frameAt(clip.times, seg.start); if (clip.times[first] < seg.start - 1e-4 && first < clip.times.length - 1) first++;
-    let lastF = frameAt(clip.times, seg.end); if (clip.times[lastF] > seg.end + 1e-4 && lastF > 0) lastF--;
+    let first = frameAt(T, seg.start); if (T[first] < seg.start - 1e-4 && first < T.length - 1) first++;
+    let lastF = frameAt(T, seg.end); if (T[lastF] > seg.end + 1e-4 && lastF > 0) lastF--;
+    const interp = opts.interp && sp < 0.999;
     while (j / fps < outT + len - 1e-6) {
       const src = seg.start + (j / fps - outT) * sp;
-      let fi = frameAt(clip.times, src);
-      fi = Math.min(Math.max(fi, first), lastF);
-      ticks.push([fi, Math.round(j * 1e6 / fps)]);
+      let fi, u = 0;
+      if (interp) {
+        fi = frameAt(T, src); if (T[fi] > src && fi > 0) fi--;
+        fi = Math.min(Math.max(fi, first), lastF);
+        if (fi < lastF) {
+          u = (src - T[fi]) / Math.max(1e-6, T[fi + 1] - T[fi]);
+          if (u < 0.03) u = 0; else if (u > 0.97) { fi++; u = 0; }
+          u = Math.min(Math.max(u, 0), 1);
+        }
+      } else {
+        fi = Math.min(Math.max(frameAt(T, src), first), lastF);
+      }
+      if (u > 0) interpCount++;
+      ticks.push([fi, Math.round(j * 1e6 / fps), u]);
       j++;
     }
     outT += len;
   }
-  return { ticks, duration: outT };
+  return { ticks, duration: outT, interpCount };
 }
 
 const AVC = ['avc1.640034', 'avc1.640033', 'avc1.640032', 'avc1.64002A', 'avc1.640028', 'avc1.4D0028', 'avc1.42E028'];
@@ -139,10 +153,13 @@ async function pickEncoder(w, h, fps, bitrate) {
  */
 export async function exportClip(clip, plan, { onProgress = () => {}, signal } = {}) {
   const { outW, outH, fps } = plan;
-  const { ticks, duration } = buildTimeline(clip, plan.segments, plan.speed, fps);
+  const { ticks, duration, interpCount } = buildTimeline(clip, plan.segments, plan.speed, fps, { interp: plan.interp });
   if (!ticks.length) throw new Error('Nothing to export — all segments are empty.');
-  const byFrame = new Map();
-  for (const [fi, ts] of ticks) { if (!byFrame.has(fi)) byFrame.set(fi, []); byFrame.get(fi).push(ts); }
+  const byFrame = new Map();   // frame index → { whole: [ts], between: [[ts, u]] }
+  for (const [fi, ts, u] of ticks) {
+    if (!byFrame.has(fi)) byFrame.set(fi, { whole: [], between: [] });
+    if (u > 0) byFrame.get(fi).between.push([ts, u]); else byFrame.get(fi).whole.push(ts);
+  }
   const bitrate = Math.min(80e6, Math.max(6e6, Math.round(outW * outH * fps * 0.22)));
   const enc = await pickEncoder(outW, outH, fps, bitrate);
 
@@ -176,35 +193,79 @@ export async function exportClip(clip, plan, { onProgress = () => {}, signal } =
   clip.times.forEach((t, i) => tsIndex.set(Math.round(t * 1e6), i));
   let emitted = 0, last = performance.now();
   const keyEvery = Math.max(1, Math.round(fps * 2));
+  const emit = async ts => {
+    const waitStart = performance.now();
+    while (encoder.encodeQueueSize > 3 && !encErr) {
+      if (performance.now() - waitStart > 20000) throw new Error('The video encoder stopped responding');
+      await new Promise(r => { wake = r; setTimeout(r, 50); });
+    }
+    if (encErr) throw encErr;
+    const vf = new VideoFrame(canvas, { timestamp: ts, duration: Math.round(1e6 / fps) });
+    encoder.encode(vf, { keyFrame: emitted % keyEvery === 0 });
+    vf.close();
+    emitted++;
+  };
+  const Mi = i => plan.M.subarray(4 * i, 4 * i + 4);
+  const lerpM = (a, b, u) => [a[0] + u * (b[0] - a[0]), a[1] + u * (b[1] - a[1]), a[2] + u * (b[2] - a[2]), a[3] + u * (b[3] - a[3])];
+  // In-between frames need a small greyscale copy of each frame to measure motion.
+  const [aw, ah] = analysisSize(clip);
+  const ds = interpCount ? new Downscaler(aw, ah) : null;
+  const gbytes = ds ? new Uint8Array(aw * ah) : null;
+  let prev = null;   // { i, pyr } for the frame currently held in R.src
+  const renderBetween = async (iA, pyrA, pyrB, list) => {
+    const F = denseFlow(null, null, aw, ah, { pyrA, pyrB, guess: globalShift(pyrA, pyrB) });
+    const data = new Float32Array(F.gw * F.gh * 2);
+    for (let k = 0; k < F.gw * F.gh; k++) { data[2 * k] = F.fx[k] / ah; data[2 * k + 1] = F.fy[k] / ah; }
+    R.setFlow(F.gw, F.gh, data);
+    const mA = Mi(iA), mB = Mi(iA + 1), tA = clip.times[iA], tB = clip.times[iA + 1];
+    for (const [ts, u] of list) {
+      R.render(lerpM(mA, mB, u), lookFor(tA + u * (tB - tA)), { pxScale: 1, interp: u });
+      await emit(ts);
+    }
+  };
   try {
   await decodeRange(clip, {
     fromUs, toUs, signal,
     onFrame: async f => {
-      const i = tsIndex.get(f.timestamp), outs = i === undefined ? null : byFrame.get(i);
-      if (!outs) { f.close(); return; }
-      const info = frameInfo(clip, f);
-      const m = plan.M.subarray(4 * i, 4 * i + 4);
-      const scale = Math.hypot(m[0], m[1]) * info.dispH / outH;
-      R.upload(f, info, scale > 1.25);
-      f.close();
-      R.render(m, lookFor(clip.times[i]), { pxScale: 1 });
-      for (const ts of outs) {
-        const waitStart = performance.now();
-        while (encoder.encodeQueueSize > 3 && !encErr) {
-          if (performance.now() - waitStart > 20000) throw new Error('The video encoder stopped responding');
-          await new Promise(r => { wake = r; setTimeout(r, 50); });
+      const i = tsIndex.get(f.timestamp);
+      const outs = i === undefined ? null : byFrame.get(i);
+      const prevNeeds = prev && byFrame.get(prev.i) && byFrame.get(prev.i).between.length && prev.i === i - 1;
+      if (!outs && !prevNeeds) {
+        f.close();
+        if (prev && prev.i !== i) {
+          const pb = byFrame.get(prev.i);   // previous frame owed in-between frames but its neighbour is missing: hold it
+          if (pb && pb.between.length) for (const [ts] of pb.between) { R.render(Mi(prev.i), lookFor(clip.times[prev.i]), { pxScale: 1 }); await emit(ts); }
+          prev = null;
         }
-        if (encErr) throw encErr;
-        const vf = new VideoFrame(canvas, { timestamp: ts, duration: Math.round(1e6 / fps) });
-        encoder.encode(vf, { keyFrame: emitted % keyEvery === 0 });
-        vf.close();
-        emitted++;
+        return;
       }
+      const info = frameInfo(clip, f);
+      const m = Mi(i);
+      const scale = Math.hypot(m[0], m[1]) * info.dispH / outH;
+      let pyr = null;
+      if (ds && (prevNeeds || (outs && outs.between.length))) {
+        ds.grabBytes(f, info, gbytes);
+        pyr = buildPyramid(Float32Array.from(gbytes), aw, ah, 4);
+      }
+      R.uploadB(f, info, scale > 1.25);
+      f.close();
+      if (prevNeeds) await renderBetween(prev.i, prev.pyr, pyr, byFrame.get(prev.i).between);
+      else if (prev && byFrame.get(prev.i) && byFrame.get(prev.i).between.length) {
+        // no next frame available: hold the previous frame instead
+        for (const [ts] of byFrame.get(prev.i).between) { R.render(Mi(prev.i), lookFor(clip.times[prev.i]), { pxScale: 1 }); await emit(ts); }
+      }
+      R.swapFrames();
+      if (outs) for (const ts of outs.whole) { R.render(m, lookFor(clip.times[i]), { pxScale: 1 }); await emit(ts); }
+      prev = { i, pyr };
       if (performance.now() - last > 150) { last = performance.now(); onProgress(emitted / ticks.length); await tick(); }
     },
   });
-  } catch (e) { if (encoder.state !== 'closed') encoder.close(); R.dispose(); throw e; }
-  R.dispose();
+  // last held frame still owes in-between frames (end of range): hold it
+  if (prev && byFrame.get(prev.i) && byFrame.get(prev.i).between.length && !(signal && signal.aborted)) {
+    for (const [ts] of byFrame.get(prev.i).between) { R.render(Mi(prev.i), lookFor(clip.times[prev.i]), { pxScale: 1 }); await emit(ts); }
+  }
+  } catch (e) { if (encoder.state !== 'closed') encoder.close(); R.dispose(); if (ds) ds.dispose(); throw e; }
+  R.dispose(); if (ds) ds.dispose();
   if (signal && signal.aborted) { encoder.close(); return null; }
   await encoder.flush();
   if (encErr) throw encErr;
@@ -229,5 +290,5 @@ export async function exportClip(clip, plan, { onProgress = () => {}, signal } =
   }
   muxer.finalize();
   onProgress(1);
-  return { blob: new Blob([target.buffer], { type: 'video/mp4' }), codec: enc.cfg.codec, frames: emitted, hasAudio: withAudio, duration };
+  return { blob: new Blob([target.buffer], { type: 'video/mp4' }), codec: enc.cfg.codec, frames: emitted, hasAudio: withAudio, duration, interpolated: interpCount };
 }
