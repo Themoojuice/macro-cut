@@ -18,7 +18,7 @@ const state = {
   stab: { on: false, level: 'medium', maxCrop: 0.22, rotation: true, zoom: true, roiMode: 'all', roi: null },
   frame: { aspect: 'native', rot: 0, quarter: 0, zoom: 1, panX: 0, panY: 0 },
   look: { ...DEFAULT_LOOK },
-  speed: 1, scope: 'part',
+  speed: 1, scope: 'part', smoothSlow: true,
   exp: { res: 'source', fps: 'auto', audio: true },
   muted: false, playing: false, compare: false,
   mediaTime: 0, plan: null, planRaw: null, previewInfo: null, tab: 'tab-trim',
@@ -36,9 +36,10 @@ try {
     Object.assign(state.look, s.look || {});
     Object.assign(state.stab, s.stab || {}, { roi: null, roiMode: 'all' });
     Object.assign(state.exp, s.exp || {});
+    if (typeof s.smoothSlow === 'boolean') state.smoothSlow = s.smoothSlow;
   }
 } catch (e) { /* storage unavailable */ }
-const persist = () => { try { localStorage.setItem(STORE, JSON.stringify({ look: state.look, stab: state.stab, exp: state.exp })); } catch (e) { /* ignore */ } };
+const persist = () => { try { localStorage.setItem(STORE, JSON.stringify({ look: state.look, stab: state.stab, exp: state.exp, smoothSlow: state.smoothSlow })); } catch (e) { /* ignore */ } };
 
 // ───────────── toast / progress ─────────────
 let toastTimer = null;
@@ -555,6 +556,7 @@ function syncControls() {
   $('levelDesc').textContent = LEVELS[state.stab.level].desc;
   pills('aspectGroup', 'aspect', state.frame.aspect);
   lookSync.forEach(f => f()); speedSync(); renderScope();
+  $('smoothSlow').checked = state.smoothSlow;
   updateStabStatus();
 }
 
@@ -715,15 +717,16 @@ function speedSync() {
   $('v-speed').textContent = speedLabel(v);
 }
 document.querySelectorAll('#speedGroup .pill-btn').forEach(b => b.onclick = () => setSpeed(parseFloat(b.dataset.speed)));
+$('smoothSlow').onchange = e => { state.smoothSlow = e.target.checked; updateSpeedInfo(); persist(); };
 function updateSpeedInfo() {
   const el = $('speedInfo'); if (!state.clip) { el.textContent = 'Open a clip first.'; return; }
   const f = state.clip.fps, sp = effSpeed(), eff = f * sp, who = partMode() ? 'This part plays' : 'Plays';
   let msg;
   if (sp === 1) msg = `${who} at normal speed (your clip is ${Math.round(f)} frames per second).`;
   else if (sp > 1) msg = `${who} ${sp}× faster.`;
-  else msg = eff >= 24
-    ? `<span class="good">Smooth slow motion.</span> ${who} with ${Math.round(eff)} real frames per second from your ${Math.round(f)} fps clip.`
-    : `<span class="warn">Slightly steppy:</span> your ${Math.round(f)} fps clip only has ${Math.round(eff)} real frames per second at this speed. For silky slow motion, film at 120 fps or use a gentler speed.`;
+  else if (eff >= Math.min(60, f) - 0.5) msg = `<span class="good">Smooth slow motion.</span> ${who} with ${Math.round(eff)} real frames per second from your ${Math.round(f)} fps clip.`;
+  else if (state.smoothSlow) msg = `<span class="good">Smooth slow motion is on.</span> Your clip has ${Math.round(eff)} real frames per second at this speed; the export creates the in-between frames from the motion. The preview still shows the steps. If something moves very fast (a jump), you may see a little smearing in those frames.`;
+  else msg = `<span class="warn">Steppy:</span> your ${Math.round(f)} fps clip only has ${Math.round(eff)} real frames per second at this speed. Turn on Smooth slow motion, or film at 120 fps.`;
   if (anySlow()) msg += ' Sound is dropped when any part changes speed.';
   el.innerHTML = msg;
 }
@@ -906,14 +909,14 @@ $('btnExportGo').onclick = async () => {
     const baseLook = { ...state.look };
     const res = await exportClip(state.clip, {
       segments: expSegs, speed: state.speed, fps, outW: w, outH: h,
-      M: state.plan.M, look: t => lookAt(expSegs, baseLook, t), audio: state.exp.audio,
+      M: state.plan.M, look: t => lookAt(expSegs, baseLook, t), audio: state.exp.audio, interp: state.smoothSlow,
     }, {
       signal: exportAbort.signal,
       onProgress: p => { $('exportBar').style.width = `${Math.round(p * 100)}%`; $('exportMsg').textContent = `Rendering ${w}×${h} @ ${fps} fps… ${Math.round(p * 100)}%`; },
     });
     if (!res) { setExportUI('options'); exportAbort = null; awake(); await resume(); return; }
     exportResult = { blob: res.blob, name: `MacroCut_${stem()}.mp4` };
-    $('exportMsg').textContent = `Done in ${((performance.now() - t0) / 1000).toFixed(0)} s: ${(res.blob.size / 1e6).toFixed(1)} MB, ${res.frames} frames, ${res.codec.startsWith('avc') ? 'H.264' : 'VP9'}${res.hasAudio ? ' + audio' : ''}.`;
+    $('exportMsg').textContent = `Done in ${((performance.now() - t0) / 1000).toFixed(0)} s: ${(res.blob.size / 1e6).toFixed(1)} MB, ${res.frames} frames, ${res.codec.startsWith('avc') ? 'H.264' : 'VP9'}${res.hasAudio ? ' + audio' : ''}${res.interpolated ? `, ${res.interpolated} in-between frames created` : ''}.`;
     setExportUI('done');
   } catch (e) {
     console.error(e); $('exportMsg').textContent = 'Export failed: ' + (e.message || e); setExportUI('error');

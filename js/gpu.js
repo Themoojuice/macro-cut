@@ -68,10 +68,11 @@ vec3 hdrFix(vec3 n) {
 const FS_WARP = `#version 300 es
 precision highp float;
 uniform sampler2D u_src; uniform vec2 u_out; uniform mat2 u_L; uniform vec2 u_t; uniform int u_cubic;
+uniform sampler2D u_srcB; uniform sampler2D u_flow; uniform int u_interp; uniform float u_it;
 ${ORIENT}
 ${HDR}
 out vec4 o;
-vec4 cubic(vec2 uv) {
+vec4 cubic(sampler2D u_src, vec2 uv) {
   vec2 sp = uv * u_texSize, t1 = floor(sp - 0.5) + 0.5, f = sp - t1;
   vec2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f)), w1 = 1.0 + f * f * (-2.5 + 1.5 * f);
   vec2 w2 = f * (0.5 + f * (2.0 - 1.5 * f)), w3 = f * f * (-0.5 + 0.5 * f);
@@ -91,9 +92,21 @@ vec4 cubic(vec2 uv) {
 void main(){
   vec2 q = vec2(gl_FragCoord.x, u_out.y - gl_FragCoord.y);
   vec2 on = vec2((q.x / u_out.x - 0.5) * (u_out.x / u_out.y), q.y / u_out.y - 0.5);
-  vec2 uv = dispToUV(u_L * on + u_t);
+  vec2 s = u_L * on + u_t;
+  vec2 uv = dispToUV(s);
   if (any(lessThan(uv, vec2(-0.002))) || any(greaterThan(uv, vec2(1.002)))) { o = vec4(0.06, 0.07, 0.08, 1.0); return; }
-  vec3 c = clamp(u_cubic == 1 ? cubic(uv).rgb : texture(u_src, uv).rgb, 0.0, 1.0);
+  vec3 c;
+  if (u_interp == 1) {
+    // in-between frame: move both neighbouring frames along the measured motion and blend
+    float A = u_dispSize.x / u_dispSize.y;
+    vec2 F = texture(u_flow, vec2(s.x / A + 0.5, s.y + 0.5)).rg;
+    vec2 ua = dispToUV(s - u_it * F), ub = dispToUV(s + (1.0 - u_it) * F);
+    vec3 a = u_cubic == 1 ? cubic(u_src, ua).rgb : texture(u_src, ua).rgb;
+    vec3 b = u_cubic == 1 ? cubic(u_srcB, ub).rgb : texture(u_srcB, ub).rgb;
+    c = clamp(mix(a, b, u_it), 0.0, 1.0);
+  } else {
+    c = clamp(u_cubic == 1 ? cubic(u_src, uv).rgb : texture(u_src, uv).rgb, 0.0, 1.0);
+  }
   if (u_hdr > 0) c = hdrFix(c);
   o = vec4(c, 1.0);
 }`;
@@ -210,12 +223,18 @@ class Base {
     if (!gl) throw new Error('WebGL2 unavailable');
     this.gl = gl;
     this.vao = gl.createVertexArray();
-    this.src = gl.createTexture();
-    gl.bindTexture(gl.TEXTURE_2D, this.src);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    const mk = () => {
+      const t = gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D, t);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+      return t;
+    };
+    this.src = mk(); this.srcB = mk(); this.flowTex = mk();
+    gl.bindTexture(gl.TEXTURE_2D, this.flowTex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RG16F, 1, 1, 0, gl.RG, gl.FLOAT, new Float32Array(2));
     this.srcInfo = null;
   }
   // Free the GPU context now instead of waiting for GC (phones cap live WebGL contexts and
@@ -224,6 +243,20 @@ class Base {
     try { const ext = this.gl.getExtension('WEBGL_lose_context'); if (ext) ext.loseContext(); } catch (e) { /* ignore */ }
   }
   // info: { texW, texH, dispW, dispH, rot (0..3 quarter turns CW) }
+  // Second frame (for in-between frames). Afterwards swapFrames() makes it the current one.
+  uploadB(source, info, mip = false) {
+    const keep = this.src; this.src = this.srcB;
+    this.upload(source, info, mip);
+    this.srcB = this.src; this.src = keep;
+  }
+  swapFrames() { const t = this.src; this.src = this.srcB; this.srcB = t; }
+  // Motion field from frame A to frame B: grid of [dx, dy] in display-normalised units (height = 1).
+  setFlow(gw, gh, data) {
+    const gl = this.gl;
+    gl.bindTexture(gl.TEXTURE_2D, this.flowTex);
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RG16F, gw, gh, 0, gl.RG, gl.FLOAT, data);
+  }
   upload(source, info, mip = false) {
     const gl = this.gl;
     gl.bindTexture(gl.TEXTURE_2D, this.src);
@@ -334,6 +367,18 @@ export class Renderer extends Base {
     gl.uniform2f(this.warp.u.u_t, M[2], M[3]);
     gl.uniform1i(this.warp.u.u_cubic, !this.mip && scale < 1.25 ? 1 : 0);
     gl.uniform1i(this.warp.u.u_hdr, info.hdr || 0);
+    const it = opts.interp;
+    gl.uniform1i(this.warp.u.u_interp, it != null ? 1 : 0);
+    if (it != null) {
+      gl.uniform1f(this.warp.u.u_it, it);
+      gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, this.srcB); gl.uniform1i(this.warp.u.u_srcB, 1);
+      gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, this.flowTex); gl.uniform1i(this.warp.u.u_flow, 2);
+      gl.activeTexture(gl.TEXTURE0);
+    } else {
+      gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, this.src); gl.uniform1i(this.warp.u.u_srcB, 1);
+      gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, this.flowTex); gl.uniform1i(this.warp.u.u_flow, 2);
+      gl.activeTexture(gl.TEXTURE0);
+    }
     this.setOrient(this.warp, info);
     this.draw(this.A.fb, w, h);
     const raw = !!opts.raw;

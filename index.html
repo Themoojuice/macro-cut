@@ -6,7 +6,7 @@
   <meta name="theme-color" content="#0b0d10" />
   <title>MacroCut</title>
   <link rel="manifest" href="manifest.json" />
-  <link rel="stylesheet" href="css/app.css?v=7" />
+  <link rel="stylesheet" href="css/app.css?v=8" />
   <script src="vendor/mp4box.all.min.js"></script>
   <script src="vendor/mp4-muxer.js"></script>
 </head>
@@ -164,6 +164,7 @@
         <button class="pill-btn active" data-speed="1">Normal</button>
         <button class="pill-btn" data-speed="2">2×</button>
       </div>
+      <label class="toggle"><input type="checkbox" id="smoothSlow" /> Smooth slow motion: create in-between frames when exporting</label>
       <div class="stat" id="speedInfo"></div>
     </div>
   </div>
@@ -221,6 +222,6 @@
   </div>
 
   <video id="video" playsinline muted preload="auto" style="position:fixed;left:-9999px;top:-9999px;width:2px;height:2px;opacity:0;pointer-events:none"></video>
-  <script type="module" src="js/app.js?v=7"></script>
+  <script type="module" src="js/app.js?v=8"></script>
 </body>
 </html>
