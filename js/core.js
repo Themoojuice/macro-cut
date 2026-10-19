@@ -731,3 +731,34 @@ export function suggestCuts(times, sharp, ok, C, o = {}) {
   segs = merged.filter(s => s.end - s.start >= minKeep);
   return segs.length ? segs : [{ start: times[0], end: times[N - 1] + dt }];
 }
+
+// ───────────────────────── per-part settings ─────────────────────────
+// Segments may carry their own `look` and `speed`; everything else uses the whole-clip values.
+export function segmentAt(segments, t) {
+  // half-open [start, end): a playhead sitting exactly on a split belongs to the part that starts there
+  for (let k = 0; k < segments.length; k++) {
+    const sg = segments[k], last = k === segments.length - 1 || Math.abs(segments[k + 1].start - sg.end) > 1e-3;
+    if (t >= sg.start - 1e-4 && (t < sg.end - 1e-4 || (last && t <= sg.end + 1e-4))) return k;
+  }
+  return -1;
+}
+export function speedAt(segments, base, t) {
+  const k = segmentAt(segments, t);
+  return k >= 0 && segments[k].speed != null ? segments[k].speed : base;
+}
+function lerpLook(a, b, u) {
+  if (a === b || u <= 0) return a; if (u >= 1) return b;
+  const o = {};
+  for (const key in a) o[key] = typeof a[key] === 'number' && typeof b[key] === 'number' ? a[key] + u * (b[key] - a[key]) : a[key];
+  return o;
+}
+// Look at time t. Where two parts join without a cut (a split point), blend over `blend` seconds.
+export function lookAt(segments, base, t, blend = 0.25) {
+  const k = segmentAt(segments, t);
+  if (k < 0) return base;
+  const L = s => s.look || base, seg = segments[k], h = blend / 2;
+  const next = segments[k + 1], prev = segments[k - 1];
+  if (next && Math.abs(next.start - seg.end) < 1e-3 && t > seg.end - h) return lerpLook(L(seg), L(next), (t - (seg.end - h)) / blend);
+  if (prev && Math.abs(seg.start - prev.end) < 1e-3 && t < seg.start + h) return lerpLook(L(prev), L(seg), 0.5 + (t - seg.start) / blend);
+  return L(seg);
+}

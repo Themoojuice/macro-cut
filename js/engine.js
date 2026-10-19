@@ -104,11 +104,12 @@ export function buildTimeline(clip, segments, speed, fps) {
   const ticks = []; // [frameIndex, tsUs]
   let outT = 0, j = 0;
   for (const seg of segments) {
-    const len = (seg.end - seg.start) / speed;
+    const sp = seg.speed != null ? seg.speed : speed;
+    const len = (seg.end - seg.start) / sp;
     let first = frameAt(clip.times, seg.start); if (clip.times[first] < seg.start - 1e-4 && first < clip.times.length - 1) first++;
     let lastF = frameAt(clip.times, seg.end); if (clip.times[lastF] > seg.end + 1e-4 && lastF > 0) lastF--;
     while (j / fps < outT + len - 1e-6) {
-      const src = seg.start + (j / fps - outT) * speed;
+      const src = seg.start + (j / fps - outT) * sp;
       let fi = frameAt(clip.times, src);
       fi = Math.min(Math.max(fi, first), lastF);
       ticks.push([fi, Math.round(j * 1e6 / fps)]);
@@ -146,7 +147,9 @@ export async function exportClip(clip, plan, { onProgress = () => {}, signal } =
   const enc = await pickEncoder(outW, outH, fps, bitrate);
 
   const A = clip.audio;
-  const withAudio = !!(plan.audio && A && A.description && Math.abs(plan.speed - 1) < 1e-6);
+  const allNormal = plan.segments.every(sg => Math.abs((sg.speed != null ? sg.speed : plan.speed) - 1) < 1e-6);
+  const withAudio = !!(plan.audio && A && A.description && allNormal);
+  const lookFor = typeof plan.look === 'function' ? plan.look : () => plan.look;
   const target = new Mp4Muxer.ArrayBufferTarget();
   const muxer = new Mp4Muxer.Muxer({
     target,
@@ -184,7 +187,7 @@ export async function exportClip(clip, plan, { onProgress = () => {}, signal } =
       const scale = Math.hypot(m[0], m[1]) * info.dispH / outH;
       R.upload(f, info, scale > 1.25);
       f.close();
-      R.render(m, plan.look, { pxScale: 1 });
+      R.render(m, lookFor(clip.times[i]), { pxScale: 1 });
       for (const ts of outs) {
         const waitStart = performance.now();
         while (encoder.encodeQueueSize > 3 && !encErr) {

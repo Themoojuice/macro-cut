@@ -1,6 +1,6 @@
 import { openClip, decodeRange, withTimeout } from './media.js';
 import { Renderer, DEFAULT_LOOK } from './gpu.js';
-import { computeStabilisation, clampPan, frameAt, suggestCuts } from './core.js';
+import { computeStabilisation, clampPan, frameAt, suggestCuts, lookAt, speedAt, segmentAt } from './core.js';
 import { analyseClip, exportClip, frameInfo } from './engine.js';
 
 const $ = id => document.getElementById(id);
@@ -18,7 +18,7 @@ const state = {
   stab: { on: false, level: 'medium', maxCrop: 0.22, rotation: true, zoom: true, roiMode: 'all', roi: null },
   frame: { aspect: 'native', rot: 0, quarter: 0, zoom: 1, panX: 0, panY: 0 },
   look: { ...DEFAULT_LOOK },
-  speed: 1,
+  speed: 1, scope: 'part',
   exp: { res: 'source', fps: 'auto', audio: true },
   muted: false, playing: false, compare: false,
   mediaTime: 0, plan: null, planRaw: null, previewInfo: null, tab: 'tab-trim',
@@ -113,6 +113,45 @@ function requestDraw() {
   requestAnimationFrame(() => { drawQueued = false; draw(); });
 }
 function currentIndex() { return frameAt(state.clip.times, state.mediaTime); }
+// ── per-part settings: Look and Speed can differ per part of the timeline ──
+function partMode() { return state.scope === 'part' && state.segments.length > 1; }
+function activeSeg() { const k = segmentAt(state.segments, state.mediaTime); return k >= 0 ? k : Math.min(state.sel, state.segments.length - 1); }
+function lookAtTime(t) { return lookAt(state.segments, state.look, t); }
+function effLook() { if (!partMode()) return state.look; const sg = state.segments[activeSeg()]; return (sg && sg.look) || state.look; }
+function editableLook() {
+  if (!partMode()) return state.look;
+  const sg = state.segments[activeSeg()];
+  if (!sg.look) { sg.look = { ...state.look }; renderSegments(); }
+  return sg.look;
+}
+function effSpeed() { if (!partMode()) return state.speed; const sg = state.segments[activeSeg()]; return sg && sg.speed != null ? sg.speed : state.speed; }
+function anySlow() { return state.segments.some(sg => Math.abs((sg.speed != null ? sg.speed : state.speed) - 1) > 1e-6); }
+function syncPartControls() { lookSync.forEach(f => f()); speedSync(); renderScope(); updateSpeedInfo(); }
+function renderScope() {
+  const multi = state.segments.length > 1, k = activeSeg(), sg = state.segments[k];
+  document.querySelectorAll('[data-scope-bar]').forEach(bar => {
+    bar.classList.toggle('show', multi);
+    bar.querySelectorAll('.pill-btn').forEach(b => b.classList.toggle('active', b.dataset.scope === state.scope));
+    const isLook = !!bar.closest('#tab-look'), own = sg && (isLook ? sg.look : sg.speed != null);
+    bar.querySelector('.scope-hint').textContent = state.scope === 'part'
+      ? `Editing part ${k + 1} of ${state.segments.length}: the one under the playhead. Move the playhead to edit another part.`
+      : `Editing the whole clip.${state.segments.some(x => isLook ? x.look : x.speed != null) ? ' Parts you changed separately keep their own settings.' : ''}`;
+    bar.querySelector('.scope-reset').style.display = state.scope === 'part' && own ? '' : 'none';
+  });
+}
+document.querySelectorAll('[data-scope-bar]').forEach(bar => {
+  bar.querySelectorAll('.pill-btn').forEach(b => b.onclick = () => { state.scope = b.dataset.scope; syncPartControls(); });
+  bar.querySelector('.scope-reset').onclick = () => {
+    const sg = state.segments[activeSeg()];
+    if (bar.closest('#tab-look')) delete sg.look; else delete sg.speed;
+    renderSegments(); syncPartControls(); requestDraw(); applyPreviewRate();
+  };
+});
+function applyPreviewRate() {
+  if (!state.clip) return;
+  const r = speedAt(state.segments, state.speed, video.currentTime);
+  if (Math.abs(video.playbackRate - r) > 1e-3) video.playbackRate = r;
+}
 function currentM() {
   const i = currentIndex(), P = state.compare ? state.planRaw : state.plan;
   return P.M.subarray(4 * i, 4 * i + 4);
@@ -122,7 +161,7 @@ function draw() {
   state.draws = (state.draws || 0) + 1;
   if (planDirty) recompute();
   const [, eh] = exportDims();
-  renderer.render(currentM(), state.look, { raw: state.compare, pxScale: renderer.size[1] / eh });
+  renderer.render(currentM(), lookAtTime(state.mediaTime), { raw: state.compare, pxScale: renderer.size[1] / eh });
 }
 
 // ───────────── loading ─────────────
@@ -303,10 +342,10 @@ function play() {
   if (!state.clip) return;
   const t = video.currentTime;
   if (!state.segments.some(s => t >= s.start && t < s.end - 0.05)) video.currentTime = state.segments[0].start;
-  video.playbackRate = state.speed;
+  applyPreviewRate();
   video.play().catch(e => { state.playing = false; $('btnPlay').textContent = '▶'; toast('Playback blocked: ' + e.message, 3000); });
   state.playing = true; $('btnPlay').textContent = '⏸';
-  const tickLoop = () => { if (!state.playing) return; checkSegmentBounds(); requestAnimationFrame(tickLoop); };
+  const tickLoop = () => { if (!state.playing) return; checkSegmentBounds(); applyPreviewRate(); requestAnimationFrame(tickLoop); };
   requestAnimationFrame(tickLoop);
 }
 function pause() { video.pause(); state.playing = false; $('btnPlay').textContent = '▶'; }
@@ -348,10 +387,13 @@ function updateStabChip() {
 
 // ───────────── timeline ─────────────
 const segEl = $('segments'), track = $('track'), playhead = $('playhead');
+let lastActiveKey = '';
 function updatePlayhead() {
   if (!state.clip) return;
   const pct = `${Math.max(0, Math.min(100, (state.mediaTime / state.clip.duration) * 100))}%`;
   playhead.style.left = pct; $('graphHead').style.left = pct;
+  const k = segmentAt(state.segments, state.mediaTime), key = `${k}/${state.segments.length}`;
+  if (k >= 0 && key !== lastActiveKey) { lastActiveKey = key; state.sel = k; renderSegments(); syncPartControls(); }
   $('curTime').textContent = fmt(state.mediaTime);
 }
 function renderSegments() {
@@ -365,6 +407,10 @@ function renderSegments() {
     const hl = document.createElement('div'), hr = document.createElement('div');
     hl.className = hr.className = 'seg-handle';
     el.append(hl, hr);
+    const tags = [];
+    if (seg.look) tags.push('🎨');
+    if (seg.speed != null) tags.push(`${+seg.speed.toFixed(2)}×`);
+    if (tags.length) { const bd = document.createElement('span'); bd.className = 'seg-badge'; bd.textContent = tags.join(' '); el.appendChild(bd); }
     el.addEventListener('pointerdown', ev => {
       if (ev.target !== el) return;
       state.sel = idx; renderSegments();
@@ -372,6 +418,7 @@ function renderSegments() {
     handleDrag(hl, idx, true); handleDrag(hr, idx, false);
     segEl.appendChild(el);
   });
+  renderScope();
 }
 function handleDrag(h, idx, left) {
   h.addEventListener('pointerdown', ev => {
@@ -404,13 +451,15 @@ $('btnSplit').onclick = () => {
   const t = state.mediaTime, i = state.segments.findIndex(s => t > s.start + 0.1 && t < s.end - 0.1);
   if (i < 0) return toast('Move the playhead inside a segment first', 1800);
   const s = state.segments[i];
-  state.segments.splice(i, 1, { start: s.start, end: t }, { start: t, end: s.end });
-  state.sel = i + 1; renderSegments(); invalidate(); clearUndo();
+  const copy = x => { const o = { ...x }; if (x.look) o.look = { ...x.look }; return o; };
+  state.segments.splice(i, 1, { ...copy(s), end: t }, { ...copy(s), start: t });
+  state.sel = i + 1; renderSegments(); invalidate(); clearUndo(); syncPartControls();
+  if (state.segments.length === 2) toast('Split. Look and Speed now change just the part under the playhead', 3200);
 };
 $('btnDelete').onclick = () => {
   if (state.segments.length <= 1) return toast('Split first, then delete the bad piece', 1800);
   state.segments.splice(state.sel, 1); state.sel = Math.max(0, state.sel - 1);
-  seek(state.segments[state.sel].start); renderSegments(); invalidate(); clearUndo();
+  seek(state.segments[state.sel].start); renderSegments(); invalidate(); clearUndo(); syncPartControls();
 };
 $('btnResetCuts').onclick = () => { if (!state.clip) return; state.segments = [{ start: 0, end: state.clip.duration }]; state.sel = 0; renderSegments(); invalidate(); clearUndo(); };
 function clearUndo() { undoSegs = null; $('btnAutoTrim').textContent = '✨ Cut out the blurry & searching bits'; }
@@ -473,7 +522,7 @@ const syncers = [
   bindRange('maxCrop', () => state.stab.maxCrop, v => { state.stab.maxCrop = v; }, v => `${Math.round(v * 100)}%`),
   bindRange('rot', () => state.frame.rot, v => { state.frame.rot = v; clampFramePan(); }, v => `${v.toFixed(1)}°`),
   bindRange('zoom', () => state.frame.zoom, v => { state.frame.zoom = v; clampFramePan(); }, v => `${v.toFixed(2)}×`),
-  bindRange('speed', () => state.speed, v => { setSpeed(v); }, v => speedLabel(v)),
+  bindRange('speed', () => effSpeed(), v => { setSpeed(v); }, v => speedLabel(v)),
 ];
 $('stabRot').onchange = e => { state.stab.rotation = e.target.checked; invalidate(); persist(); };
 $('stabZoom').onchange = e => { state.stab.zoom = e.target.checked; invalidate(); persist(); };
@@ -504,8 +553,8 @@ function syncControls() {
   $('stabOn').checked = state.stab.on;
   pills('stabLevel', 'level', state.stab.level); pills('roiMode', 'roi', state.stab.roiMode);
   $('levelDesc').textContent = LEVELS[state.stab.level].desc;
-  pills('aspectGroup', 'aspect', state.frame.aspect); pills('speedGroup', 'speed', state.speed);
-  lookSync.forEach(f => f());
+  pills('aspectGroup', 'aspect', state.frame.aspect);
+  lookSync.forEach(f => f()); speedSync(); renderScope();
   updateStabStatus();
 }
 
@@ -641,36 +690,42 @@ const lookSync = LOOK_UI.map(([key, label, min, max, st, f]) => {
   const row = document.createElement('div'); row.className = 'control-row';
   row.innerHTML = `<div class="control-label">${label} <b></b></div><input type="range" min="${min}" max="${max}" step="${st}" />`;
   const inp = row.querySelector('input'), b = row.querySelector('b');
-  inp.addEventListener('input', () => { state.look[key] = parseFloat(inp.value); b.textContent = f(state.look[key]); pills('lookPresets', 'preset', ''); requestDraw(); persist(); });
-  inp.addEventListener('dblclick', () => { state.look[key] = DEFAULT_LOOK[key]; inp.value = state.look[key]; b.textContent = f(state.look[key]); requestDraw(); persist(); });
+  inp.addEventListener('input', () => { const L = editableLook(); L[key] = parseFloat(inp.value); b.textContent = f(L[key]); pills('lookPresets', 'preset', ''); renderScope(); requestDraw(); persist(); });
+  inp.addEventListener('dblclick', () => { const L = editableLook(); L[key] = partMode() ? state.look[key] : DEFAULT_LOOK[key]; inp.value = L[key]; b.textContent = f(L[key]); requestDraw(); persist(); });
   $('lookSliders').appendChild(row);
-  return () => { inp.value = state.look[key]; b.textContent = f(state.look[key]); };
+  return () => { const L = effLook(); inp.value = L[key]; b.textContent = f(L[key]); };
 });
 document.querySelectorAll('#lookPresets .pill-btn').forEach(b => b.onclick = () => {
-  Object.assign(state.look, LOOK_PRESETS[b.dataset.preset]); pills('lookPresets', 'preset', b.dataset.preset);
-  lookSync.forEach(f => f()); requestDraw(); persist();
+  Object.assign(editableLook(), LOOK_PRESETS[b.dataset.preset]); pills('lookPresets', 'preset', b.dataset.preset);
+  lookSync.forEach(f => f()); renderScope(); requestDraw(); persist();
 });
 
 // ───────────── speed ─────────────
 function speedLabel(v) { return Math.abs(v - 1) < 1e-6 ? 'normal' : `${+v.toFixed(2)}×`; }
 function setSpeed(v) {
-  state.speed = Math.round(v * 100) / 100;
-  video.playbackRate = state.speed;
-  pills('speedGroup', 'speed', String(state.speed));
-  const el = $('speed'); if (el && +el.value !== state.speed) el.value = state.speed;
-  $('v-speed').textContent = speedLabel(state.speed);
-  updateSpeedInfo();
+  v = Math.round(v * 100) / 100;
+  if (partMode()) { state.segments[activeSeg()].speed = v; renderSegments(); }
+  else state.speed = v;
+  applyPreviewRate(); speedSync(); updateSpeedInfo();
+}
+function speedSync() {
+  const v = effSpeed();
+  pills('speedGroup', 'speed', String(v));
+  const el = $('speed'); if (el && +el.value !== v) el.value = v;
+  $('v-speed').textContent = speedLabel(v);
 }
 document.querySelectorAll('#speedGroup .pill-btn').forEach(b => b.onclick = () => setSpeed(parseFloat(b.dataset.speed)));
 function updateSpeedInfo() {
   const el = $('speedInfo'); if (!state.clip) { el.textContent = 'Open a clip first.'; return; }
-  const f = state.clip.fps, sp = state.speed, eff = f * sp;
-  if (sp === 1) { el.textContent = `Normal speed (your clip is ${Math.round(f)} frames per second).`; return; }
-  if (sp > 1) { el.textContent = `Sped up ${sp}×. Sound is dropped when the speed changes.`; return; }
-  el.innerHTML = eff >= 24
-    ? `<span class="good">Smooth slow motion.</span> Each second shows ${Math.round(eff)} different frames from your clip.`
-    : `<span class="warn">Slightly steppy:</span> your ${Math.round(f)} fps clip only has ${Math.round(eff)} different frames per second at this speed. For silky slow motion, film at 60 or 120 fps.`;
-  el.innerHTML += ' Sound is dropped when the speed changes.';
+  const f = state.clip.fps, sp = effSpeed(), eff = f * sp, who = partMode() ? 'This part plays' : 'Plays';
+  let msg;
+  if (sp === 1) msg = `${who} at normal speed (your clip is ${Math.round(f)} frames per second).`;
+  else if (sp > 1) msg = `${who} ${sp}× faster.`;
+  else msg = eff >= 24
+    ? `<span class="good">Smooth slow motion.</span> ${who} with ${Math.round(eff)} real frames per second from your ${Math.round(f)} fps clip.`
+    : `<span class="warn">Slightly steppy:</span> your ${Math.round(f)} fps clip only has ${Math.round(eff)} real frames per second at this speed. For silky slow motion, film at 120 fps or use a gentler speed.`;
+  if (anySlow()) msg += ' Sound is dropped when any part changes speed.';
+  el.innerHTML = msg;
 }
 
 // ───────────── open ─────────────
@@ -688,7 +743,7 @@ $('btnThisFrame').onclick = async () => {
   const R = new Renderer(c); R.setSize(w, h);
   const m = currentM();
   R.upload(video, state.previewInfo, Math.hypot(m[0], m[1]) * state.previewInfo.dispH / h > 1.25);
-  R.render(m, state.look, { pxScale: 1, raw: state.compare });
+  R.render(m, lookAtTime(state.mediaTime), { pxScale: 1, raw: state.compare });
   const blob = c.convertToBlob ? await c.convertToBlob({ type: 'image/png' }) : await new Promise(r => c.toBlob(r, 'image/png'));
   R.dispose();
   download(blob, `MacroCut_${stem()}_${fmt(state.mediaTime).replace(/[:.]/g, '-')}.png`);
@@ -733,7 +788,7 @@ $('btnFindBest').onclick = async () => {
         await decodeRange(c, { fromUs: ts, toUs: ts, onFrame: f => {
           if (!got && f.timestamp === ts) {
             const info = frameInfo(c, f), m = state.plan.M.subarray(4 * i, 4 * i + 4);
-            R.upload(f, info, Math.hypot(m[0], m[1]) * info.dispH / h > 1.25); R.render(m, state.look, { pxScale: 1 }); got = true;
+            R.upload(f, info, Math.hypot(m[0], m[1]) * info.dispH / h > 1.25); R.render(m, lookAtTime(T[i]), { pxScale: 1 }); got = true;
           }
           f.close();
         } });
@@ -795,7 +850,7 @@ let exportAbort = null, exportResult = null;
 function exportFps() {
   if (state.exp.fps !== 'auto') return parseInt(state.exp.fps, 10);
   const f = state.clip.fps;
-  return state.speed === 1 ? Math.min(60, Math.max(24, Math.round(f))) : 30;
+  return Math.min(60, Math.max(24, Math.round(f)));
 }
 function renderExportOptions() {
   const g = $('resGroup'); g.innerHTML = '';
@@ -811,9 +866,10 @@ function renderExportOptions() {
   }
   pills('fpsGroup', 'fps', state.exp.fps);
   $('expAudio').checked = state.exp.audio;
-  $('expAudio').disabled = state.speed !== 1 || !state.clip.audio;
-  const total = state.segments.reduce((s, x) => s + (x.end - x.start), 0) / state.speed;
-  $('exportSummary').textContent = `${total.toFixed(1)} s · ${exportFps()} fps · ${state.analysis && state.stab.on ? `steadied (${LEVELS[state.stab.level].label})` : 'not steadied'} · ${speedLabel(state.speed)} speed`;
+  $('expAudio').disabled = anySlow() || !state.clip.audio;
+  const total = state.segments.reduce((s, x) => s + (x.end - x.start) / (x.speed != null ? x.speed : state.speed), 0);
+  const speeds = new Set(state.segments.map(x => x.speed != null ? x.speed : state.speed));
+  $('exportSummary').textContent = `${total.toFixed(1)} s · ${exportFps()} fps · ${state.analysis && state.stab.on ? `steadied (${LEVELS[state.stab.level].label})` : 'not steadied'} · ${speeds.size > 1 ? 'mixed speeds' : speedLabel([...speeds][0]) + ' speed'}${state.segments.some(x => x.look) ? ' · per-part looks' : ''}`;
 }
 document.querySelectorAll('#fpsGroup .pill-btn').forEach(b => b.onclick = () => { state.exp.fps = b.dataset.fps; persist(); renderExportOptions(); });
 $('expAudio').onchange = e => { state.exp.audio = e.target.checked; persist(); };
@@ -846,9 +902,11 @@ $('btnExportGo').onclick = async () => {
   const awake = await keepAwake();
   try {
     if (planDirty) recompute();
+    const expSegs = state.segments.slice().sort((a, b) => a.start - b.start).map(x => ({ ...x, look: x.look ? { ...x.look } : undefined }));
+    const baseLook = { ...state.look };
     const res = await exportClip(state.clip, {
-      segments: state.segments.slice().sort((a, b) => a.start - b.start), speed: state.speed, fps, outW: w, outH: h,
-      M: state.plan.M, look: { ...state.look }, audio: state.exp.audio,
+      segments: expSegs, speed: state.speed, fps, outW: w, outH: h,
+      M: state.plan.M, look: t => lookAt(expSegs, baseLook, t), audio: state.exp.audio,
     }, {
       signal: exportAbort.signal,
       onProgress: p => { $('exportBar').style.width = `${Math.round(p * 100)}%`; $('exportMsg').textContent = `Rendering ${w}×${h} @ ${fps} fps… ${Math.round(p * 100)}%`; },
@@ -878,4 +936,4 @@ updateSpeedInfo();
 if (!('VideoDecoder' in window)) toast('This browser lacks WebCodecs. Use Chrome on Android/desktop.', 8000);
 window.addEventListener('resize', () => updateReticle());
 if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
-window.__macrocut = { state, loadFile, recompute, setStabOn, setSpeed }; // debugging / tests
+window.__macrocut = { state, loadFile, recompute, setStabOn, setSpeed, seek }; // debugging / tests
