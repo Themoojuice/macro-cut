@@ -10,7 +10,7 @@ A phone-first video editor for handheld macro footage (jumping spiders, mostly).
 2. **Trim** → **✨ Cut out the blurry & searching bits** to keep only the good part in one tap (Undo if you disagree), or drag the white handles / Split + Delete yourself.
 3. **Stabilise** → switch on, pick **Mild**, **Medium** or **Max**. Tap **❖** to flip between before and after.
 4. **Frame** (rotate, crop, zoom, aspect), **Look** (sharpen, colour), **Speed** (0.1×–2×) as you like. Once you split the clip, Look and Speed change just the part under the playhead (or flip to *Whole clip*). Save looks you like under **My looks**.
-5. **Export** → Render MP4 → Save / Share. Slowed parts get smooth slow motion (Speed tab switch, on by default).
+5. **Export** → Render MP4 → Save / Share. Slowed parts get smooth slow motion (Speed tab switch, on by default). Tick **✨ Extra clean** for grainy (low-light) footage.
 6. **📸** → *Find the sharpest shots* for full-resolution stills (for iNaturalist), or save the current frame.
 
 Your edit saves automatically on the phone; open the same clip again and it's all back (Trim → *Start this clip over* to reset).
@@ -26,6 +26,7 @@ Your edit saves automatically on the phone; open the same clip again and it's al
 | Auto-cut | Keeps stretches that are in focus and not mid-sweep (sweep = camera motion well above the clip's normal handheld following). Gaps under 0.6 s are kept to avoid jump cuts. |
 | Best shots | Ranks frames by focus (Laplacian on a noise-robust half-res grid), picks the 6 sharpest well-separated moments, renders each at full resolution with all settings applied. |
 | Smooth slow motion | For parts slowed below the source frame rate, the export measures how every part of the picture moves between two real frames (grid Lucas–Kanade both ways, consistency-checked, gaps filled) and creates the in-between frames by moving both frames along that motion and blending. On a 60 fps ground truth, created frames are within ~1 dB of real ones (vs ~4.5 dB worse when repeating frames). |
+| Extra clean (export switch) | Each frame is blended with its ±2 neighbours, lined up along measured motion (chained from one motion measurement per frame). Per pixel, neighbours that don't match the centre (moving legs, bad motion) get zero weight. The blend threshold adapts to the clip's measured grain, and softer neighbours are down-weighted, so clean footage is left alone. Grainy test clip: 32.3 → 36.7 dB vs noise-free truth. Spec: `docs/SPEC-multiframe.md`. |
 | Saving | Each clip's edit (cuts, per-part looks and speeds, framing, stabilisation and the shake measurement) autosaves to IndexedDB on the phone. |
 | Export | Offline, frame-accurate render → H.264 MP4 (VP9 fallback), constant frame rate, original audio passed through at normal speed. Screen kept awake while working. |
 
@@ -51,4 +52,4 @@ vendor/                   mp4box.js (BSD-3), mp4-muxer (MIT)
 test/                     synthetic clip generators, Node scoring, headless-browser end-to-end tests
 ```
 
-Tests: `test/make_hard.py` (realistic hard synthetic clip with ground truth) + `test/score.mjs` (tracking error and jitter), `test/real_track.mjs` (real footage), `test/features.py` (every control measured on exported files), `test/e2e.py`, `test/hdr_e2e.py`, `test/hang.py` (simulated dead decoders), `test/upgrades.py` (auto-cut + best shots), `test/parts.py` (per-part look/speed), `test/flow.test.mjs` + `test/slowmo.py` (in-between frames vs real 60 fps frames), `test/save.py` (save/restore).
+Tests: `test/make_hard.py` (realistic hard synthetic clip with ground truth) + `test/score.mjs` (tracking error and jitter), `test/real_track.mjs` (real footage), `test/features.py` (every control measured on exported files), `test/e2e.py`, `test/hdr_e2e.py`, `test/hang.py` (simulated dead decoders), `test/upgrades.py` (auto-cut + best shots), `test/parts.py` (per-part look/speed), `test/flow.test.mjs` + `test/slowmo.py` (in-between frames vs real 60 fps frames), `test/save.py` (save/restore), `test/denoise.proto.py` + `test/clean.py` (Extra clean vs noise-free truth).

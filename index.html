@@ -6,7 +6,7 @@
   <meta name="theme-color" content="#0b0d10" />
   <title>MacroCut</title>
   <link rel="manifest" href="manifest.json" />
-  <link rel="stylesheet" href="css/app.css?v=9" />
+  <link rel="stylesheet" href="css/app.css?v=10" />
   <script src="vendor/mp4box.all.min.js"></script>
   <script src="vendor/mp4-muxer.js"></script>
 </head>
@@ -213,6 +213,7 @@
           <button class="pill-btn" data-fps="30">30</button>
           <button class="pill-btn" data-fps="60">60</button>
         </div>
+        <label class="toggle"><input type="checkbox" id="expClean" /> ✨ Extra clean: blends 5 neighbouring frames to remove grain (export takes ~3× longer)</label>
         <label class="toggle"><input type="checkbox" id="expAudio" /> Keep sound (only at normal speed)</label>
         <div class="hint" id="exportSummary"></div>
       </div>
@@ -230,6 +231,6 @@
   </div>
 
   <video id="video" playsinline muted preload="auto" style="position:fixed;left:-9999px;top:-9999px;width:2px;height:2px;opacity:0;pointer-events:none"></video>
-  <script type="module" src="js/app.js?v=9"></script>
+  <script type="module" src="js/app.js?v=10"></script>
 </body>
 </html>

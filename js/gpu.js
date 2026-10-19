@@ -111,6 +111,61 @@ void main(){
   o = vec4(c, 1.0);
 }`;
 
+// Multi-frame denoise (texture space of the source frame): neighbours are lined up along measured motion
+// and blended with weights that drop to zero wherever they don't match the centre (moving legs, bad motion).
+const FS_DENOISE = `#version 300 es
+precision highp float;
+uniform sampler2D u_c, u_n0, u_n1, u_n2, u_n3, u_f0, u_f1, u_f2, u_f3;
+uniform int u_cnt; uniform float u_h; uniform vec4 u_sw;
+${ORIENT}
+out vec4 o;
+vec2 uvToDisp(vec2 uv) {
+  vec2 pc = (uv - 0.5) * u_texSize, pd;
+  if (u_rot == 0) pd = pc;
+  else if (u_rot == 1) pd = vec2(-pc.y, pc.x);
+  else if (u_rot == 2) pd = -pc;
+  else pd = vec2(pc.y, -pc.x);
+  return pd / u_dispSize.y;
+}
+vec4 cubic(sampler2D src, vec2 uv) {
+  vec2 sp = uv * u_texSize, t1 = floor(sp - 0.5) + 0.5, f = sp - t1;
+  vec2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f)), w1 = 1.0 + f * f * (-2.5 + 1.5 * f);
+  vec2 w2 = f * (0.5 + f * (2.0 - 1.5 * f)), w3 = f * f * (-0.5 + 0.5 * f);
+  vec2 w12 = w1 + w2, t12 = (t1 + w2 / w12) / u_texSize, t0 = (t1 - 1.0) / u_texSize, t3 = (t1 + 2.0) / u_texSize;
+  vec4 r = vec4(0.0);
+  r += textureLod(src, vec2(t0.x, t0.y), 0.0) * w0.x * w0.y;   r += textureLod(src, vec2(t12.x, t0.y), 0.0) * w12.x * w0.y;
+  r += textureLod(src, vec2(t3.x, t0.y), 0.0) * w3.x * w0.y;   r += textureLod(src, vec2(t0.x, t12.y), 0.0) * w0.x * w12.y;
+  r += textureLod(src, vec2(t12.x, t12.y), 0.0) * w12.x * w12.y; r += textureLod(src, vec2(t3.x, t12.y), 0.0) * w3.x * w12.y;
+  r += textureLod(src, vec2(t0.x, t3.y), 0.0) * w0.x * w3.y;   r += textureLod(src, vec2(t12.x, t3.y), 0.0) * w12.x * w3.y;
+  r += textureLod(src, vec2(t3.x, t3.y), 0.0) * w3.x * w3.y;
+  return r;
+}
+float patchLuma(sampler2D s, vec2 uv) {
+  vec2 p = 1.25 / u_texSize; const vec3 k = vec3(1.0 / 3.0);
+  return (dot(textureLod(s, uv, 0.0).rgb, k) + dot(textureLod(s, uv + vec2(p.x, 0.0), 0.0).rgb, k) + dot(textureLod(s, uv - vec2(p.x, 0.0), 0.0).rgb, k)
+        + dot(textureLod(s, uv + vec2(0.0, p.y), 0.0).rgb, k) + dot(textureLod(s, uv - vec2(0.0, p.y), 0.0).rgb, k)) * 0.2;
+}
+vec4 neighbour(sampler2D n, sampler2D f, vec2 s, float lc, float sw) {
+  float A = u_dispSize.x / u_dispSize.y;
+  vec2 F = texture(f, vec2(s.x / A + 0.5, s.y + 0.5)).rg;
+  vec2 uv = dispToUV(s + F);
+  if (any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0)))) return vec4(0.0);
+  float d = abs(patchLuma(n, uv) - lc) / u_h;
+  float w = exp(-d * d) * sw;
+  return vec4(clamp(cubic(n, uv).rgb, 0.0, 1.0) * w, w);
+}
+void main() {
+  vec2 uv = gl_FragCoord.xy / u_texSize, s = uvToDisp(uv);
+  vec3 c = textureLod(u_c, uv, 0.0).rgb;
+  float lc = patchLuma(u_c, uv);
+  vec4 acc = vec4(c, 1.0);
+  if (u_cnt > 0) acc += neighbour(u_n0, u_f0, s, lc, u_sw.x);
+  if (u_cnt > 1) acc += neighbour(u_n1, u_f1, s, lc, u_sw.y);
+  if (u_cnt > 2) acc += neighbour(u_n2, u_f2, s, lc, u_sw.z);
+  if (u_cnt > 3) acc += neighbour(u_n3, u_f3, s, lc, u_sw.w);
+  o = vec4(acc.rgb / acc.a, 1.0);
+}`;
+
 const FS_BLUR = `#version 300 es
 precision highp float;
 uniform sampler2D u_tex; uniform vec2 u_dir; uniform float u_sigma; uniform int u_rad;
@@ -250,6 +305,59 @@ class Base {
     this.srcB = this.src; this.src = keep;
   }
   swapFrames() { const t = this.src; this.src = this.srcB; this.srcB = t; }
+  // ── multi-frame denoise support ──
+  makeTex() {
+    const gl = this.gl, t = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, t);
+    for (const [k, v] of [[gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE], [gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE], [gl.TEXTURE_MAG_FILTER, gl.LINEAR], [gl.TEXTURE_MIN_FILTER, gl.LINEAR]]) gl.texParameteri(gl.TEXTURE_2D, k, v);
+    return t;
+  }
+  uploadTex(tex, source) {
+    const gl = this.gl;
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false); gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, source);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  }
+  makeTarget(w, h) {
+    const gl = this.gl, t = this.makeTex();
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+    const fb = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, t, 0);
+    return { t, fb, w, h };
+  }
+  setFlowTex(tex, gw, gh, data) {
+    const gl = this.gl;
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RG16F, gw, gh, 0, gl.RG, gl.FLOAT, data);
+  }
+  // Blend up to 4 motion-aligned neighbours into the centre frame; result goes to target (texture space).
+  denoise(centre, neigh, info, target, h = 0.03, mip = false) {
+    const gl = this.gl;
+    if (!this.dn) this.dn = compile(gl, VS, FS_DENOISE);
+    const u = this.dn.u;
+    gl.useProgram(this.dn.p);
+    const bind = (unit, tex, name) => { gl.activeTexture(gl.TEXTURE0 + unit); gl.bindTexture(gl.TEXTURE_2D, tex); gl.uniform1i(u[name], unit); };
+    bind(0, centre, 'u_c');
+    for (let j = 0; j < 4; j++) {
+      const nb = neigh[j] || neigh[0];
+      bind(1 + j, nb ? nb.tex : centre, `u_n${j}`);
+      bind(5 + j, nb ? nb.flowTex : this.flowTex, `u_f${j}`);
+    }
+    gl.activeTexture(gl.TEXTURE0);
+    gl.uniform1i(u.u_cnt, neigh.length); gl.uniform1f(u.u_h, h);
+    const sw = [0, 1, 2, 3].map(j => (neigh[j] && neigh[j].weight != null ? neigh[j].weight : 1));
+    gl.uniform4f(u.u_sw, sw[0], sw[1], sw[2], sw[3]);
+    this.setOrient(this.dn, info);
+    this.draw(target.fb, target.w, target.h);
+    gl.bindTexture(gl.TEXTURE_2D, target.t);
+    if (mip) { gl.generateMipmap(gl.TEXTURE_2D); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR); }
+    else gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  }
+  useSrc(tex, info, mip) { this.src = tex; this.srcInfo = info; this.mip = mip; }
+  useSrcB(tex) { this.srcB = tex; }
   // Motion field from frame A to frame B: grid of [dx, dy] in display-normalised units (height = 1).
   setFlow(gw, gh, data) {
     const gl = this.gl;
@@ -333,6 +441,7 @@ export class Renderer extends Base {
     const gl = this.gl;
     this.warp = compile(gl, VS, FS_WARP);
     this.blur = compile(gl, VS, FS_BLUR);
+    this.dn = null;   // denoise program, compiled on first use
     this.fin = compile(gl, VS, FS_FINAL);
     this.size = [0, 0];
   }

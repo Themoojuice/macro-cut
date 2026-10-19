@@ -2,7 +2,7 @@
 /* global Mp4Muxer */
 import { decodeRange, WindowReader, hdrMode } from './media.js';
 import { Downscaler, Renderer } from './gpu.js';
-import { MotionTracker, frameSharpness, frameAt, fillGaps, denseFlow, buildPyramid, globalShift } from './core.js';
+import { MotionTracker, frameSharpness, frameAt, fillGaps, denseFlow, buildPyramid, globalShift, chainField, grainSigma } from './core.js';
 
 export function frameInfo(clip, f) {
   const odd = (clip.rotation / 90) & 1;
@@ -209,9 +209,118 @@ export async function exportClip(clip, plan, { onProgress = () => {}, signal } =
   const lerpM = (a, b, u) => [a[0] + u * (b[0] - a[0]), a[1] + u * (b[1] - a[1]), a[2] + u * (b[2] - a[2]), a[3] + u * (b[3] - a[3])];
   // In-between frames need a small greyscale copy of each frame to measure motion.
   const [aw, ah] = analysisSize(clip);
-  const ds = interpCount ? new Downscaler(aw, ah) : null;
+  const ds = (interpCount || plan.denoise) ? new Downscaler(aw, ah) : null;
   const gbytes = ds ? new Uint8Array(aw * ah) : null;
   let prev = null;   // { i, pyr } for the frame currently held in R.src
+  // ── Extra clean: each frame blended with its ±2 neighbours along measured motion ──
+  async function exportDenoised() {
+    const D = 2;
+    // Blend threshold follows the clip's real grain: only differences grain could explain get averaged.
+    let H = 0.03, grainChecks = 0;
+    const gcv = typeof OffscreenCanvas !== 'undefined' ? new OffscreenCanvas(192, 192) : Object.assign(document.createElement('canvas'), { width: 192, height: 192 });
+    const gctx = gcv.getContext('2d', { willReadFrequently: true });
+    const measureGrain = f => {
+      try {
+        const W = f.displayWidth, Hh = f.displayHeight, sz = 192, est = [];
+        for (const [fx, fy] of [[0.08, 0.08], [0.92, 0.08], [0.08, 0.92], [0.92, 0.92], [0.5, 0.5], [0.5, 0.1], [0.1, 0.5]]) {
+          const x = Math.round(fx * (W - sz)), y = Math.round(fy * (Hh - sz));
+          gctx.drawImage(f, x, y, sz, sz, 0, 0, sz, sz);
+          est.push(grainSigma(gctx.getImageData(0, 0, sz, sz).data, sz, sz));
+        }
+        est.sort((a, b) => a - b);
+        const sigma = est[1];                                   // quietest areas = grain, not texture
+        const sd = sigma * Math.sqrt(2 / 5);                    // spread of a 5-tap patch difference from grain alone
+        const h = Math.min(0.06, Math.max(0.004, 3.5 * sd));
+        H = grainChecks ? 0.7 * H + 0.3 * h : h; grainChecks++;
+      } catch (e) { /* keep previous */ }
+    };
+    const needed = new Set();
+    for (const [fi, , u] of ticks) { needed.add(fi); if (u > 0) needed.add(fi + 1); }
+    const near = k => { for (let d = -D; d <= D; d++) if (needed.has(k + d)) return true; return false; };
+    const raw = new Map(), fw = new Map(), bw = new Map(), pool = [], flowPool = [];
+    const targets = [];
+    let flip = 0, last = -2, prevC = null, lastProg = performance.now();
+    const norm = F => { const d = new Float32Array(F.gw * F.gh * 2); for (let k = 0; k < F.gw * F.gh; k++) { d[2 * k] = F.x[k] / ah; d[2 * k + 1] = F.y[k] / ah; } return d; };
+    const flowTex = (F) => { const t = flowPool.pop() || R.makeTex(); R.setFlowTex(t, F.gw, F.gh, norm(F)); return t; };
+    const done = new Set();
+    const holdPrev = async () => {
+      const pb = prevC && byFrame.get(prevC.c);
+      if (pb && pb.between.length && !prevC.betweenDone) {
+        R.useSrc(prevC.tex, prevC.info, prevC.mip);
+        for (const [ts] of pb.between) { R.render(Mi(prevC.c), lookFor(clip.times[prevC.c]), { pxScale: 1 }); await emit(ts); }
+        prevC.betweenDone = true;
+      }
+    };
+    exportDenoised.grain = () => H;
+    const ready = async (c, tex, C) => {
+      const pb = prevC && byFrame.get(prevC.c);
+      if (pb && pb.between.length && prevC.c === c - 1 && fw.has(c - 1)) {
+        R.useSrc(prevC.tex, prevC.info, prevC.mip); R.useSrcB(tex);
+        R.setFlow(fw.get(c - 1).gw, fw.get(c - 1).gh, norm(fw.get(c - 1)));
+        const mA = Mi(c - 1), mB = Mi(c), tA = clip.times[c - 1], tB = clip.times[c];
+        for (const [ts, u] of pb.between) { R.render(lerpM(mA, mB, u), lookFor(tA + u * (tB - tA)), { pxScale: 1, interp: u }); await emit(ts); }
+        prevC.betweenDone = true;
+      } else await holdPrev();
+      R.useSrc(tex, C.info, C.mip);
+      const outs = byFrame.get(c);
+      if (outs) for (const ts of outs.whole) { R.render(Mi(c), lookFor(clip.times[c]), { pxScale: 1 }); await emit(ts); }
+      prevC = { c, tex, info: C.info, mip: C.mip };
+    };
+    const finalize = async c => {
+      if (done.has(c) || !raw.has(c) || !needed.has(c)) return;
+      done.add(c);
+      const C = raw.get(c), neigh = [], used = [];
+      // a blurrier neighbour (shake blur, focus drift) would soften the result: weight it down
+      const add = (k, F) => {
+        if (!raw.has(k) || !F) return;
+        const ft = flowTex(F); used.push(ft);
+        const r = raw.get(k).sharp / Math.max(1e-6, C.sharp);
+        neigh.push({ tex: raw.get(k).tex, flowTex: ft, weight: Math.min(1, r * r) });
+      };
+      add(c + 1, fw.get(c));
+      add(c - 1, bw.get(c));
+      if (fw.get(c) && fw.get(c + 1)) add(c + 2, chainField(fw.get(c), fw.get(c + 1)));
+      if (bw.get(c) && bw.get(c - 1)) add(c - 2, chainField(bw.get(c), bw.get(c - 1)));
+      if (!targets.length) for (let k = 0; k < 2; k++) targets.push(R.makeTarget(C.info.texW, C.info.texH));
+      const tgt = targets[flip]; flip ^= 1;
+      R.denoise(C.tex, neigh, C.info, tgt, H, C.mip);
+      flowPool.push(...used);
+      await ready(c, tgt.t, C);
+    };
+    const flushAll = async () => { for (const c of [...raw.keys()].sort((a, b) => a - b)) await finalize(c); };
+    const evict = keep => {
+      for (const k of [...raw.keys()]) if (k < keep) { pool.push(raw.get(k).tex); raw.delete(k); fw.delete(k); bw.delete(k); }
+    };
+    await decodeRange(clip, {
+      fromUs, toUs, signal,
+      onFrame: async f => {
+        const k = tsIndex.get(f.timestamp);
+        if (k === undefined || !near(k)) { f.close(); return; }
+        if (k !== last + 1) { await flushAll(); await holdPrev(); evict(Infinity); prevC = null; }
+        last = k;
+        const info = frameInfo(clip, f), m = Mi(k);
+        const mip = Math.hypot(m[0], m[1]) * info.dispH / outH > 1.25;
+        const tex = pool.pop() || R.makeTex();
+        if (grainChecks === 0 || (k % 30 === 0 && grainChecks < 20)) measureGrain(f);
+        R.uploadTex(tex, f);
+        ds.grabBytes(f, info, gbytes);
+        f.close();
+        const pyr = buildPyramid(Float32Array.from(gbytes), aw, ah, 4);
+        raw.set(k, { tex, pyr, info, mip, sharp: frameSharpness(pyr[0].d, aw, ah) });
+        if (raw.has(k - 1)) {
+          const F = denseFlow(null, null, aw, ah, { pyrA: raw.get(k - 1).pyr, pyrB: pyr, guess: globalShift(raw.get(k - 1).pyr, pyr) });
+          fw.set(k - 1, { gw: F.gw, gh: F.gh, w: aw, h: ah, x: F.fx, y: F.fy });
+          bw.set(k, { gw: F.gw, gh: F.gh, w: aw, h: ah, x: F.bx, y: F.by });
+        }
+        await finalize(k - D);
+        evict(k - 2 * D);
+        if (performance.now() - lastProg > 150) { lastProg = performance.now(); onProgress(emitted / ticks.length); await tick(); }
+      },
+    });
+    if (!(signal && signal.aborted)) { await flushAll(); await holdPrev(); }
+    console.info(`MacroCut extra clean: blend threshold ${H.toFixed(4)}`);
+  }
+
   const renderBetween = async (iA, pyrA, pyrB, list) => {
     const F = denseFlow(null, null, aw, ah, { pyrA, pyrB, guess: globalShift(pyrA, pyrB) });
     const data = new Float32Array(F.gw * F.gh * 2);
@@ -224,7 +333,8 @@ export async function exportClip(clip, plan, { onProgress = () => {}, signal } =
     }
   };
   try {
-  await decodeRange(clip, {
+  if (plan.denoise) await exportDenoised();
+  else await decodeRange(clip, {
     fromUs, toUs, signal,
     onFrame: async f => {
       const i = tsIndex.get(f.timestamp);
@@ -261,7 +371,7 @@ export async function exportClip(clip, plan, { onProgress = () => {}, signal } =
     },
   });
   // last held frame still owes in-between frames (end of range): hold it
-  if (prev && byFrame.get(prev.i) && byFrame.get(prev.i).between.length && !(signal && signal.aborted)) {
+  if (!plan.denoise && prev && byFrame.get(prev.i) && byFrame.get(prev.i).between.length && !(signal && signal.aborted)) {
     for (const [ts] of byFrame.get(prev.i).between) { R.render(Mi(prev.i), lookFor(clip.times[prev.i]), { pxScale: 1 }); await emit(ts); }
   }
   } catch (e) { if (encoder.state !== 'closed') encoder.close(); R.dispose(); if (ds) ds.dispose(); throw e; }
@@ -290,5 +400,5 @@ export async function exportClip(clip, plan, { onProgress = () => {}, signal } =
   }
   muxer.finalize();
   onProgress(1);
-  return { blob: new Blob([target.buffer], { type: 'video/mp4' }), codec: enc.cfg.codec, frames: emitted, hasAudio: withAudio, duration, interpolated: interpCount };
+  return { blob: new Blob([target.buffer], { type: 'video/mp4' }), codec: enc.cfg.codec, frames: emitted, hasAudio: withAudio, duration, interpolated: interpCount, cleaned: !!plan.denoise };
 }
