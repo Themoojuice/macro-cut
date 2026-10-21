@@ -5,7 +5,7 @@ os.environ.setdefault('PLAYWRIGHT_BROWSERS_PATH', '/opt/pw-browsers')
 from playwright.async_api import async_playwright
 CLIP = sys.argv[1]
 S = 'window.__macrocut.state'
-SNAP = f'JSON.stringify({{segs: {S}.segments.map(s => [+s.start.toFixed(3), +s.end.toFixed(3), s.speed ?? null, s.look ? s.look.exposure : null]), frame: {S}.frame, exp: {S}.look.exposure, speed: {S}.speed, level: {S}.stab.level}})'
+SNAP = f'JSON.stringify({{segs: {S}.segments.map(s => [+s.start.toFixed(3), +s.end.toFixed(3), s.speed ?? null, s.look ? (s.look.adj.exposure ?? 0) : null]), frame: {S}.frame, exp: ({S}.look.adj.exposure ?? 0), speed: {S}.speed, level: {S}.stab.level}})'
 
 async def main():
     fails = []

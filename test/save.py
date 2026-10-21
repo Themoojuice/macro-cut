@@ -22,7 +22,7 @@ async def main():
         await pg.click('#btnSplit'); await pg.evaluate('window.__macrocut.seek(4.0)'); await pg.wait_for_timeout(200)
         await pg.click('.dock-item[data-tab="tab-look"]')
         await pg.evaluate('''() => { const r = [...document.querySelectorAll('#lookSliders .control-row')].find(r => r.textContent.trim().startsWith('Brightness'));
-          const el = r.querySelector('input'); el.value = -0.8; el.dispatchEvent(new Event('input', {bubbles: true})); }''')
+          const el = r.querySelector('input'); el.value = -40; el.dispatchEvent(new Event('input', {bubbles: true})); }''')
         await pg.evaluate('window.__macrocut.setSpeed(0.5)')
         await pg.evaluate(f'{S}.frame.rot = 4.5')
         await pg.click('.dock-item[data-tab="tab-stab"]'); await pg.click('#stabLevel .pill-btn[data-level="max"]')
@@ -42,7 +42,7 @@ async def main():
         await pg.click('#myLooks .pill-btn:last-child'); await pg.fill('#lookName', 'Moody'); await pg.click('#btnSaveLookGo')
         await load(OTHER)
         await pg.click('.dock-item[data-tab="tab-look"]'); await pg.click('#myLooks .pill-btn:first-child')
-        print('look on other clip, exposure =', await pg.evaluate(f'{S}.look.exposure'), '| other clip segments:', await pg.evaluate(f'{S}.segments.length'))
+        print('look on other clip, exposure =', await pg.evaluate('window.__macrocut.lookNow().exposure'), '| other clip segments:', await pg.evaluate(f'{S}.segments.length'))
         # start over on first clip
         await load(CLIP); await pg.click('.dock-item[data-tab="tab-trim"]'); await pg.click('#btnStartOver'); await pg.wait_for_timeout(1500)
         await pg.reload(); await load(CLIP)

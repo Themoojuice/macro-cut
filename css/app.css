@@ -202,3 +202,32 @@ details#stabMore summary { font-size: 13px; color: var(--text-muted); cursor: po
 .undo-group .icon-btn + .icon-btn { border-left: 1px solid #2b323f; }
 .undo-group .icon-btn:active { background: var(--accent-dim); }
 .undo-group .icon-btn:disabled { color: var(--text-muted); opacity: 0.4; }
+
+/* Look tab */
+.look-tweaks-head { display: flex; align-items: center; gap: 8px; }
+.look-tweaks-head .hint { flex: 1; }
+.look-tweaks-head .btn-ghost { flex: none; white-space: nowrap; }
+.slider-wrap { flex: 1; min-width: 0; position: relative; display: flex; }
+.look-row.two-sided .slider-wrap::before {   /* centre mark = 0 = the preset as-is */
+  content: ""; position: absolute; left: 50%; top: 3px; bottom: 3px; width: 2px; margin-left: -1px;
+  background: var(--text-muted); opacity: 0.45; border-radius: 1px; pointer-events: none;
+}
+.look-row.idle { opacity: 0.4; }
+#lookSliders.look-off .look-row { opacity: 0.4; }
+/* Look sliders fill from 0 (the preset) towards the thumb, so "no change" looks empty */
+.look-row input[type="range"] { -webkit-appearance: none; appearance: none; background: transparent; height: 28px; margin: 0; }
+.look-row input[type="range"]::-webkit-slider-runnable-track {
+  height: 6px; border-radius: 3px;
+  background: linear-gradient(to right, #3a4250 var(--f0, 50%), var(--accent) var(--f0, 50%), var(--accent) var(--f1, 50%), #3a4250 var(--f1, 50%));
+}
+.look-row input[type="range"]::-moz-range-track {
+  height: 6px; border-radius: 3px;
+  background: linear-gradient(to right, #3a4250 var(--f0, 50%), var(--accent) var(--f0, 50%), var(--accent) var(--f1, 50%), #3a4250 var(--f1, 50%));
+}
+.look-row input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none; width: 22px; height: 22px; margin-top: -8px; border-radius: 50%;
+  background: var(--accent); border: 2px solid var(--bg-panel, #10141b); box-shadow: 0 1px 3px rgba(0,0,0,0.5);
+}
+.look-row input[type="range"]::-moz-range-thumb { width: 22px; height: 22px; border-radius: 50%; background: var(--accent); border: 2px solid #10141b; }
+.look-row.two-sided .slider-wrap::before { top: 7px; bottom: 7px; z-index: 0; }
+.look-row input[type="range"] { position: relative; z-index: 1; }
