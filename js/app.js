@@ -3,7 +3,8 @@ import { Renderer } from './gpu.js';
 import { KEYS, LIMITS, PRESETS, baseOf, defaultLook, cloneLook, normLook, resolveLook, applyAdj, oneSided, hasTweaks } from './look.js';
 import { computeStabilisation, clampPan, frameAt, suggestCuts, lookAt, speedAt, segmentAt } from './core.js';
 import { analyseClip, exportClip, frameInfo, stackStill } from './engine.js';
-import { clipKey, loadProject, saveProject, deleteProject, savedLooks, setSavedLooks } from './store.js';
+import { clipKey, loadProject, saveProject, deleteProject, savedLooks, setSavedLooks, saveLastExport, loadLastExport } from './store.js';
+import { wasHidden, resetHidden } from './media.js';
 
 const $ = id => document.getElementById(id);
 const video = $('video'), view = $('view');
@@ -284,7 +285,7 @@ async function keepAwake() {
   return () => { wakeWanted = Math.max(0, wakeWanted - 1); if (!wakeWanted && wakeLock) { wakeLock.release().catch(() => {}); wakeLock = null; } };
 }
 document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'visible' && wakeWanted) { acquireWake(); toast('Still working. Keep MacroCut open on screen until it finishes', 3000); }
+  if (document.visibilityState === 'visible' && wakeWanted) { acquireWake(); toast('Still working. It buzzes when it\'s done', 3000); }
 });
 
 // Free the preview's hardware decoder while analysis/export decode the file, then bring it back.
@@ -1050,7 +1051,50 @@ function renderExportOptions() {
 document.querySelectorAll('#fpsGroup .pill-btn').forEach(b => b.onclick = () => { state.exp.fps = b.dataset.fps; persist(); renderExportOptions(); });
 $('expAudio').onchange = e => { state.exp.audio = e.target.checked; persist(); };
 $('expClean').onchange = e => { state.exp.clean = e.target.checked; persist(); renderExportOptions(); };
+// ── never lose a finished video: it saves itself, stays one tap away, and survives closing or reloading ──
+let lastExport = null;   // { blob, name, at }
+loadLastExport().then(x => { if (x && x.blob && !lastExport) { lastExport = x; renderLastExport(); } }).catch(() => {});
+function renderLastExport() {
+  const box = $('lastExport');
+  if (!lastExport) { box.style.display = 'none'; return; }
+  box.style.display = 'flex';
+  const when = new Date(lastExport.at).toLocaleString([], { weekday: 'short', hour: 'numeric', minute: '2-digit' });
+  $('lastExportInfo').innerHTML = `<b>Your last video</b>: ${lastExport.name} · ${(lastExport.blob.size / 1e6).toFixed(1)} MB · ${when}`;
+  $('btnLastShare').style.display = navigator.canShare ? '' : 'none';
+}
+$('btnLastSave').onclick = () => { if (lastExport) { download(lastExport.blob, lastExport.name); toast('Saving to your phone\'s Downloads', 2000); } };
+$('btnLastShare').onclick = () => lastExport && shareVideo(lastExport.blob, lastExport.name);
+async function shareVideo(blob, name) {
+  const file = new File([blob], name, { type: 'video/mp4' });
+  try { if (navigator.canShare && navigator.canShare({ files: [file] })) await navigator.share({ files: [file], title: name }); else toast('Sharing not supported here, use Save', 2000); }
+  catch (e) { if (e.name !== 'AbortError') toast('Share failed: ' + e.message, 2500); }
+}
+// Tell the user it's finished: buzz, chime, and a phone notification if MacroCut isn't on screen.
+let chimeCtx = null;
+function prepareAlerts() {
+  try { chimeCtx = chimeCtx || new (window.AudioContext || window.webkitAudioContext)(); chimeCtx.resume(); } catch (e) { /* no audio */ }
+  try { if ('Notification' in window && Notification.permission === 'default') Notification.requestPermission().catch(() => {}); } catch (e) { /* not supported */ }
+}
+function finishedAlert(ok, msg) {
+  try { navigator.vibrate && navigator.vibrate(ok ? [180, 90, 180] : [500]); } catch (e) { /* not allowed */ }
+  try {
+    if (chimeCtx) {
+      const t = chimeCtx.currentTime;
+      for (const [f, d] of ok ? [[880, 0], [1320, 0.16]] : [[330, 0]]) {
+        const o = chimeCtx.createOscillator(), g = chimeCtx.createGain();
+        o.frequency.value = f; g.gain.setValueAtTime(0.0001, t + d); g.gain.exponentialRampToValueAtTime(0.25, t + d + 0.02); g.gain.exponentialRampToValueAtTime(0.0001, t + d + 0.5);
+        o.connect(g).connect(chimeCtx.destination); o.start(t + d); o.stop(t + d + 0.55);
+      }
+    }
+  } catch (e) { /* no audio */ }
+  try {
+    if (document.visibilityState === 'hidden' && 'Notification' in window && Notification.permission === 'granted' && navigator.serviceWorker)
+      navigator.serviceWorker.ready.then(r => r.showNotification(ok ? 'MacroCut: video ready' : 'MacroCut: export stopped', { body: msg, tag: 'macrocut-export' })).catch(() => {});
+  } catch (e) { /* not supported */ }
+}
+
 function setExportUI(mode) {
+  if (mode === 'options') renderLastExport(); else $('lastExport').style.display = 'none';
   $('exportOptions').style.display = mode === 'options' ? 'flex' : 'none';
   $('exportProgress').style.display = mode === 'options' ? 'none' : 'flex';
   $('btnExportGo').style.display = mode === 'options' ? '' : 'none';
@@ -1073,6 +1117,7 @@ $('btnExportGo').onclick = async () => {
   const [w, h] = exportDims(), fps = exportFps();
   setExportUI('running'); $('exportBar').style.width = '0';
   $('exportMsg').textContent = `Rendering ${w}×${h} @ ${fps} fps…`;
+  prepareAlerts(); resetHidden();
   exportAbort = new AbortController();
   const t0 = performance.now();
   const resume = await parkVideo();
@@ -1086,26 +1131,43 @@ $('btnExportGo').onclick = async () => {
       M: state.plan.M, look: t => lookAt(expSegs, baseLook, t), audio: state.exp.audio, interp: state.smoothSlow, denoise: !!state.exp.clean,
     }, {
       signal: exportAbort.signal,
-      onProgress: p => { $('exportBar').style.width = `${Math.round(p * 100)}%`; $('exportMsg').textContent = `Rendering ${w}×${h} @ ${fps} fps… ${Math.round(p * 100)}%`; },
+      onProgress: p => {
+        const el = (performance.now() - t0) / 1000, left = p > 0.03 ? el * (1 - p) / p : null;
+        $('exportBar').style.width = `${Math.round(p * 100)}%`;
+        $('exportMsg').textContent = `Rendering ${w}×${h} @ ${fps} fps… ${Math.round(p * 100)}%${left != null ? ` · about ${left < 90 ? `${Math.max(5, Math.round(left / 5) * 5)} s` : `${Math.round(left / 60)} min`} left` : ''}. It saves itself and buzzes when done.`;
+      },
     });
     if (!res) { setExportUI('options'); exportAbort = null; awake(); await resume(); return; }
-    exportResult = { blob: res.blob, name: `MacroCut_${stem()}.mp4` };
-    $('exportMsg').textContent = `Done in ${((performance.now() - t0) / 1000).toFixed(0)} s: ${(res.blob.size / 1e6).toFixed(1)} MB, ${res.frames} frames, ${res.codec.startsWith('avc') ? 'H.264' : 'VP9'}${res.hasAudio ? ' + audio' : ''}${res.interpolated ? `, ${res.interpolated} in-between frames created` : ''}${res.cleaned ? ', extra clean' : ''}.`;
+    const d = new Date(), p2 = n => String(n).padStart(2, '0');
+    const name = `MacroCut_${stem()}_${d.getFullYear()}${p2(d.getMonth() + 1)}${p2(d.getDate())}-${p2(d.getHours())}${p2(d.getMinutes())}.mp4`;
+    exportResult = { blob: res.blob, name };
+    lastExport = { blob: res.blob, name, at: Date.now() };
+    saveLastExport(lastExport).catch(e => console.warn('could not keep last export', e));
+    download(res.blob, name);   // save straight away: no extra tap needed
+    const secs = (performance.now() - t0) / 1000, T = res.timing;
+    let where = '';
+    if (T && T.total > 5000) {
+      const out = Math.min(100, Math.round(100 * (T.encoder + T.gpu) / T.total));
+      where = ` Time split: drawing + encoding frames ${out}%, reading the clip${res.interpolated || res.cleaned ? ' + working out motion' : ''} ${100 - out}%.`;
+    }
+    $('exportMsg').innerHTML = `<b>✓ Saved to your phone's Downloads</b> as ${name}. Done in ${secs < 90 ? `${secs.toFixed(0)} s` : `${(secs / 60).toFixed(1)} min`}: ${(res.blob.size / 1e6).toFixed(1)} MB, ${res.frames} frames, ${res.codec.startsWith('avc') ? 'H.264' : 'VP9'}${res.hasAudio ? ' + audio' : ''}${res.interpolated ? `, ${res.interpolated} in-between frames created` : ''}${res.cleaned ? ', extra clean' : ''}. If it isn't in Downloads, tap Save again; it also stays under Export until your next video.${where}`;
     setExportUI('done');
+    finishedAlert(true, `${name} is saved to Downloads.`);
   } catch (e) {
-    console.error(e); $('exportMsg').textContent = 'Export failed: ' + (e.message || e); setExportUI('error');
+    console.error(e);
+    const away = wasHidden;
+    $('exportMsg').textContent = away
+      ? `Export stopped while MacroCut was off screen: the phone took the video hardware back (${e.message || e}). Tap Close, then Render again and keep MacroCut on screen; the phone can lie face-down, the screen stays on by itself.`
+      : 'Export failed: ' + (e.message || e);
+    setExportUI('error');
+    finishedAlert(false, away ? 'Stopped while MacroCut was in the background. Open it and tap Render again.' : 'Export failed.');
   }
   exportAbort = null; awake();
   await resume();
 };
 $('exportSheet').addEventListener('click', e => { if (e.target === $('exportSheet') && !exportAbort) $('exportSheet').classList.remove('open'); });
 $('btnSave').onclick = () => exportResult && download(exportResult.blob, exportResult.name);
-$('btnShare').onclick = async () => {
-  if (!exportResult) return;
-  const file = new File([exportResult.blob], exportResult.name, { type: 'video/mp4' });
-  try { if (navigator.canShare({ files: [file] })) await navigator.share({ files: [file], title: exportResult.name }); else toast('Sharing not supported here, use Save', 2000); }
-  catch (e) { if (e.name !== 'AbortError') toast('Share failed: ' + e.message, 2500); }
-};
+$('btnShare').onclick = () => exportResult && shareVideo(exportResult.blob, exportResult.name);
 
 // ───────────── undo / redo ─────────────
 // Snapshots of the edit (cuts, per-part look/speed, framing, look, speed, stabilise settings). Every edit already

@@ -542,6 +542,16 @@ export function boxSmooth3(vals, sigma, mask) {
   return cur;
 }
 
+// Smooth a per-frame requirement (a level, a pull) without ever going below it: spread each value over the
+// smoothing kernel's full reach first, then smooth. Result ≥ input everywhere and changes gradually.
+export function easeUp(req, sigma) {
+  const n = req.length, r = Math.max(0, Math.round((Math.sqrt(4 * sigma * sigma + 1) - 1) / 2)), win = 3 * r;
+  if (!r) return Float64Array.from(req);
+  const dil = new Float64Array(n);
+  for (let i = 0; i < n; i++) { let m = 0; for (let k = Math.max(0, i - win); k <= Math.min(n - 1, i + win); k++) m = Math.max(m, req[k]); dil[i] = m; }
+  return boxSmooth3(dil, sigma, null);
+}
+
 function gaussSmooth(vals, times, sigma, mask) {
   const n = vals.length, out = new Float64Array(n);
   if (sigma <= 0) { out.set(vals); return out; }
@@ -641,27 +651,30 @@ export function computeStabilisation(o) {
         while (j < nL - 1 && needZoom(warp(i, L[j]), fr) > Z) j++;
         feas[i] = (o.kept && !o.kept[i]) ? 0 : j;
       }
-      // spread + ease the level changes in time so the switch itself is invisible
-      const win = Math.max(1, Math.round(0.4 / dt)), dil = new Float64Array(N);
-      for (let i = 0; i < N; i++) { let m = 0; for (let k = Math.max(0, i - win); k <= Math.min(N - 1, i + win); k++) m = Math.max(m, feas[k]); dil[i] = m; }
-      const lvS = boxSmooth3(dil, 0.2 / dt, null);
+      // spread + ease the level changes in time so the switch itself is invisible.
+      // The spread covers the whole smoothing kernel, so the eased level never dips below what a frame needs
+      // (a dip forced a one-frame jump back up: a visible shudder on very shaky clips).
+      const lvS = easeUp(feas, 0.2 / dt);
       for (let i = 0; i < N; i++) {
         const lv = Math.min(nL - 1, Math.max(lvS[i], feas[i]));
         const j0 = Math.floor(lv), j1 = Math.min(nL - 1, j0 + 1), u = lv - j0;
         for (let c = 0; c < 4; c++) S[c][i] = L[j0][c][i] + u * (L[j1][c][i] - L[j0][c][i]);
         if (lv > 1e-3) adjusted++;
       }
-      // last resort: frames that still don't fit (even light smoothing) get pulled toward the raw camera
+      // last resort: frames that still don't fit (even light smoothing) get pulled toward the raw camera.
+      // Work out how far each frame must be pulled, then ease the pull in time like the levels above, so
+      // neighbouring frames move together instead of each snapping by a different amount.
+      const S0 = S.map(a => Float64Array.from(a)), pull = new Float64Array(N);
+      const pulled = (i, m) => { for (let c = 0; c < 4; c++) S[c][i] = S0[c][i] + m * (P[c][i] - S0[c][i]); };
       for (let i = 0; i < N; i++) {
-        if ((o.kept && !o.kept[i]) || needZoom(warp(i, S), fr) <= Z * 1.0001) continue;
-        const keep = S.map(a => a[i]); let lo = 0, hi = 1;
-        for (let it = 0; it < 16; it++) {
-          const m = (lo + hi) / 2;
-          for (let c = 0; c < 4; c++) S[c][i] = P[c][i] + m * (keep[c] - P[c][i]);
-          if (needZoom(warp(i, S), fr) <= Z) lo = m; else hi = m;
-        }
-        for (let c = 0; c < 4; c++) S[c][i] = P[c][i] + lo * (keep[c] - P[c][i]);
-        touching++;
+        if ((o.kept && !o.kept[i]) || needZoom(warp(i, S0), fr) <= Z * 1.0001) continue;
+        let lo = 0, hi = 1;   // lo = too little pull, hi = enough
+        for (let it = 0; it < 16; it++) { const m = (lo + hi) / 2; pulled(i, m); if (needZoom(warp(i, S), fr) <= Z) hi = m; else lo = m; }
+        pull[i] = hi; pulled(i, 0); touching++;
+      }
+      if (touching) {
+        const pS = easeUp(pull, 0.15 / dt);
+        for (let i = 0; i < N; i++) pulled(i, Math.min(1, Math.max(pS[i], pull[i])));
       }
     }
     for (let i = 0; i < N; i++) W[i] = warp(i, S);

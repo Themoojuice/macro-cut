@@ -27,3 +27,8 @@ export const deleteProject = key => tx('readwrite', s => s.delete(key));
 const LOOKS = 'macrocut.looks';
 export function savedLooks() { try { return JSON.parse(localStorage.getItem(LOOKS) || '[]'); } catch (e) { return []; } }
 export function setSavedLooks(list) { try { localStorage.setItem(LOOKS, JSON.stringify(list)); } catch (e) { /* storage full / blocked */ } }
+
+// The last finished export, kept until the next one, so a video is never lost by closing the sheet or reloading.
+const LAST = '__last_export__';
+export const saveLastExport = item => tx('readwrite', s => s.put(item, LAST));
+export const loadLastExport = () => tx('readonly', s => s.get(LAST));
