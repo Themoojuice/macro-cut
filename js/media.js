@@ -40,6 +40,26 @@ export function withTimeout(p, ms, what) {
   return Promise.race([p, new Promise((_, rej) => { t = setTimeout(() => rej(new Error(`${what} timed out`)), ms); })]).finally(() => clearTimeout(t));
 }
 
+// A clock that stops while MacroCut is off screen. The phone pauses or slows a page you've switched away from;
+// that pause must not count as "the decoder/encoder stopped responding" and kill a long export.
+let hiddenSince = typeof document !== 'undefined' && document.visibilityState === 'hidden' ? performance.now() : null, hiddenTotal = 0;
+export let wasHidden = false;   // set if the page has been off screen since the last reset
+if (typeof document !== 'undefined') document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'hidden') { if (hiddenSince == null) hiddenSince = performance.now(); wasHidden = true; }
+  else if (hiddenSince != null) { hiddenTotal += performance.now() - hiddenSince; hiddenSince = null; }
+});
+export function resetHidden() { wasHidden = typeof document !== 'undefined' && document.visibilityState === 'hidden'; }
+export function activeNow() { return performance.now() - hiddenTotal - (hiddenSince != null ? performance.now() - hiddenSince : 0); }
+// withTimeout, but time spent off screen doesn't count.
+export function activeTimeout(p, ms, what) {
+  let t, done = false;
+  const start = activeNow();
+  return Promise.race([p, new Promise((_, rej) => {
+    const check = () => { if (done) return; const left = ms - (activeNow() - start); if (left <= 0) rej(new Error(`${what} timed out`)); else t = setTimeout(check, Math.min(left, 1000)); };
+    t = setTimeout(check, Math.min(ms, 1000));
+  })]).finally(() => { done = true; clearTimeout(t); });
+}
+
 export class WindowReader {
   constructor(file, win = 16 << 20) { this.file = file; this.win = win; this.start = 0; this.buf = null; }
   async read(off, len) {
@@ -164,15 +184,15 @@ export async function decodeRange(clip, { fromUs = 0, toUs = Infinity, onFrame, 
   let end = S.length - 1;
   for (let i = start; i < S.length; i++) { if (S[i].key && S[i].ts > toUs) { end = i - 1; break; } }
   const pending = [];
-  let err = null, wake = null, lastProgress = performance.now();
-  const poke = () => { lastProgress = performance.now(); if (wake) { const w = wake; wake = null; w(); } };
+  let err = null, wake = null, lastProgress = activeNow();
+  const poke = () => { lastProgress = activeNow(); if (wake) { const w = wake; wake = null; w(); } };
   const dec = new VideoDecoder({
     output: f => { pending.push(f); poke(); },
     error: e => { err = e; poke(); },
   });
   dec.addEventListener('dequeue', poke);
   // A hardware decoder that is busy elsewhere (e.g. the preview) can accept work and never answer.
-  const stalled = () => performance.now() - lastProgress > stallMs;
+  const stalled = () => activeNow() - lastProgress > stallMs;
   dec.configure(clip.decoderConfig);
   const reader = new WindowReader(clip.file); // own window: decodes may run alongside each other
   let i = start, flushed = false;
@@ -188,12 +208,12 @@ export async function decodeRange(clip, { fromUs = 0, toUs = Infinity, onFrame, 
     while (true) {
       if (err) throw err;
       if (signal && signal.aborted) break;
-      if (pending.length) { await drain(); lastProgress = performance.now(); continue; }
+      if (pending.length) { await drain(); lastProgress = activeNow(); continue; }
       if (i <= end) {
-        if (dec.decodeQueueSize < 4 && pending.length < maxQueue) { const ch = await chunkFor(clip, S[i++], reader); if (dec.state === 'configured') dec.decode(ch); lastProgress = Math.max(lastProgress, performance.now() - stallMs / 2); continue; }
+        if (dec.decodeQueueSize < 4 && pending.length < maxQueue) { const ch = await chunkFor(clip, S[i++], reader); if (dec.state === 'configured') dec.decode(ch); lastProgress = Math.max(lastProgress, activeNow() - stallMs / 2); continue; }
       } else if (!flushed) {
         flushed = true;
-        await withTimeout(dec.flush(), stallMs, 'Video decoder');
+        await activeTimeout(dec.flush(), stallMs, 'Video decoder');
         continue;
       } else break;
       if (stalled()) throw new Error('The video decoder stopped responding');

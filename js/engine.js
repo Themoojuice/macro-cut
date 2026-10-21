@@ -1,6 +1,6 @@
 // Analysis (motion tracking) and export (frame-accurate WebCodecs render → MP4).
 /* global Mp4Muxer */
-import { decodeRange, WindowReader, hdrMode } from './media.js';
+import { decodeRange, WindowReader, hdrMode, activeNow } from './media.js';
 import { Downscaler, Renderer } from './gpu.js';
 import { MotionTracker, frameSharpness, frameAt, fillGaps, denseFlow, buildPyramid, globalShift, chainField, grainSigma } from './core.js';
 
@@ -191,16 +191,20 @@ export async function exportClip(clip, plan, { onProgress = () => {}, signal } =
   const fromUs = Math.round(plan.segments[0].start * 1e6) - 1, toUs = Math.round(plan.segments[plan.segments.length - 1].end * 1e6) + 1;
   const tsIndex = new Map();
   clip.times.forEach((t, i) => tsIndex.set(Math.round(t * 1e6), i));
-  let emitted = 0, last = performance.now();
+  let emitted = 0, last = performance.now(), tEnc = 0, tGpu = 0;
+  const tStart = activeNow();
   const keyEvery = Math.max(1, Math.round(fps * 2));
   const emit = async ts => {
-    const waitStart = performance.now();
+    const waitStart = activeNow();
     while (encoder.encodeQueueSize > 3 && !encErr) {
-      if (performance.now() - waitStart > 20000) throw new Error('The video encoder stopped responding');
+      if (activeNow() - waitStart > 20000) throw new Error('The video encoder stopped responding');
       await new Promise(r => { wake = r; setTimeout(r, 50); });
     }
+    tEnc += activeNow() - waitStart;
     if (encErr) throw encErr;
+    const g0 = activeNow();
     const vf = new VideoFrame(canvas, { timestamp: ts, duration: Math.round(1e6 / fps) });
+    tGpu += activeNow() - g0;
     encoder.encode(vf, { keyFrame: emitted % keyEvery === 0 });
     vf.close();
     emitted++;
@@ -400,7 +404,8 @@ export async function exportClip(clip, plan, { onProgress = () => {}, signal } =
   }
   muxer.finalize();
   onProgress(1);
-  return { blob: new Blob([target.buffer], { type: 'video/mp4' }), codec: enc.cfg.codec, frames: emitted, hasAudio: withAudio, duration, interpolated: interpCount, cleaned: !!plan.denoise };
+  return { blob: new Blob([target.buffer], { type: 'video/mp4' }), codec: enc.cfg.codec, frames: emitted, hasAudio: withAudio, duration, interpolated: interpCount, cleaned: !!plan.denoise,
+    timing: { total: activeNow() - tStart, encoder: tEnc, gpu: tGpu } };
 }
 
 

@@ -1,6 +1,6 @@
 // Network-first (new commits show up immediately), falling back to cache so the app also works offline in the field.
-const CACHE = 'macrocut-v14';
-const SHELL = ['./', './index.html', './css/app.css?v=14', './js/app.js?v=14', './js/core.js', './js/gpu.js', './js/media.js', './js/engine.js', './js/track-worker.js', './js/store.js', './js/look.js',
+const CACHE = 'macrocut-v15';
+const SHELL = ['./', './index.html', './css/app.css?v=15', './js/app.js?v=15', './js/core.js', './js/gpu.js', './js/media.js', './js/engine.js', './js/track-worker.js', './js/store.js', './js/look.js',
   './vendor/mp4box.all.min.js', './vendor/mp4-muxer.js', './manifest.json'];
 
 self.addEventListener('install', e => {
@@ -18,4 +18,12 @@ self.addEventListener('fetch', e => {
       return res;
     }).catch(() => caches.match(req, { ignoreSearch: false }).then(r => r || caches.match(req, { ignoreSearch: true })))
   );
+});
+// Tapping the "video ready" notification brings MacroCut back to the front.
+self.addEventListener('notificationclick', e => {
+  e.notification.close();
+  e.waitUntil(self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then(cs => {
+    for (const c of cs) if ('focus' in c) return c.focus();
+    return self.clients.openWindow('./');
+  }));
 });

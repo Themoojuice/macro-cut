@@ -231,3 +231,7 @@ details#stabMore summary { font-size: 13px; color: var(--text-muted); cursor: po
 .look-row input[type="range"]::-moz-range-thumb { width: 22px; height: 22px; border-radius: 50%; background: var(--accent); border: 2px solid #10141b; }
 .look-row.two-sided .slider-wrap::before { top: 7px; bottom: 7px; z-index: 0; }
 .look-row input[type="range"] { position: relative; z-index: 1; }
+
+/* Export: last finished video, always one tap away */
+.last-export { display: flex; flex-direction: column; gap: 6px; padding: 10px; border: 1px solid var(--accent); border-radius: 9px; background: var(--accent-dim); }
+.last-export .hint { color: var(--text-main); }
