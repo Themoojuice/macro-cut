@@ -1,5 +1,6 @@
 import { openClip, decodeRange, withTimeout } from './media.js';
-import { Renderer, DEFAULT_LOOK } from './gpu.js';
+import { Renderer } from './gpu.js';
+import { KEYS, LIMITS, PRESETS, baseOf, defaultLook, cloneLook, normLook, resolveLook, applyAdj, oneSided, hasTweaks } from './look.js';
 import { computeStabilisation, clampPan, frameAt, suggestCuts, lookAt, speedAt, segmentAt } from './core.js';
 import { analyseClip, exportClip, frameInfo, stackStill } from './engine.js';
 import { clipKey, loadProject, saveProject, deleteProject, savedLooks, setSavedLooks } from './store.js';
@@ -8,17 +9,12 @@ const $ = id => document.getElementById(id);
 const video = $('video'), view = $('view');
 
 // ───────────── state ─────────────
-const LOOK_PRESETS = {
-  natural: { ...DEFAULT_LOOK },
-  pop: { ...DEFAULT_LOOK, cas: 0.55, detail: 1.1, radius: 1.4, denoise: 0.25, contrast: 0.12, shadows: 0.25, highlights: 0.3, saturation: 0.15, vibrance: 0.45 },
-  off: { cas: 0, detail: 0, radius: 1.5, denoise: 0, exposure: 0, contrast: 0, shadows: 0, highlights: 0, saturation: 0, vibrance: 0, warmth: 0, tint: 0 },
-};
 const state = {
   clip: null, segments: [], sel: 0,
   analysis: null, analysing: null,
   stab: { on: false, level: 'medium', maxCrop: 0.22, rotation: true, zoom: true, roiMode: 'all', roi: null },
   frame: { aspect: 'native', rot: 0, quarter: 0, zoom: 1, panX: 0, panY: 0 },
-  look: { ...DEFAULT_LOOK },
+  look: defaultLook(),
   speed: 1, scope: 'part', smoothSlow: true,
   exp: { res: 'source', fps: 'auto', audio: true, clean: false },
   muted: false, playing: false, compare: false,
@@ -34,13 +30,12 @@ const STORE = 'macrocut.v5';
 try {
   const s = JSON.parse(localStorage.getItem(STORE) || 'null');
   if (s) {
-    Object.assign(state.look, s.look || {});
     Object.assign(state.stab, s.stab || {}, { roi: null, roiMode: 'all' });
     Object.assign(state.exp, s.exp || {});
     if (typeof s.smoothSlow === 'boolean') state.smoothSlow = s.smoothSlow;
   }
 } catch (e) { /* storage unavailable */ }
-const persist = () => { scheduleSave(); try { localStorage.setItem(STORE, JSON.stringify({ look: state.look, stab: state.stab, exp: state.exp, smoothSlow: state.smoothSlow })); } catch (e) { /* ignore */ } };
+const persist = () => { scheduleSave(); try { localStorage.setItem(STORE, JSON.stringify({ stab: state.stab, exp: state.exp, smoothSlow: state.smoothSlow })); } catch (e) { /* ignore */ } };
 
 // ───────────── toast / progress ─────────────
 let toastTimer = null;
@@ -118,17 +113,25 @@ function currentIndex() { return frameAt(state.clip.times, state.mediaTime); }
 // ── per-part settings: Look and Speed can differ per part of the timeline ──
 function partMode() { return state.scope === 'part' && state.segments.length > 1; }
 function activeSeg() { const k = segmentAt(state.segments, state.mediaTime); return k >= 0 ? k : Math.min(state.sel, state.segments.length - 1); }
-function lookAtTime(t) { return lookAt(state.segments, state.look, t); }
+// Looks are stored as preset + tweaks; the renderer wants plain numbers.
+function resolvedLookAt(segs, base, t) {
+  return lookAt(segs.map(x => x.look ? { start: x.start, end: x.end, look: resolveLook(x.look) } : x), resolveLook(base), t);
+}
+function lookAtTime(t) { return resolvedLookAt(state.segments, state.look, t); }
 function effLook() { if (!partMode()) return state.look; const sg = state.segments[activeSeg()]; return (sg && sg.look) || state.look; }
 function editableLook() {
   if (!partMode()) return state.look;
   const sg = state.segments[activeSeg()];
-  if (!sg.look) { sg.look = { ...state.look }; renderSegments(); }
+  if (!sg.look) { sg.look = cloneLook(state.look); renderSegments(); }
   return sg.look;
+}
+function setEditableLook(L) {
+  if (!partMode()) { state.look = L; return; }
+  state.segments[activeSeg()].look = L; renderSegments();
 }
 function effSpeed() { if (!partMode()) return state.speed; const sg = state.segments[activeSeg()]; return sg && sg.speed != null ? sg.speed : state.speed; }
 function anySlow() { return state.segments.some(sg => Math.abs((sg.speed != null ? sg.speed : state.speed) - 1) > 1e-6); }
-function syncPartControls() { lookSync.forEach(f => f()); speedSync(); renderScope(); updateSpeedInfo(); }
+function syncPartControls() { syncLookUI(); speedSync(); renderScope(); updateSpeedInfo(); }
 function renderScope() {
   const multi = state.segments.length > 1, k = activeSeg(), sg = state.segments[k];
   document.querySelectorAll('[data-scope-bar]').forEach(bar => {
@@ -191,6 +194,7 @@ async function loadFile(file) {
     const clip = await openClip(file, msg => toast(msg));
     state.analysis = null; state.stab.roi = null; state.stab.on = false;
     state.segments = [{ start: 0, end: clip.duration }]; state.sel = 0; clearUndo();
+    state.look = defaultLook();   // every new clip starts at Natural with all sliders at 0
     $('shotsGrid').innerHTML = ''; $('btnShotsSaveAll').style.display = 'none';
     state.frame = { aspect: 'native', rot: 0, quarter: 0, zoom: 1, panX: 0, panY: 0 };
     // 1. reference thumbnail from the decoder (only needed for rotated or HDR clips), before <video> exists
@@ -512,7 +516,7 @@ $('btnSplit').onclick = () => {
   const t = state.mediaTime, i = state.segments.findIndex(s => t > s.start + 0.1 && t < s.end - 0.1);
   if (i < 0) return toast('Move the playhead inside a segment first', 1800);
   const s = state.segments[i];
-  const copy = x => { const o = { ...x }; if (x.look) o.look = { ...x.look }; return o; };
+  const copy = x => { const o = { ...x }; if (x.look) o.look = cloneLook(x.look); return o; };
   state.segments.splice(i, 1, { ...copy(s), end: t }, { ...copy(s), start: t });
   state.sel = i + 1; renderSegments(); invalidate(); clearUndo(); syncPartControls();
   if (state.segments.length === 2) toast('Split. Look and Speed now change just the part under the playhead', 3200);
@@ -615,7 +619,7 @@ function syncControls() {
   pills('stabLevel', 'level', state.stab.level); pills('roiMode', 'roi', state.stab.roiMode);
   $('levelDesc').textContent = LEVELS[state.stab.level].desc;
   pills('aspectGroup', 'aspect', state.frame.aspect);
-  lookSync.forEach(f => f()); speedSync(); renderScope();
+  syncLookUI(); speedSync(); renderScope();
   $('smoothSlow').checked = state.smoothSlow;
   updateStabStatus();
 }
@@ -735,33 +739,76 @@ function updateReticle() {
 }
 
 // ───────────── look ─────────────
+// Each slider is a tweak on top of the chosen preset: 0 = the preset exactly (where every slider starts),
+// right = more, left = less, all the way to the setting's limit at each end. Effects that can't go below
+// nothing (sharpening with no preset) only go right. Double-tap a slider to put it back to 0.
 const LOOK_UI = [
-  ['cas', 'Sharpen', 0, 1, 0.01, v => `${Math.round(v * 100)}%`],
-  ['detail', 'Hair & texture', 0, 2.5, 0.01, v => `${Math.round(v * 100)}%`],
-  ['radius', 'Detail size', 0.6, 4, 0.1, v => v < 1.2 ? 'fine' : v < 2.2 ? 'medium' : 'coarse'],
-  ['denoise', 'Smooth background', 0, 1, 0.01, v => `${Math.round(v * 100)}%`],
-  ['exposure', 'Brightness', -2, 2, 0.05, v => `${v > 0 ? '+' : ''}${Math.round(v * 50)}`],
-  ['contrast', 'Contrast', -0.5, 0.6, 0.01, v => `${Math.round(v * 100)}`],
-  ['shadows', 'Brighten shadows', -0.5, 1, 0.01, v => `${Math.round(v * 100)}`],
-  ['highlights', 'Calm bright areas', -0.5, 1, 0.01, v => `${Math.round(v * 100)}`],
-  ['saturation', 'Colour strength', -1, 1, 0.01, v => `${Math.round(v * 100)}`],
-  ['vibrance', 'Boost dull colours', -0.5, 1.5, 0.01, v => `${Math.round(v * 100)}`],
-  ['warmth', 'Cool ↔ warm', -1, 1, 0.01, v => `${Math.round(v * 100)}`],
-  ['tint', 'Green ↔ pink', -1, 1, 0.01, v => `${Math.round(v * 100)}`],
+  ['cas', 'Sharpen'], ['detail', 'Hair & texture'], ['radius', 'Detail size'], ['denoise', 'Smooth background'],
+  ['exposure', 'Brightness'], ['contrast', 'Contrast'], ['shadows', 'Brighten shadows'], ['highlights', 'Calm bright areas'],
+  ['saturation', 'Colour strength'], ['vibrance', 'Boost dull colours'], ['warmth', 'Cool ↔ warm'], ['tint', 'Green ↔ pink'],
 ];
-const lookSync = LOOK_UI.map(([key, label, min, max, st, f]) => {
-  const row = document.createElement('div'); row.className = 'control-row';
-  row.innerHTML = `<div class="control-label">${label} <b></b></div><input type="range" min="${min}" max="${max}" step="${st}" />`;
+const PRESET_NOTE = {
+  natural: '<b>Natural</b>: light sharpening and gentle colour.',
+  pop: '<b>Spood pop</b>: more hair detail, punchier colour and shine.',
+  none: '<b>No preset</b>: the clip as filmed, plus only your slider changes.',
+};
+const sizeWord = v => v < 1.2 ? 'fine' : v < 2.2 ? 'medium' : 'coarse';
+const signed = n => n > 0 ? `+${n}` : n < 0 ? `−${-n}` : '0';
+function lookChanged() { syncLookUI(); renderScope(); requestDraw(); persist(); }
+const lookRows = LOOK_UI.map(([key, label]) => {
+  const row = document.createElement('div'); row.className = 'control-row look-row';
+  row.innerHTML = `<div class="control-label">${label} <b></b></div><div class="slider-wrap"><input type="range" min="-100" max="100" step="1" value="0" /></div>`;
   const inp = row.querySelector('input'), b = row.querySelector('b');
-  inp.addEventListener('input', () => { const L = editableLook(); L[key] = parseFloat(inp.value); b.textContent = f(L[key]); pills('lookPresets', 'preset', ''); renderScope(); requestDraw(); persist(); });
-  inp.addEventListener('dblclick', () => { const L = editableLook(); L[key] = partMode() ? state.look[key] : DEFAULT_LOOK[key]; inp.value = L[key]; b.textContent = f(L[key]); requestDraw(); persist(); });
+  inp.addEventListener('input', () => {
+    const L = editableLook();
+    // Moving a slider while Off means "start from the clip as filmed": no preset, just this change.
+    if (L.off) { L.off = false; L.preset = null; L.adj = {}; }
+    L.adj[key] = parseInt(inp.value, 10) / 100; if (!L.adj[key]) delete L.adj[key];
+    lookChanged();
+  });
+  // Double-tap to reset. Touch browsers don't fire dblclick on sliders, so time the taps ourselves.
+  let lastTap = 0, lastX = 0;
+  const reset = () => { const L = editableLook(); delete L.adj[key]; lookChanged(); };
+  inp.addEventListener('pointerdown', e => {
+    const now = performance.now();
+    if (now - lastTap < 350 && Math.abs(e.clientX - lastX) < 40) { lastTap = 0; setTimeout(reset, 0); }
+    else { lastTap = now; lastX = e.clientX; }
+  });
+  inp.addEventListener('dblclick', reset);
   $('lookSliders').appendChild(row);
-  return () => { const L = effLook(); inp.value = L[key]; b.textContent = f(L[key]); };
+  return { key, row, inp, b };
 });
-document.querySelectorAll('#lookPresets .pill-btn').forEach(b => b.onclick = () => {
-  Object.assign(editableLook(), LOOK_PRESETS[b.dataset.preset]); pills('lookPresets', 'preset', b.dataset.preset);
-  lookSync.forEach(f => f()); renderScope(); requestDraw(); persist();
+function syncLookUI() {
+  const L = effLook(), base = baseOf(L), R = resolveLook(L);
+  for (const { key, row, inp, b } of lookRows) {
+    const one = oneSided(key, base), a = Math.round((L.adj[key] || 0) * 100), shown = one ? Math.max(0, a) : a;
+    inp.min = one ? 0 : -100; inp.value = shown;
+    row.classList.toggle('two-sided', !one);
+    const lo = one ? 0 : -100, z = (0 - lo) / (100 - lo) * 100, v = (shown - lo) / (100 - lo) * 100;
+    // track fill runs from the 0 mark to the thumb (thumb travel is inset by half its width)
+    const px = q => `calc(11px + (100% - 22px) * ${q / 100})`;
+    inp.style.setProperty('--f0', px(Math.min(z, v))); inp.style.setProperty('--f1', px(Math.max(z, v)));
+    b.textContent = key === 'radius' ? sizeWord(R.radius) + (shown ? ` (${signed(shown)})` : '') : signed(shown);
+    // Detail size only matters when hair detail or background smoothing is on.
+    const idle = key === 'radius' && !L.off && R.detail < 1e-3 && R.denoise < 1e-3;
+    row.classList.toggle('idle', idle);
+  }
+  $('lookSliders').classList.toggle('look-off', !!L.off);
+  document.querySelectorAll('#lookPresets .pill-btn').forEach(btn =>
+    btn.classList.toggle('active', btn.dataset.preset === 'off' ? !!L.off : !L.off && L.preset === btn.dataset.preset));
+  const tweaked = hasTweaks(L);
+  $('lookStatus').innerHTML = L.off
+    ? '<b>Off</b>: showing the clip exactly as filmed. Tap Off again to bring your look back.'
+    : PRESET_NOTE[L.preset || 'none'] + (tweaked ? ' Plus your slider changes.' : ' Sliders start at 0 = the preset as-is.');
+  $('btnLookReset').style.display = tweaked ? '' : 'none';
+}
+document.querySelectorAll('#lookPresets .pill-btn').forEach(btn => btn.onclick = () => {
+  const L = editableLook(), p = btn.dataset.preset;
+  if (p === 'off') L.off = !L.off;
+  else { L.preset = !L.off && L.preset === p ? null : p; L.off = false; }   // tap the lit one again to switch it off
+  lookChanged();
 });
+$('btnLookReset').onclick = () => { const L = editableLook(); L.adj = {}; L.off = false; lookChanged(); toast('Sliders back to 0', 1200); };
 
 // ───────────── speed ─────────────
 function speedLabel(v) { return Math.abs(v - 1) < 1e-6 ? 'normal' : `${+v.toFixed(2)}×`; }
@@ -1032,8 +1079,8 @@ $('btnExportGo').onclick = async () => {
   const awake = await keepAwake();
   try {
     if (planDirty) recompute();
-    const expSegs = state.segments.slice().sort((a, b) => a.start - b.start).map(x => ({ ...x, look: x.look ? { ...x.look } : undefined }));
-    const baseLook = { ...state.look };
+    const expSegs = state.segments.slice().sort((a, b) => a.start - b.start).map(x => ({ ...x, look: x.look ? resolveLook(x.look) : undefined }));
+    const baseLook = resolveLook(state.look);
     const res = await exportClip(state.clip, {
       segments: expSegs, speed: state.speed, fps, outW: w, outH: h,
       M: state.plan.M, look: t => lookAt(expSegs, baseLook, t), audio: state.exp.audio, interp: state.smoothSlow, denoise: !!state.exp.clean,
@@ -1102,19 +1149,19 @@ function applyEditState(json) {
   const p = JSON.parse(json), wasOn = state.stab.on;
   restoring = true;
   try {
-    state.segments = p.segments.map(x => { const o = { start: x.start, end: x.end }; if (x.speed != null) o.speed = x.speed; if (x.look) o.look = { ...x.look }; return o; });
+    state.segments = p.segments.map(x => { const o = { start: x.start, end: x.end }; if (x.speed != null) o.speed = x.speed; if (x.look) o.look = normLook(x.look); return o; });
     state.sel = Math.min(state.sel, state.segments.length - 1);
-    state.frame = { ...p.frame }; state.look = { ...p.look }; state.speed = p.speed; state.smoothSlow = p.smoothSlow;
+    state.frame = { ...p.frame }; state.look = normLook(p.look); state.speed = p.speed; state.smoothSlow = p.smoothSlow;
     Object.assign(state.stab, p.stab);
     if (undoSegs) clearUndo();   // the auto-cut button's own one-shot undo is superseded
     renderSegments(); syncControls(); syncPartControls(); applyPreviewRate();
     if (state.stab.on !== wasOn) setStabOn(state.stab.on); else invalidate();
-    updateStabChip(); pills('lookPresets', 'preset', '');
+    updateStabChip(); syncLookUI();
     const t = state.mediaTime;
     if (!state.segments.some(s => t >= s.start && t <= s.end)) seek(state.segments[0].start);
   } finally { restoring = false; }
   histCur = json;
-  try { localStorage.setItem(STORE, JSON.stringify({ look: state.look, stab: state.stab, exp: state.exp, smoothSlow: state.smoothSlow })); } catch (e) { /* ignore */ }
+  try { localStorage.setItem(STORE, JSON.stringify({ stab: state.stab, exp: state.exp, smoothSlow: state.smoothSlow })); } catch (e) { /* ignore */ }
   scheduleSave(); clearTimeout(histTimer);
 }
 function undo() {
@@ -1162,8 +1209,8 @@ function snapshot() {
   const st = state.stab;
   return {
     v: 1, savedAt: Date.now(), name: state.clip.name,
-    segments: state.segments.map(x => ({ start: x.start, end: x.end, speed: x.speed, look: x.look ? { ...x.look } : undefined })),
-    frame: { ...state.frame }, look: { ...state.look }, speed: state.speed,
+    segments: state.segments.map(x => ({ start: x.start, end: x.end, speed: x.speed, look: x.look ? cloneLook(x.look) : undefined })),
+    frame: { ...state.frame }, look: cloneLook(state.look), speed: state.speed,
     stab: { on: st.on, level: st.level, maxCrop: st.maxCrop, rotation: st.rotation, zoom: st.zoom, roi: st.roi, roiMode: st.roiMode },
     analysis: ana,
   };
@@ -1179,9 +1226,9 @@ function applyProject(p) {
   const D = state.clip.duration;
   const segs = (p.segments || []).filter(x => x.end > x.start && x.start < D).map(x => ({ ...x, end: Math.min(x.end, D) }));
   if (segs.length) state.segments = segs;
-  for (const x of state.segments) { if (x.speed == null) delete x.speed; if (!x.look) delete x.look; }
+  for (const x of state.segments) { if (x.speed == null) delete x.speed; if (!x.look) delete x.look; else x.look = normLook(x.look); }
   if (p.frame) state.frame = { ...state.frame, ...p.frame };
-  if (p.look) state.look = { ...DEFAULT_LOOK, ...p.look };
+  if (p.look) state.look = normLook(p.look);
   if (typeof p.speed === 'number') state.speed = p.speed;
   if (p.stab) Object.assign(state.stab, p.stab);
   const a = p.analysis;
@@ -1196,7 +1243,7 @@ $('btnStartOver').onclick = async () => {
   try { await deleteProject(state.key); } catch (e) { /* nothing saved */ }
   state.segments = [{ start: 0, end: state.clip.duration }]; state.sel = 0; clearUndo();
   state.frame = { aspect: 'native', rot: 0, quarter: 0, zoom: 1, panX: 0, panY: 0 };
-  state.look = { ...LOOK_PRESETS.natural }; state.speed = 1; state.stab.on = false; state.stab.roi = null; state.stab.roiMode = 'all';
+  state.look = defaultLook(); state.speed = 1; state.stab.on = false; state.stab.roi = null; state.stab.roiMode = 'all';
   renderSegments(); syncControls(); updateStabChip(); invalidate();
   toast('Started over. The shake measurement is kept, so switching Stabilise on is instant.', 3500);
 };
@@ -1213,8 +1260,7 @@ function renderMyLooks() {
     b.onpointerup = b.onpointerleave = b.onpointercancel = () => clearTimeout(timer);
     b.onclick = () => {
       if (held) return;
-      Object.assign(editableLook(), { ...DEFAULT_LOOK, ...item.look }); pills('lookPresets', 'preset', '');
-      lookSync.forEach(f => f()); renderScope(); requestDraw(); persist();
+      setEditableLook(normLook(item.look)); lookChanged();
       toast(`Applied "${item.name}"${partMode() ? ' to this part' : ''}`, 1500);
     };
     box.appendChild(b);
@@ -1226,7 +1272,7 @@ function renderMyLooks() {
 $('btnSaveLookGo').onclick = () => {
   const name = $('lookName').value.trim() || `Look ${savedLooks().length + 1}`;
   const list = savedLooks().filter(x => x.name !== name);
-  list.push({ name, look: { ...effLook() } }); setSavedLooks(list);
+  list.push({ name, look: { ...cloneLook(effLook()), off: false } }); setSavedLooks(list);
   $('saveLookRow').style.display = 'none'; renderMyLooks();
   toast(`Saved "${name}". Tap it on any clip to use it`, 2200);
 };
@@ -1239,4 +1285,4 @@ updateSpeedInfo();
 if (!('VideoDecoder' in window)) toast('This browser lacks WebCodecs. Use Chrome on Android/desktop.', 8000);
 window.addEventListener('resize', () => updateReticle());
 if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
-window.__macrocut = { state, loadFile, recompute, setStabOn, setSpeed, seek, video }; // debugging / tests
+window.__macrocut = { state, loadFile, recompute, setStabOn, setSpeed, seek, video, lookNow: () => lookAtTime(state.mediaTime) }; // debugging / tests

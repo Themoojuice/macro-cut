@@ -6,7 +6,7 @@
   <meta name="theme-color" content="#0b0d10" />
   <title>MacroCut</title>
   <link rel="manifest" href="manifest.json" />
-  <link rel="stylesheet" href="css/app.css?v=13" />
+  <link rel="stylesheet" href="css/app.css?v=14" />
   <script src="vendor/mp4box.all.min.js"></script>
   <script src="vendor/mp4-muxer.js"></script>
 </head>
@@ -148,13 +148,17 @@
         <button class="pill-btn" data-preset="pop">Spood pop</button>
         <button class="pill-btn" data-preset="off">Off</button>
       </div>
+      <div class="hint" id="lookStatus"></div>
       <div class="section-label">My looks</div>
       <div class="pill-group my-looks" id="myLooks"></div>
       <div class="save-look-row" id="saveLookRow" style="display:none">
         <input type="text" id="lookName" maxlength="24" placeholder="Name this look" />
         <button class="btn-primary" id="btnSaveLookGo">Save</button>
       </div>
-      <div class="hint">Double-tap any slider to reset it. Press and hold a saved look to delete it.</div>
+      <div class="look-tweaks-head">
+        <div class="hint">Double-tap a slider to put it back to 0. Press and hold a saved look to delete it.</div>
+        <button class="btn-ghost" id="btnLookReset" style="display:none">Reset sliders</button>
+      </div>
       <div id="lookSliders" style="display:flex;flex-direction:column;gap:6px"></div>
     </div>
 
@@ -236,6 +240,6 @@
   </div>
 
   <video id="video" playsinline muted preload="auto" style="position:fixed;left:-9999px;top:-9999px;width:2px;height:2px;opacity:0;pointer-events:none"></video>
-  <script type="module" src="js/app.js?v=13"></script>
+  <script type="module" src="js/app.js?v=14"></script>
 </body>
 </html>

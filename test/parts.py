@@ -23,7 +23,7 @@ async def main():
         await pg.click('.dock-item[data-tab="tab-look"]')
         print('scope hint:', await pg.inner_text('#tab-look .scope-hint'))
         await pg.evaluate('''() => { const row = [...document.querySelectorAll('#lookSliders .control-row')].find(r => r.textContent.trim().startsWith('Brightness'));
-          const el = row.querySelector('input'); el.value = -1; el.dispatchEvent(new Event('input', {bubbles: true})); }''')
+          const el = row.querySelector('input'); el.value = -50; el.dispatchEvent(new Event('input', {bubbles: true})); }''')
         await pg.click('.dock-item[data-tab="tab-speed"]'); await pg.click('#speedGroup .pill-btn[data-speed="0.5"]')
         print('speed info:', await pg.inner_text('#speedInfo'))
         # check part 1 is untouched in the UI
