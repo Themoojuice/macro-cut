@@ -6,7 +6,7 @@
   <meta name="theme-color" content="#0b0d10" />
   <title>MacroCut</title>
   <link rel="manifest" href="manifest.json" />
-  <link rel="stylesheet" href="css/app.css?v=16" />
+  <link rel="stylesheet" href="css/app.css?v=17" />
   <script src="vendor/mp4box.all.min.js"></script>
   <script src="vendor/mp4-muxer.js"></script>
 </head>
@@ -60,6 +60,7 @@
       <div id="segments"></div>
       <div id="playhead"></div>
     </div>
+    <div class="trim-bubble" id="trimBubble"></div>
   </div>
 
   <div class="controls-drawer">
@@ -67,13 +68,17 @@
     <div class="tab-pane active" id="tab-trim">
       <button class="btn-primary" id="btnAutoTrim" style="padding:10px">✨ Cut out the blurry &amp; searching bits</button>
       <div class="pill-group">
+        <button class="pill-btn" id="btnStartHere">⇤ Start here</button>
+        <button class="pill-btn" id="btnEndHere">End here ⇥</button>
+      </div>
+      <div class="pill-group">
         <button class="pill-btn" id="btnSplit">✂️ Split</button>
         <button class="pill-btn danger" id="btnDelete">🗑️ Delete</button>
         <button class="pill-btn" id="btnResetCuts">Reset</button>
       </div>
       <div class="hint" id="saveState">Your edits save automatically on this phone. Open the same clip again to carry on.</div>
       <button class="btn-ghost" id="btnStartOver" style="align-self:flex-start">Start this clip over</button>
-      <div class="hint">Drag the white handles to trim. To cut out a blurry middle bit: scrub to it, <b>Split</b> at both ends, select it, <b>Delete</b>. After motion analysis the top strip shows focus: <span style="color:var(--good)">green = sharp</span>, <span style="color:var(--danger)">red = blur</span>.</div>
+      <div class="hint"><b>Trim:</b> drag near either end of a part. Slide your finger up while dragging for fine control. Or move the playhead to the exact frame (⏮ ⏭ step one frame) and tap <b>Start here</b> / <b>End here</b>. To cut out a blurry middle bit: scrub to it, <b>Split</b> at both ends, select it, <b>Delete</b>. After motion analysis the top strip shows focus: <span style="color:var(--good)">green = sharp</span>, <span style="color:var(--danger)">red = blur</span>.</div>
     </div>
 
     <!-- STABILISE -->
@@ -247,6 +252,6 @@
   </div>
 
   <video id="video" playsinline muted preload="auto" style="position:fixed;left:-9999px;top:-9999px;width:2px;height:2px;opacity:0;pointer-events:none"></video>
-  <script type="module" src="js/app.js?v=16"></script>
+  <script type="module" src="js/app.js?v=17"></script>
 </body>
 </html>

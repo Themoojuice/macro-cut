@@ -461,7 +461,7 @@ function updatePlayhead() {
   const pct = `${Math.max(0, Math.min(100, (state.mediaTime / state.clip.duration) * 100))}%`;
   playhead.style.left = pct; $('graphHead').style.left = pct;
   const k = segmentAt(state.segments, state.mediaTime), key = `${k}/${state.segments.length}`;
-  if (k >= 0 && key !== lastActiveKey) { lastActiveKey = key; state.sel = k; renderSegments(); syncPartControls(); }
+  if (k >= 0 && key !== lastActiveKey && !trimDrag) { lastActiveKey = key; state.sel = k; renderSegments(); syncPartControls(); }
   $('curTime').textContent = fmt(state.mediaTime);
 }
 function renderSegments() {
@@ -471,50 +471,131 @@ function renderSegments() {
   state.segments.forEach((seg, idx) => {
     const el = document.createElement('div');
     el.className = 'clip-segment' + (idx === state.sel ? ' selected' : '');
-    el.style.left = `${(seg.start / D) * 100}%`;
-    el.style.width = `${Math.max(((seg.end - seg.start) / D) * 100, 1.5)}%`;
     const hl = document.createElement('div'), hr = document.createElement('div');
-    hl.className = hr.className = 'seg-handle';
+    hl.className = 'seg-handle left'; hr.className = 'seg-handle right';
     el.append(hl, hr);
     const tags = [];
     if (seg.look) tags.push('🎨');
     if (seg.speed != null) tags.push(`${+seg.speed.toFixed(2)}×`);
     if (tags.length) { const bd = document.createElement('span'); bd.className = 'seg-badge'; bd.textContent = tags.join(' '); el.appendChild(bd); }
-    el.addEventListener('pointerdown', ev => {
-      if (ev.target !== el) return;
-      state.sel = idx; renderSegments();
-    });
-    handleDrag(hl, idx, true); handleDrag(hr, idx, false);
     segEl.appendChild(el);
   });
+  layoutSegments();
   renderScope();
 }
-function handleDrag(h, idx, left) {
-  h.addEventListener('pointerdown', ev => {
-    ev.stopPropagation(); pause(); state.sel = idx;
-    const rect = track.getBoundingClientRect(), D = state.clip.duration;
-    h.setPointerCapture(ev.pointerId);
-    const move = e => {
-      const t = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width)) * D, seg = state.segments[idx];
-      if (left) { const lo = idx > 0 ? state.segments[idx - 1].end : 0; seg.start = Math.max(lo, Math.min(t, seg.end - 0.15)); seek(seg.start); }
-      else { const hi = idx < state.segments.length - 1 ? state.segments[idx + 1].start : D; seg.end = Math.min(hi, Math.max(t, seg.start + 0.15)); seek(seg.end - 0.01); }
-      renderSegments();
-    };
-    const up = () => { h.removeEventListener('pointermove', move); h.removeEventListener('pointerup', up); h.removeEventListener('pointercancel', up); invalidate(); };
-    h.addEventListener('pointermove', move); h.addEventListener('pointerup', up); h.addEventListener('pointercancel', up);
+// Position the segment boxes without rebuilding them (rebuilding mid-drag used to drop the finger's handle).
+function layoutSegments() {
+  const D = state.clip ? state.clip.duration : 0; if (!D) return;
+  [...segEl.children].forEach((el, idx) => {
+    const seg = state.segments[idx]; if (!seg) return;
+    el.style.left = `${(seg.start / D) * 100}%`;
+    el.style.width = `${Math.max(((seg.end - seg.start) / D) * 100, 0.6)}%`;
+    el.classList.toggle('selected', idx === state.sel);
   });
 }
+
+// ── Trim by dragging: grab near any segment edge (no need to hit the small tab exactly). The edge follows the
+// finger; slide the finger up off the timeline for fine control (up to 10× finer). The video shows the frame at
+// the edge, and a bubble shows the time. Lifting the finger is one undo step.
+const EDGE_GRAB_PX = 26, MIN_LEN = 0.15;
+function edgeNear(clientX) {
+  const rect = track.getBoundingClientRect(), D = state.clip.duration, px = t => rect.left + (t / D) * rect.width;
+  let best = null;
+  state.segments.forEach((sg, idx) => {
+    for (const left of [true, false]) {
+      const d = Math.abs(clientX - px(left ? sg.start : sg.end));
+      // ties (narrow parts, touching parts): prefer the selected part, then the edge on the side the finger is
+      const bias = (idx === state.sel ? -3 : 0) + ((left ? clientX >= px(sg.start) : clientX <= px(sg.end)) ? -2 : 0);
+      if (d <= EDGE_GRAB_PX && (!best || d + bias < best.score)) best = { idx, left, score: d + bias };
+    }
+  });
+  return best;
+}
+let trimDrag = null, trimSeekQueued = false;
+function trimBubble(show) {
+  const b = $('trimBubble');
+  if (!show || !trimDrag) { b.style.display = 'none'; return; }
+  const sg = state.segments[trimDrag.idx], t = trimDrag.left ? sg.start : sg.end, D = state.clip.duration;
+  const r = track.getBoundingClientRect(), sec = track.parentElement.getBoundingClientRect();
+  b.style.display = 'block';
+  b.innerHTML = `${trimDrag.left ? 'Start' : 'End'} <b>${fmt(t)}</b> · part ${(sg.end - sg.start).toFixed(1)} s${trimDrag.fine > 1.5 ? ` · fine ×${Math.round(trimDrag.fine)}` : '<br><span>slide up for fine control</span>'}`;
+  const x = r.left - sec.left + (t / D) * r.width, half = b.offsetWidth / 2 + 6;
+  b.style.left = `${Math.max(half, Math.min(sec.width - half, x))}px`;
+  segEl.querySelectorAll('.seg-handle.active').forEach(h => h.classList.remove('active'));
+  const el = segEl.children[trimDrag.idx]; if (el) el.querySelector(trimDrag.left ? '.seg-handle.left' : '.seg-handle.right').classList.add('active');
+}
+function startTrim(ev, hit) {
+  ev.preventDefault(); pause();
+  const sg = state.segments[hit.idx];
+  state.sel = hit.idx; layoutSegments(); syncPartControls();
+  trimDrag = { id: ev.pointerId, idx: hit.idx, left: hit.left, x0: ev.clientX, y0: ev.clientY, t0: hit.left ? sg.start : sg.end, lastX: ev.clientX, t: hit.left ? sg.start : sg.end, fine: 1, atLimit: false };
+  track.classList.add('trimming');
+  try { track.setPointerCapture(ev.pointerId); } catch (e) { /* fine */ }
+  try { navigator.vibrate && navigator.vibrate(8); } catch (e) { /* not allowed */ }
+  seek(trimDrag.left ? trimDrag.t : trimDrag.t - 0.01); trimBubble(true);
+}
+function moveTrim(e) {
+  const d = trimDrag; if (!d || e.pointerId !== d.id) return;
+  const rect = track.getBoundingClientRect(), D = state.clip.duration, perPx = D / rect.width;
+  // fine control: the further above the timeline the finger is, the slower the edge moves
+  const up = Math.max(0, rect.top - e.clientY);
+  d.fine = Math.min(10, 1 + up / 30);
+  d.t += (e.clientX - d.lastX) * perPx / d.fine; d.lastX = e.clientX;
+  const sg = state.segments[d.idx];
+  let lo, hi;
+  if (d.left) { lo = d.idx > 0 ? state.segments[d.idx - 1].end : 0; hi = sg.end - MIN_LEN; }
+  else { lo = sg.start + MIN_LEN; hi = d.idx < state.segments.length - 1 ? state.segments[d.idx + 1].start : D; }
+  const t = Math.max(lo, Math.min(hi, d.t)), hit = t !== d.t;
+  if (hit && !d.atLimit) { try { navigator.vibrate && navigator.vibrate(15); } catch (er) { /* not allowed */ } }
+  d.atLimit = hit; d.t = t;
+  if (d.left) sg.start = t; else sg.end = t;
+  layoutSegments(); trimBubble(true);
+  if (!trimSeekQueued) { trimSeekQueued = true; requestAnimationFrame(() => { trimSeekQueued = false; if (trimDrag) { const s2 = state.segments[trimDrag.idx]; seek(trimDrag.left ? s2.start : s2.end - 0.01); } }); }
+}
+function endTrim(e) {
+  const d = trimDrag; if (!d || (e && e.pointerId !== d.id)) return;
+  trimDrag = null; track.classList.remove('trimming'); trimBubble(false);
+  renderSegments(); invalidate(); clearUndo(); syncPartControls();
+}
 track.addEventListener('pointerdown', ev => {
-  if (!state.clip || ev.target.classList.contains('seg-handle')) return;
+  if (!state.clip) return;
+  const hit = edgeNear(ev.clientX);
+  if (hit) return startTrim(ev, hit);
   pause();
   const rect = track.getBoundingClientRect();
   const scrub = x => seek(Math.max(0, Math.min(1, (x - rect.left) / rect.width)) * state.clip.duration);
   scrub(ev.clientX);
   track.setPointerCapture(ev.pointerId);
   const move = e => scrub(e.clientX);
-  const up = () => { track.removeEventListener('pointermove', move); track.removeEventListener('pointerup', up); };
-  track.addEventListener('pointermove', move); track.addEventListener('pointerup', up);
+  const up = () => { track.removeEventListener('pointermove', move); track.removeEventListener('pointerup', up); track.removeEventListener('pointercancel', up); };
+  track.addEventListener('pointermove', move); track.addEventListener('pointerup', up); track.addEventListener('pointercancel', up);
 });
+window.addEventListener('pointermove', moveTrim, true);
+window.addEventListener('pointerup', endTrim, true);
+window.addEventListener('pointercancel', endTrim, true);
+
+// Precise trimming: put the playhead on the exact frame (scrub, then ⏮ ⏭ for single frames) and tap.
+function trimHere(left) {
+  if (!state.clip) return;
+  const t = state.mediaTime, S = state.segments, D = state.clip.duration;
+  let i = S.findIndex(s => t >= s.start && t <= s.end);
+  if (i < 0) i = left ? S.findIndex(s => s.start > t) : S.map(s => s.end < t).lastIndexOf(true);   // in a cut-out gap: extend the neighbour
+  if (i < 0) return;
+  const sg = S[i];
+  if (left) {
+    const lo = i > 0 ? S[i - 1].end : 0;
+    if (sg.end - t < MIN_LEN) return toast('That would leave almost nothing. Move the playhead earlier', 1800);
+    sg.start = Math.max(lo, t);
+  } else {
+    const hi = i < S.length - 1 ? S[i + 1].start : D;
+    if (t - sg.start < MIN_LEN) return toast('That would leave almost nothing. Move the playhead later', 1800);
+    sg.end = Math.min(hi, t);
+  }
+  state.sel = i; renderSegments(); invalidate(); clearUndo(); syncPartControls();
+  toast(`${left ? 'Starts' : 'Ends'} at ${fmt(left ? sg.start : sg.end)}`, 1200);
+}
+$('btnStartHere').onclick = () => trimHere(true);
+$('btnEndHere').onclick = () => trimHere(false);
 $('btnSplit').onclick = () => {
   if (!state.clip) return;
   const t = state.mediaTime, i = state.segments.findIndex(s => t > s.start + 0.1 && t < s.end - 0.1);
