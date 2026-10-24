@@ -212,8 +212,20 @@ export async function decodeRange(clip, { fromUs = 0, toUs = Infinity, onFrame, 
       if (i <= end) {
         if (dec.decodeQueueSize < 4 && pending.length < maxQueue) { const ch = await chunkFor(clip, S[i++], reader); if (dec.state === 'configured') dec.decode(ch); lastProgress = Math.max(lastProgress, activeNow() - stallMs / 2); continue; }
       } else if (!flushed) {
+        // Ask for the last frames, and keep taking them while it finishes: a phone decoder has only a few
+        // frame slots, so waiting for the flush without emptying them deadlocks at 100%.
         flushed = true;
-        await activeTimeout(dec.flush(), stallMs, 'Video decoder');
+        let fin = false, ferr = null;
+        dec.flush().then(() => { fin = true; poke(); }, e => { ferr = e; fin = true; poke(); });
+        lastProgress = activeNow();
+        while (!fin) {
+          if (err) throw err;
+          if (signal && signal.aborted) break;
+          if (pending.length) { await drain(); lastProgress = activeNow(); continue; }
+          if (stalled()) { console.warn('decoder flush never finished; using the frames we have'); break; }
+          await new Promise(r => { wake = r; setTimeout(r, 30); });
+        }
+        if (ferr && !(signal && signal.aborted) && dec.state !== 'closed') console.warn('decoder flush failed; using the frames we have', ferr);
         continue;
       } else break;
       if (stalled()) throw new Error('The video decoder stopped responding');

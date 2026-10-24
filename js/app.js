@@ -3,7 +3,7 @@ import { Renderer } from './gpu.js';
 import { KEYS, LIMITS, PRESETS, baseOf, defaultLook, cloneLook, normLook, resolveLook, applyAdj, oneSided, hasTweaks } from './look.js';
 import { computeStabilisation, clampPan, frameAt, suggestCuts, lookAt, speedAt, segmentAt } from './core.js';
 import { analyseClip, exportClip, frameInfo, stackStill } from './engine.js';
-import { clipKey, loadProject, saveProject, deleteProject, savedLooks, setSavedLooks, saveLastExport, loadLastExport } from './store.js';
+import { clipKey, loadProject, saveProject, deleteProject, savedLooks, setSavedLooks, saveLastExport, loadLastExport, safeCopy } from './store.js';
 import { wasHidden, resetHidden } from './media.js';
 
 const $ = id => document.getElementById(id);
@@ -192,6 +192,9 @@ async function loadFile(file) {
     pause();
     state.previewInfo = null; state.clip = null; state.plan = state.planRaw = null; state.analysis = null;
     video.removeAttribute('src'); video.load();
+    const original = file;
+    step('copying', 'Getting the clip ready…');
+    file = await safeCopy(original, p => toast(`Getting the clip ready… ${p}%`));
     const clip = await openClip(file, msg => toast(msg));
     state.analysis = null; state.stab.roi = null; state.stab.on = false;
     state.segments = [{ start: 0, end: clip.duration }]; state.sel = 0; clearUndo();
@@ -219,7 +222,7 @@ async function loadFile(file) {
     state.previewInfo = probe ? matchPreview(clip, probe) : defaultPreview(clip);
     video.muted = state.muted;
     state.clip = clip;
-    state.key = clipKey(file);
+    state.key = clipKey(original);
     let restored = null;
     try { restored = await withTimeout(loadProject(state.key), 4000, 'saved edit'); } catch (e) { console.warn('no saved edit', e); }
     if (restored) { try { applyProject(restored); } catch (e) { console.warn('saved edit unreadable', e); restored = null; } }
@@ -1150,13 +1153,15 @@ $('btnExportGo').onclick = async () => {
       const out = Math.min(100, Math.round(100 * (T.encoder + T.gpu) / T.total));
       where = ` Time split: drawing + encoding frames ${out}%, reading the clip${res.interpolated || res.cleaned ? ' + working out motion' : ''} ${100 - out}%.`;
     }
-    $('exportMsg').innerHTML = `<b>✓ Saved to your phone's Downloads</b> as ${name}. Done in ${secs < 90 ? `${secs.toFixed(0)} s` : `${(secs / 60).toFixed(1)} min`}: ${(res.blob.size / 1e6).toFixed(1)} MB, ${res.frames} frames, ${res.codec.startsWith('avc') ? 'H.264' : 'VP9'}${res.hasAudio ? ' + audio' : ''}${res.interpolated ? `, ${res.interpolated} in-between frames created` : ''}${res.cleaned ? ', extra clean' : ''}. If it isn't in Downloads, tap Save again; it also stays under Export until your next video.${where}`;
+    $('exportMsg').innerHTML = `<b>✓ Saved to your phone's Downloads</b> as ${name}. Done in ${secs < 90 ? `${secs.toFixed(0)} s` : `${(secs / 60).toFixed(1)} min`}: ${(res.blob.size / 1e6).toFixed(1)} MB, ${res.frames} frames, ${res.codec.startsWith('avc') ? 'H.264' : 'VP9'}${res.hasAudio ? ' + audio' : ''}${res.interpolated ? `, ${res.interpolated} in-between frames created` : ''}${res.cleaned ? ', extra clean' : ''}.${res.shortBy ? ` The phone stopped reading the clip near the end, so it finishes ${res.shortBy < 1 ? 'a moment' : `${res.shortBy.toFixed(1)} s`} early.` : ''} If it isn't in Downloads, tap Save again; it also stays under Export until your next video.${where}`;
     setExportUI('done');
     finishedAlert(true, `${name} is saved to Downloads.`);
   } catch (e) {
     console.error(e);
-    const away = wasHidden;
-    $('exportMsg').textContent = away
+    const away = wasHidden, lost = e && (e.name === 'NotReadableError' || /could not be read/i.test(e.message || ''));
+    $('exportMsg').textContent = lost
+      ? 'MacroCut lost access to the video file (the phone took back its permission). Tap Close, tap 📂 and open the same clip again (your edit comes back), then Render again.'
+      : away
       ? `Export stopped while MacroCut was off screen: the phone took the video hardware back (${e.message || e}). Tap Close, then Render again and keep MacroCut on screen; the phone can lie face-down, the screen stays on by itself.`
       : 'Export failed: ' + (e.message || e);
     setExportUI('error');
