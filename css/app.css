@@ -88,7 +88,7 @@ button { font: inherit; color: inherit; }
 .transport-mid, .transport-right { display: flex; align-items: center; gap: 2px; }
 
 .timeline-section {
-  height: 88px; background: var(--bg-panel); border-top: 1px solid #1f242d; border-bottom: 1px solid #1f242d;
+  position: relative; height: 88px; background: var(--bg-panel); border-top: 1px solid #1f242d; border-bottom: 1px solid #1f242d;
   display: flex; align-items: center; padding: 0 10px; gap: 10px; flex-shrink: 0;
 }
 .mute-track-btn {
@@ -235,3 +235,18 @@ details#stabMore summary { font-size: 13px; color: var(--text-muted); cursor: po
 /* Export: last finished video, always one tap away */
 .last-export { display: flex; flex-direction: column; gap: 6px; padding: 10px; border: 1px solid var(--accent); border-radius: 9px; background: var(--accent-dim); }
 .last-export .hint { color: var(--text-main); }
+
+/* Trim handles: bigger, grabbable anywhere near the edge (hit-testing is done in JS) */
+.clip-segment { overflow: visible; }
+.seg-handle { width: 14px; border-radius: 4px; pointer-events: none; }
+.seg-handle.left { border-radius: 4px 2px 2px 4px; }
+.seg-handle.right { border-radius: 2px 4px 4px 2px; }
+.clip-segment:not(.selected) .seg-handle { background: #9aa4b2; }
+#track.trimming .seg-handle.active { background: var(--accent); }
+.trim-bubble {
+  display: none; position: absolute; bottom: calc(100% + 6px); transform: translateX(-50%); z-index: 30; pointer-events: none;
+  background: rgba(10,12,16,0.92); border: 1px solid var(--accent); color: var(--text-main); border-radius: 8px;
+  padding: 5px 9px; font-size: 12px; text-align: center; white-space: nowrap; font-variant-numeric: tabular-nums;
+}
+.trim-bubble b { color: var(--accent); }
+.trim-bubble span { color: var(--text-muted); font-size: 11px; }

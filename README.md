@@ -13,6 +13,8 @@ A phone-first video editor for handheld macro footage (jumping spiders, mostly).
 5. **Export** → Render MP4 → Save / Share. Slowed parts get smooth slow motion (Speed tab switch, on by default). Tick **✨ Extra clean** for grainy (low-light) footage.
 6. **📸** → *Find the sharpest shots* for full-resolution stills (for iNaturalist), or save the current frame. **Stack this moment** fuses the frames within ±0.3 s into one still, taking each region from whichever frame had it sharpest (tap the result to compare with the single frame).
 
+**Trimming:** drag near either end of a part (slide your finger up while dragging for up to 10× finer control), or put the playhead on the exact frame and tap **Start here** / **End here**.
+
 **↶ / ↷** (top bar, or Ctrl+Z / Ctrl+Shift+Z) undo and redo any edit: cuts, looks, framing, speed, stabilise settings. One slider drag or pinch is one step; the shake measurement is never thrown away.
 
 Your edit saves automatically on the phone; open the same clip again and it's all back (Trim → *Start this clip over* to reset).
