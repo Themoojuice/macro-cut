@@ -191,7 +191,7 @@ export async function exportClip(clip, plan, { onProgress = () => {}, signal } =
   const fromUs = Math.round(plan.segments[0].start * 1e6) - 1, toUs = Math.round(plan.segments[plan.segments.length - 1].end * 1e6) + 1;
   const tsIndex = new Map();
   clip.times.forEach((t, i) => tsIndex.set(Math.round(t * 1e6), i));
-  let emitted = 0, last = performance.now(), tEnc = 0, tGpu = 0;
+  let emitted = 0, last = performance.now(), tEnc = 0, tGpu = 0, salvaged = null;
   const tStart = activeNow();
   const keyEvery = Math.max(1, Math.round(fps * 2));
   const emit = async ts => {
@@ -378,7 +378,11 @@ export async function exportClip(clip, plan, { onProgress = () => {}, signal } =
   if (!plan.denoise && prev && byFrame.get(prev.i) && byFrame.get(prev.i).between.length && !(signal && signal.aborted)) {
     for (const [ts] of byFrame.get(prev.i).between) { R.render(Mi(prev.i), lookFor(clip.times[prev.i]), { pxScale: 1 }); await emit(ts); }
   }
-  } catch (e) { if (encoder.state !== 'closed') encoder.close(); R.dispose(); if (ds) ds.dispose(); throw e; }
+  } catch (e) {
+    // Nearly done and the encoder is fine: keep the video instead of throwing it away; it just ends a moment early.
+    if (!encErr && encoder.state === 'configured' && emitted >= ticks.length * 0.9 && !(signal && signal.aborted)) { console.warn('salvaging export', e); salvaged = e; }
+    else { if (encoder.state !== 'closed') encoder.close(); R.dispose(); if (ds) ds.dispose(); throw e; }
+  }
   R.dispose(); if (ds) ds.dispose();
   if (signal && signal.aborted) { encoder.close(); return null; }
   await encoder.flush();
@@ -405,6 +409,7 @@ export async function exportClip(clip, plan, { onProgress = () => {}, signal } =
   muxer.finalize();
   onProgress(1);
   return { blob: new Blob([target.buffer], { type: 'video/mp4' }), codec: enc.cfg.codec, frames: emitted, hasAudio: withAudio, duration, interpolated: interpCount, cleaned: !!plan.denoise,
+    shortBy: salvaged ? Math.max(0, (ticks.length - emitted) / fps) : 0,
     timing: { total: activeNow() - tStart, encoder: tEnc, gpu: tGpu } };
 }
 
