@@ -440,7 +440,7 @@ export async function exportClip(clip, plan, { onProgress = () => {}, signal } =
 
   if (withAudio) {
     let outT = 0, first = true;
-    const areader = new WindowReader(clip.file, 4 << 20);
+    const areader = new WindowReader(clip.file, 4 << 20, clip.original);
     const meta = { decoderConfig: { codec: A.codec, sampleRate: A.sampleRate, numberOfChannels: A.channels, description: A.description } };
     for (const seg of plan.segments) {
       const s0 = seg.start * 1e6, s1 = seg.end * 1e6;

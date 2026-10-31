@@ -196,6 +196,7 @@ async function loadFile(file) {
     step('copying', 'Getting the clip ready…');
     file = await safeCopy(original, p => toast(`Getting the clip ready… ${p}%`));
     const clip = await openClip(file, msg => toast(msg));
+    if (file !== original) clip.original = original;   // read the picked file if our working copy goes missing
     state.analysis = null; state.stab.roi = null; state.stab.on = false;
     state.segments = [{ start: 0, end: clip.duration }]; state.sel = 0; clearUndo();
     state.look = defaultLook();   // every new clip starts at Natural with all sliders at 0
