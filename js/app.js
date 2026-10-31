@@ -1109,8 +1109,8 @@ function download(blob, name) {
 let exportAbort = null, exportResult = null;
 const FOCUS_HINT = {
   off: 'For a still spider filmed while you lean in and out: every part that comes into focus can stay sharp.',
-  build: '<b>Build up:</b> as the focus moves through the spider, each part stays sharp once it has been in focus. Anything that moves (palps, legs, a head turn) shows as filmed, so nothing ghosts. Export takes about 1.5× longer.',
-  full: '<b>Sharp from the start:</b> each still pose is sharp from its first frame, using the sharpest moments from later on too. MacroCut reads the clip twice, so export takes about 2.5× longer.',
+  build: '<b>Build up:</b> as the focus moves through the spider, each part stays sharp once it has been in focus. Anything that moves (palps, legs, a head turn) shows as filmed, so nothing ghosts. Export takes longer.',
+  full: '<b>Sharp from the start:</b> each still pose is sharp from its first frame, using the sharpest moments from later on too. MacroCut reads the clip twice, so export takes more than twice as long.',
 };
 const FOCUS_NOTE = ' Each spot shows its sharpest moment, so the result blends moments rather than showing one instant.';
 function exportFps() {
