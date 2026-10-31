@@ -25,6 +25,8 @@ async def main():
         msg = await pg.inner_text('#exportMsg'); print('  ', msg[:150])
         check('export finishes from the original file', 'Saved to your phone' in msg)
         check('switch to the original was logged', any('reading the original' in w for w in warns))
+        await pg.wait_for_timeout(1500)
+        check('preview back after export', await pg.evaluate('(() => { const v = document.getElementById("video"); return v.readyState >= 2 && !v.error; })()'))
         check('no page errors', not errs); print('  errors:', errs[:3])
         await b.close()
     print('ALL PASS' if not fails else f'{len(fails)} FAILED')

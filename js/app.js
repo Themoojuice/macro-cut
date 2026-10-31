@@ -300,7 +300,18 @@ async function parkVideo() {
   return async () => {
     video.src = videoURL;
     try { await waitVideo('loadeddata', 15000); video.currentTime = t; await waitVideo('seeked', 3000).catch(() => {}); }
-    catch (e) { toast('Preview reload failed: ' + e.message, 4000); }
+    catch (e) {
+      // our working copy may have been cleared by the browser: show the picked file instead
+      const orig = state.clip && state.clip.original;
+      let ok = false;
+      if (orig) {
+        try {
+          URL.revokeObjectURL(videoURL); videoURL = URL.createObjectURL(orig); video.src = videoURL;
+          await waitVideo('loadeddata', 15000); video.currentTime = t; await waitVideo('seeked', 3000).catch(() => {}); ok = true;
+        } catch (e2) { /* fall through */ }
+      }
+      if (!ok) toast('Preview reload failed: ' + e.message, 4000);
+    }
     finally { parked = Math.max(0, parked - 1); }
   };
 }
