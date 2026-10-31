@@ -83,3 +83,51 @@ Plus a **do-no-harm rule**: the centre frame is the base, and another frame only
 ### Acceptance tests (revised)
 - Synthetic focus sweep: stacked ≥ centre frame in every band (✔); stretch goal ≥ best single frame per band (✘, see above).
 - Real clip: never worse than the single frame (no holes, no mosaic, no added grain) (✔ on the test clip); visibly sharper where the centre frame was soft (✔, modest).
+
+---
+
+## C. Focus build-up (video)
+
+### Behaviour
+- Export sheet, **Focus build-up**: *Off* · *Build up* · *Sharp from the start*.
+- **Build up:** as the focus moves through the spider, every part that has been sharp stays sharp, until the whole animal is in focus. Anything that moves (palps, a leg, a head turn) shows the live frame instead of an old copy, so nothing ghosts.
+- **Sharp from the start:** same, but each still pose is sharp from its first frame: the clip is read twice, and the second pass starts from what the first pass built.
+- Needs the shake measurement (it is run first if missing). Works with Extra clean, smooth slow motion, per-part looks and speeds. Preview is unchanged (it needs every frame in order).
+- Honest note in the UI: the result is a composite in time (each spot shows its sharpest *still-valid* view), not a single moment.
+
+### Method
+1. **A spider-locked canvas.** The tracker's camera `C_k` maps frame k onto a world fixed to the tracked layer (the spider). The accumulator lives in an *anchor* frame's coordinates (plus a margin), so stored pixels are resampled once on the way in and once on the way out, never repeatedly. It re-anchors (starts fresh) only when the current view no longer fits the canvas (big pan, rotation or zoom).
+2. **Per frame, on a decision grid (~540p):**
+   - *Sharpness now:* detail energy in the 2–6 px band of the incoming frame (same measure as stacked stills, so compression blocking and grain don't win), minus the grain floor.
+   - *Still the same thing?* Blur the stored image by several amounts and compare each with what the camera sees now (luma, ~15-px window, brightness offset tolerated). If **no** blur of the stored view explains the current view, the spider moved there: take the live frame.
+   - *Store the new frame* where it is clearly sharper than what is stored (soft ramp 1.1–1.5×), where the stored view is no longer valid, or where nothing is stored yet. So the stored view is always the best one seen.
+   - *Show the live frame* where it is nearly as sharp as the stored view (≥ 0.7–0.9×) or the stored view is invalid; show the stored view only where it is clearly sharper. Both maps are smoothed slightly so choices don't flicker pixel to pixel.
+   - Stored sharpness slowly decays (half-life ~11 s), so a stale view can eventually be replaced by a nearly-as-sharp fresh one.
+3. **Colour update** at full canvas resolution: `stored = mix(stored, frame, take)`.
+4. **Output:** the normal render path, with one change in the warp shader: where the *show* map says so, the stored pixel; elsewhere the live pixel (so whatever is in focus right now is exactly the live frame, resampled once, and in-between slow-motion frames still move correctly).
+
+### Budget and risks
+- **GPU memory:** two RGBA8 canvas textures (+ mipmaps) and small float decision maps. 4K source to 4K export ≈ 2 × 45 MB; lower export resolutions accumulate at a matching lower resolution.
+- **Time:** one decision pass (at ~540p) and one full-resolution update per frame; *Sharp from the start* reads and processes the clip twice.
+- **Risks:** (1) palp flicks smaller than the defocus blur can pass the "same thing?" test and smear slightly in time; (2) tracking error (~1–2 px at 4K) shows as a faint seam where neighbouring spots come from different frames; (3) exposure drift is tolerated only partly.
+
+### As built (what testing changed, and why)
+1. **Ghost edges of a moved object.** The first version compared brightness only and allowed any amount of blur. A striped object, blurred enough, averages to about the brightness of the background it left, so sharp fragments of it stayed behind at its old place. Fixes: compare in **colour**; allow only as much blur as the **drop in sharpness** explains (a view about as sharp as the stored one must match it nearly as it is); grow "changed" spots by ~2 px (720p scale) so the edges go too. Fragments gone in the synthetic test.
+2. **"Sharp from the start" stalled the encoder.** The first pass encodes nothing, so nothing waited for the GPU: decoding raced ahead and queued minutes of GPU work, and the second pass's first frames waited behind it ("encoder stopped responding"). Fix: the first pass waits for each frame's GPU work (a fence, polled without blocking the page). The encoder is also now opened at the first encoded frame rather than at the start.
+3. With Extra clean, the first pass's frame textures are freed before the second pass starts.
+4. **Softer than live where the live frame was in focus.** Showing the stored view wherever the new frame wasn't *clearly* sharper meant an in-focus band showed an older copy (tracking error + one extra resample): 1.5–2 dB below the normal export. Fix: separate *store* (only clearly sharper frames replace the best view) from *show* (live wins whenever it's nearly as sharp).
+
+### Results
+- **Synthetic focus-dwell clip** (`test/make_buildup.py` + `test/buildup.py`: 960×540, 4 depth bands, focus dwelling ~1 s per band, hand shake + focus breathing + grain, a striped object that wiggles and jumps sideways), dB vs the all-sharp truth:
+  - after a band has been in focus: normal 29.2–30.1 → **build up 32.9–33.1** (+3.0 to +3.7 dB) ✔
+  - before the focus first reaches a band: normal 28.8–29.7 → **sharp from the start 32.4–32.7** (+2.8 to +3.6 dB) ✔
+  - while a band is in focus: same as normal (the live frame is shown) ✔
+  - where the object left: normal 31.0 → 32.6 (no ghost); where it arrived: 20.2 → 20.2 (worst single frame −0.2 dB) ✔
+- **Off = unchanged:** with focus build-up off, exports are pixel-identical to before for normal, Extra clean and smooth slow motion.
+- **Remaining gap:** a held view is ~1.5–2 dB below a live in-focus frame (tracking error of ~0.1–0.2 px plus one extra resample). Local sub-pixel refinement of the canvas mapping would close part of it.
+- **Cost** in the software-GPU test browser: ~3.3 s/frame at 540p for build up (normal export ~0.25 s/frame); sharp from the start ≈ 1.3× build up. Phone time not yet measured.
+
+### Acceptance tests
+- Synthetic focus-dwell clip with an all-sharp truth and a moving object: once each depth band has been in focus, build-up must beat the normal export in that band; where the object moved, it must not be worse than the normal export (no ghost).
+- Real handheld spider clip: visibly sharper during still poses, falls back to the live frame during a head turn.
+- Existing suite still passes.

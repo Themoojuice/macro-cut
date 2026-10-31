@@ -69,9 +69,32 @@ const FS_WARP = `#version 300 es
 precision highp float;
 uniform sampler2D u_src; uniform vec2 u_out; uniform mat2 u_L; uniform vec2 u_t; uniform int u_cubic;
 uniform sampler2D u_srcB; uniform sampler2D u_flow; uniform int u_interp; uniform float u_it;
+// focus build-up overlay: stored canvas (rgb + coverage), take-map (g), frame → canvas similarity
+uniform int u_fo, u_fcubic; uniform sampler2D u_facc, u_fdec; uniform mat2 u_G; uniform vec2 u_Gt, u_fC;
 ${ORIENT}
 ${HDR}
 out vec4 o;
+vec4 cubicSz(sampler2D src, vec2 uv, vec2 sz) {
+  vec2 sp = uv * sz, t1 = floor(sp - 0.5) + 0.5, f = sp - t1;
+  vec2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f)), w1 = 1.0 + f * f * (-2.5 + 1.5 * f);
+  vec2 w2 = f * (0.5 + f * (2.0 - 1.5 * f)), w3 = f * f * (-0.5 + 0.5 * f);
+  vec2 w12 = w1 + w2, t12 = (t1 + w2 / w12) / sz, t0 = (t1 - 1.0) / sz, t3 = (t1 + 2.0) / sz;
+  vec4 r = vec4(0.0);
+  r += textureLod(src, vec2(t0.x, t0.y), 0.0) * w0.x * w0.y;   r += textureLod(src, vec2(t12.x, t0.y), 0.0) * w12.x * w0.y;
+  r += textureLod(src, vec2(t3.x, t0.y), 0.0) * w3.x * w0.y;   r += textureLod(src, vec2(t0.x, t12.y), 0.0) * w0.x * w12.y;
+  r += textureLod(src, vec2(t12.x, t12.y), 0.0) * w12.x * w12.y; r += textureLod(src, vec2(t3.x, t12.y), 0.0) * w3.x * w12.y;
+  r += textureLod(src, vec2(t0.x, t3.y), 0.0) * w0.x * w3.y;   r += textureLod(src, vec2(t12.x, t3.y), 0.0) * w12.x * w3.y;
+  r += textureLod(src, vec2(t3.x, t3.y), 0.0) * w3.x * w3.y;
+  return r;
+}
+// where the stored view is valid and clearly sharper than the live frame, show it instead of the live pixel
+vec3 focusOverlay(vec3 live, vec2 s) {
+  vec2 p = u_G * s + u_Gt, auv = vec2(p.x / u_fC.x + 0.5, p.y / u_fC.y + 0.5);
+  if (any(lessThan(auv, vec2(0.001))) || any(greaterThan(auv, vec2(0.999)))) return live;
+  vec4 a = u_fcubic == 1 ? cubicSz(u_facc, auv, vec2(textureSize(u_facc, 0))) : texture(u_facc, auv);
+  float use = clamp(a.a, 0.0, 1.0) * (1.0 - texture(u_fdec, auv).b);
+  return mix(live, clamp(a.rgb, 0.0, 1.0), use);
+}
 vec4 cubic(sampler2D u_src, vec2 uv) {
   vec2 sp = uv * u_texSize, t1 = floor(sp - 0.5) + 0.5, f = sp - t1;
   vec2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f)), w1 = 1.0 + f * f * (-2.5 + 1.5 * f);
@@ -107,8 +130,127 @@ void main(){
   } else {
     c = clamp(u_cubic == 1 ? cubic(u_src, uv).rgb : texture(u_src, uv).rgb, 0.0, 1.0);
   }
+  if (u_fo == 1) c = focusOverlay(c, s);
   if (u_hdr > 0) c = hdrFix(c);
   o = vec4(c, 1.0);
+}`;
+
+// ── Focus build-up (canvas = anchor frame's normalised coords + margin; see js/focus.js) ──
+const FOCUS_COMMON = `
+uniform mat2 u_T; uniform vec2 u_Tt; uniform vec2 u_C;
+vec2 accToFrame(vec2 p) { return u_T * p + u_Tt; }
+vec2 accP(vec2 uv) { return vec2((uv.x - 0.5) * u_C.x, (uv.y - 0.5) * u_C.y); }
+vec2 accUV(vec2 p) { return vec2(p.x / u_C.x + 0.5, p.y / u_C.y + 0.5); }
+bool outside(vec2 uv) { return any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0))); }
+float lum(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }`;
+
+// Pass 1 (decision grid): how sharp is the incoming frame here, is the stored view still the same thing,
+// so should we take the new frame? Out: r = take (sharper / nothing stored), g = sharpness now,
+// b = stored sharpness (decayed), a = 0 outside the frame, else 1 + "this spot changed" (0..1).
+const FS_FDECIDE = `#version 300 es
+precision highp float;
+uniform sampler2D u_src, u_acc; uniform highp sampler2D u_dec;
+uniform float u_noise, u_eps, u_decay, u_lodW, u_win, u_covLod;
+uniform float u_lodA[6];
+${ORIENT}
+${FOCUS_COMMON}
+out vec4 o;
+// detail energy in the 2–6 px band of the live frame (as for stacked stills), 5×5 taps 3 source px apart
+float focusEnergy(vec2 s) {
+  float px = 1.0 / u_dispSize.y, e = 0.0;
+  for (int j = -2; j <= 2; j++) for (int i = -2; i <= 2; i++) {
+    vec2 uv = dispToUV(s + vec2(float(i), float(j)) * 3.0 * px);
+    float l = lum(textureLod(u_src, uv, 0.7).rgb) - lum(textureLod(u_src, uv, 2.2).rgb);
+    e += l * l;
+  }
+  return e / 25.0;
+}
+void main() {
+  vec2 uv = gl_FragCoord.xy / vec2(textureSize(u_dec, 0)), p = accP(uv), s = accToFrame(p);
+  float Sd = texelFetch(u_dec, ivec2(gl_FragCoord.xy), 0).r * u_decay;
+  if (outside(dispToUV(s))) { o = vec4(0.0, 0.0, Sd, 0.0); return; }
+  float e = max(focusEnergy(s) - u_noise, 0.0) * 1000.0, k = u_eps * 1000.0;   // ×1000: half-float range
+  float sharper = smoothstep(1.1, 1.5, (e + k) / (Sd + k));
+  float cov = textureLod(u_acc, uv, u_covLod).a;
+  // Same thing as stored? Some blur of the stored view must explain what the camera sees now (a sharp and a
+  // defocused view of the same thing agree after blurring; a palp or leg that moved doesn't). Compared in colour
+  // (blurred stripes can match a plain background's brightness, rarely its colour), and only as much blur as the
+  // drop in sharpness can account for: a view about as sharp as the stored one must match it nearly as it is.
+  float lmax = 1.0 + 2.0 * log2(max((Sd + k) / (e + k), 1.0));
+  vec3 sd[6]; float sd2[6];
+  for (int l = 0; l < 6; l++) { sd[l] = vec3(0.0); sd2[l] = 0.0; }
+  for (int j = -1; j <= 1; j++) for (int i = -1; i <= 1; i++) {
+    vec2 q = p + vec2(float(i), float(j)) * u_win;
+    vec3 w = textureLod(u_src, dispToUV(accToFrame(q)), u_lodW).rgb;
+    vec2 au = accUV(q);
+    for (int l = 0; l < 6; l++) { vec3 d = textureLod(u_acc, au, u_lodA[l]).rgb - w; sd[l] += d; sd2[l] += dot(d, d); }
+  }
+  float emin = 1e9;
+  for (int l = 0; l < 6; l++) {
+    if (float(l) > lmax) break;
+    vec3 m = sd[l] / 9.0;
+    emin = min(emin, (sd2[l] / 9.0 - 0.3 * dot(m, m)) / 3.0);   // small brightness offsets (exposure drift) forgiven
+  }
+  float changed = smoothstep(0.025 * 0.025, 0.05 * 0.05, emin) * smoothstep(0.5, 0.9, cov);
+  float take = max(sharper, 1.0 - smoothstep(0.5, 0.9, cov));
+  o = vec4(take, e, Sd, 1.0 + changed);
+}`;
+
+// Pass 2 (decision grid): soften the decisions so they don't flicker pixel to pixel; "changed" spots are
+// grown by ~2 cells first (decision cells are ~1.3 px at 720p scale) so a moved palp is replaced whole, edges
+// included. Two decisions: STORE the new frame (clearly sharper, changed, or nothing stored) and SHOW the live
+// frame (it is nearly as sharp as the best stored view, so the live pixel — current, resampled once — wins).
+// Out: r = stored sharpness, g = store, b = show live.
+const FS_FSMOOTH = `#version 300 es
+precision highp float;
+uniform highp sampler2D u_raw; uniform float u_eps;
+out vec4 o;
+void main() {
+  ivec2 P = ivec2(gl_FragCoord.xy), mx = textureSize(u_raw, 0) - 1;
+  vec4 c = texelFetch(u_raw, P, 0);
+  if (c.a < 0.5) { o = vec4(c.b, 0.0, 0.0, 0.0); return; }
+  float k = u_eps * 1000.0, ts = 0.0, tl = 0.0, ws = 0.0, tc = 0.0;
+  for (int j = -3; j <= 3; j++) for (int i = -3; i <= 3; i++) {
+    float d2 = float(i * i + j * j);
+    if (d2 > 9.5) continue;
+    vec4 r = texelFetch(u_raw, clamp(P + ivec2(i, j), ivec2(0), mx), 0);
+    if (r.a < 0.5) continue;
+    if (d2 <= 2.0) { float w = exp(-0.5 * d2); ts += w * r.r; tl += w * smoothstep(0.7, 0.9, (r.g + k) / (r.b + k)); ws += w; }
+    tc = max(tc, (r.a - 1.0) * clamp(1.6 - 0.3 * sqrt(d2), 0.0, 1.0));
+  }
+  float take = clamp(max(ws > 0.0 ? ts / ws : 0.0, tc), 0.0, 1.0);
+  float live = max(take, ws > 0.0 ? tl / ws : 0.0);
+  o = vec4(mix(c.b, c.g, take), take, live, 0.0);
+}`;
+
+// Pass 3 (canvas, full resolution): stored = mix(stored, frame, take). Alpha = "something stored here".
+const FS_FUPDATE = `#version 300 es
+precision highp float;
+uniform sampler2D u_src, u_acc, u_dec; uniform float u_down;
+${ORIENT}
+${FOCUS_COMMON}
+out vec4 o;
+vec4 cubic(sampler2D src, vec2 uv) {
+  vec2 sp = uv * u_texSize, t1 = floor(sp - 0.5) + 0.5, f = sp - t1;
+  vec2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f)), w1 = 1.0 + f * f * (-2.5 + 1.5 * f);
+  vec2 w2 = f * (0.5 + f * (2.0 - 1.5 * f)), w3 = f * f * (-0.5 + 0.5 * f);
+  vec2 w12 = w1 + w2, t12 = (t1 + w2 / w12) / u_texSize, t0 = (t1 - 1.0) / u_texSize, t3 = (t1 + 2.0) / u_texSize;
+  vec4 r = vec4(0.0);
+  r += textureLod(src, vec2(t0.x, t0.y), 0.0) * w0.x * w0.y;   r += textureLod(src, vec2(t12.x, t0.y), 0.0) * w12.x * w0.y;
+  r += textureLod(src, vec2(t3.x, t0.y), 0.0) * w3.x * w0.y;   r += textureLod(src, vec2(t0.x, t12.y), 0.0) * w0.x * w12.y;
+  r += textureLod(src, vec2(t12.x, t12.y), 0.0) * w12.x * w12.y; r += textureLod(src, vec2(t3.x, t12.y), 0.0) * w3.x * w12.y;
+  r += textureLod(src, vec2(t0.x, t3.y), 0.0) * w0.x * w3.y;   r += textureLod(src, vec2(t12.x, t3.y), 0.0) * w12.x * w3.y;
+  r += textureLod(src, vec2(t3.x, t3.y), 0.0) * w3.x * w3.y;
+  return r;
+}
+void main() {
+  vec2 uv = gl_FragCoord.xy / vec2(textureSize(u_acc, 0));
+  vec4 old = texelFetch(u_acc, ivec2(gl_FragCoord.xy), 0);
+  vec2 su = dispToUV(accToFrame(accP(uv)));
+  float take = max(texture(u_dec, uv).g, 1.0 - old.a);   // nothing stored yet: always take the frame
+  if (outside(su) || take < 0.002) { o = old; return; }
+  vec3 w = u_down > 0.0 ? textureLod(u_src, su, u_down).rgb : clamp(cubic(u_src, su).rgb, 0.0, 1.0);
+  o = vec4(mix(old.rgb, w, take), 1.0);
 }`;
 
 // Multi-frame denoise (texture space of the source frame): neighbours are lined up along measured motion
@@ -495,6 +637,74 @@ class Base {
     this.acc = null; this.emax = null;
   }
   mipTex(tex) { const gl = this.gl; gl.bindTexture(gl.TEXTURE_2D, tex); gl.generateMipmap(gl.TEXTURE_2D); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR); }
+  // Resolves when the GPU has finished everything queued so far (fence, polled without blocking the page).
+  async gpuDone(maxMs = 30000) {
+    const gl = this.gl, f = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
+    if (!f) return;
+    gl.flush();
+    const t0 = performance.now();
+    while (gl.getSyncParameter(f, gl.SYNC_STATUS) !== gl.SIGNALED && performance.now() - t0 < maxMs && !gl.isContextLost()) await new Promise(r => setTimeout(r, 4));
+    gl.deleteSync(f);
+  }
+  // ── focus build-up (see js/focus.js) ──
+  // Canvas: RGBA8 + mipmaps (rgb = stored picture, a = something stored). Decision maps: RGBA16F.
+  focusBegin(geo) {
+    const gl = this.gl;
+    if (!gl.getExtension('EXT_color_buffer_float')) throw new Error('This phone\'s graphics chip can\'t do focus build-up (no float render targets).');
+    if (!this.fdP) { this.fdP = compile(gl, VS, FS_FDECIDE); this.fsP = compile(gl, VS, FS_FSMOOTH); this.fuP = compile(gl, VS, FS_FUPDATE); }
+    if (this.facc) this.focusEnd();
+    const levels = 1 + Math.floor(Math.log2(Math.max(geo.AW, geo.AH)));
+    const fbo = (t, w, h) => { const fb = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, fb); gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, t, 0); return { t, fb, w, h }; };
+    this.fMkAcc = () => {
+      const t = this.makeTex(); gl.texStorage2D(gl.TEXTURE_2D, levels, gl.RGBA8, geo.AW, geo.AH);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+      return fbo(t, geo.AW, geo.AH);
+    };
+    this.fMkDec = () => { const t = this.makeTex(); gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA16F, geo.DW, geo.DH); return fbo(t, geo.DW, geo.DH); };
+    this.fgeo = geo;
+    this.facc = [this.fMkAcc(), this.fMkAcc()]; this.fdec = [this.fMkDec(), this.fMkDec()]; this.fraw = this.fMkDec(); this.fi = 0;
+    this.focusClear();
+  }
+  focusClear() {
+    const gl = this.gl;
+    gl.clearColor(0, 0, 0, 0);
+    for (const x of [...this.facc, ...this.fdec]) { gl.bindFramebuffer(gl.FRAMEBUFFER, x.fb); gl.viewport(0, 0, x.w, x.h); gl.clear(gl.COLOR_BUFFER_BIT); }
+    for (const x of this.facc) { gl.bindTexture(gl.TEXTURE_2D, x.t); gl.generateMipmap(gl.TEXTURE_2D); }
+  }
+  _fFree(list) { const gl = this.gl; for (const x of list) if (x) { gl.deleteTexture(x.t); gl.deleteFramebuffer(x.fb); } }
+  // hand the current canvas + decision map over (kept for a second pass); fresh ones take their place
+  focusDetach() { const s = { acc: this.facc[this.fi], dec: this.fdec[this.fi] }; this.facc[this.fi] = this.fMkAcc(); this.fdec[this.fi] = this.fMkDec(); return s; }
+  focusAttach(s) { this._fFree([this.facc[this.fi], this.fdec[this.fi]]); this.facc[this.fi] = s.acc; this.fdec[this.fi] = s.dec; }
+  focusDrop(s) { this._fFree([s.acc, s.dec]); }
+  focusEnd() { if (this.facc) this._fFree([...this.facc, ...this.fdec, this.fraw]); this.facc = this.fdec = this.fraw = null; }
+  // One frame: decide (decision grid) → soften → update the canvas → mipmaps. srcTex must have mipmaps.
+  // T: canvas-normalised → frame display-normalised similarity [a,b,tx,ty].
+  focusStep(srcTex, info, T, prm) {
+    const gl = this.gl, geo = this.fgeo, i0 = this.fi, i1 = 1 - this.fi;
+    const A0 = this.facc[i0], A1 = this.facc[i1], D0 = this.fdec[i0], D1 = this.fdec[i1];
+    const bindTo = (prog, unit, tex, name) => { gl.activeTexture(gl.TEXTURE0 + unit); gl.bindTexture(gl.TEXTURE_2D, tex); gl.uniform1i(prog.u[name], unit); };
+    const geom = prog => {
+      gl.uniformMatrix2fv(prog.u.u_T, false, [T[0], T[1], -T[1], T[0]]); gl.uniform2f(prog.u.u_Tt, T[2], T[3]);
+      gl.uniform2f(prog.u.u_C, geo.CW, geo.CH); this.setOrient(prog, info);
+    };
+    let P = this.fdP; gl.useProgram(P.p);
+    bindTo(P, 0, srcTex, 'u_src'); bindTo(P, 1, A0.t, 'u_acc'); bindTo(P, 2, D0.t, 'u_dec');
+    geom(P);
+    gl.uniform1f(P.u.u_noise, prm.noise); gl.uniform1f(P.u.u_eps, prm.eps); gl.uniform1f(P.u.u_decay, prm.decay);
+    gl.uniform1f(P.u.u_lodW, prm.lodW); gl.uniform1f(P.u.u_win, prm.win); gl.uniform1f(P.u.u_covLod, prm.covLod);
+    gl.uniform1fv(P.u['u_lodA[0]'], prm.lodA);
+    this.draw(this.fraw.fb, geo.DW, geo.DH);
+    P = this.fsP; gl.useProgram(P.p);
+    bindTo(P, 0, this.fraw.t, 'u_raw'); gl.uniform1f(P.u.u_eps, prm.eps);
+    this.draw(D1.fb, geo.DW, geo.DH);
+    P = this.fuP; gl.useProgram(P.p);
+    bindTo(P, 0, srcTex, 'u_src'); bindTo(P, 1, A0.t, 'u_acc'); bindTo(P, 2, D1.t, 'u_dec');
+    geom(P); gl.uniform1f(P.u.u_down, prm.down);
+    this.draw(A1.fb, geo.AW, geo.AH);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, A1.t); gl.generateMipmap(gl.TEXTURE_2D);
+    this.fi = i1;
+  }
   useSrc(tex, info, mip) { this.src = tex; this.srcInfo = info; this.mip = mip; }
   useSrcB(tex) { this.srcB = tex; }
   // Motion field from frame A to frame B: grid of [dx, dy] in display-normalised units (height = 1).
@@ -626,6 +836,21 @@ export class Renderer extends Base {
       gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, this.src); gl.uniform1i(this.warp.u.u_srcB, 1);
       gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, this.flowTex); gl.uniform1i(this.warp.u.u_flow, 2);
       gl.activeTexture(gl.TEXTURE0);
+    }
+    // focus build-up: opts.focus = { G } (frame → canvas similarity); canvas state is this.facc / this.fdec (.b = show live)
+    const fo = opts.focus && this.facc ? opts.focus : null;
+    gl.uniform1i(this.warp.u.u_fo, fo ? 1 : 0);
+    if (fo) {
+      const G = fo.G, geo = this.fgeo;
+      gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_2D, this.facc[this.fi].t); gl.uniform1i(this.warp.u.u_facc, 3);
+      gl.activeTexture(gl.TEXTURE4); gl.bindTexture(gl.TEXTURE_2D, this.fdec[this.fi].t); gl.uniform1i(this.warp.u.u_fdec, 4);
+      gl.activeTexture(gl.TEXTURE0);
+      gl.uniformMatrix2fv(this.warp.u.u_G, false, [G[0], G[1], -G[1], G[0]]); gl.uniform2f(this.warp.u.u_Gt, G[2], G[3]);
+      gl.uniform2f(this.warp.u.u_fC, geo.CW, geo.CH);
+      const canvasPerOut = Math.hypot(M[0], M[1]) * Math.hypot(G[0], G[1]) * (geo.AH / geo.CH) / h;
+      gl.uniform1i(this.warp.u.u_fcubic, canvasPerOut < 1.25 ? 1 : 0);
+    } else {
+      gl.uniform1i(this.warp.u.u_facc, 0); gl.uniform1i(this.warp.u.u_fdec, 0);
     }
     this.setOrient(this.warp, info);
     this.draw(this.A.fb, w, h);

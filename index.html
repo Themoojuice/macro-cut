@@ -6,7 +6,7 @@
   <meta name="theme-color" content="#0b0d10" />
   <title>MacroCut</title>
   <link rel="manifest" href="manifest.json" />
-  <link rel="stylesheet" href="css/app.css?v=17" />
+  <link rel="stylesheet" href="css/app.css?v=18" />
   <script src="vendor/mp4box.all.min.js"></script>
   <script src="vendor/mp4-muxer.js"></script>
 </head>
@@ -228,6 +228,13 @@
           <button class="pill-btn" data-fps="60">60</button>
         </div>
         <label class="toggle"><input type="checkbox" id="expClean" /> ✨ Extra clean: blends 5 neighbouring frames to remove grain (export takes ~3× longer)</label>
+        <div class="section-label">Focus build-up</div>
+        <div class="pill-group" id="focusGroup">
+          <button class="pill-btn" data-focus="off">Off</button>
+          <button class="pill-btn" data-focus="build">Build up</button>
+          <button class="pill-btn" data-focus="full">Sharp from the start</button>
+        </div>
+        <div class="hint" id="focusHint"></div>
         <label class="toggle"><input type="checkbox" id="expAudio" /> Keep sound (only at normal speed)</label>
         <div class="hint" id="exportSummary"></div>
         <div class="last-export" id="lastExport" style="display:none">
@@ -252,6 +259,6 @@
   </div>
 
   <video id="video" playsinline muted preload="auto" style="position:fixed;left:-9999px;top:-9999px;width:2px;height:2px;opacity:0;pointer-events:none"></video>
-  <script type="module" src="js/app.js?v=17"></script>
+  <script type="module" src="js/app.js?v=18"></script>
 </body>
 </html>

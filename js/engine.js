@@ -3,6 +3,7 @@
 import { decodeRange, WindowReader, hdrMode, activeNow } from './media.js';
 import { Downscaler, Renderer } from './gpu.js';
 import { MotionTracker, frameSharpness, frameAt, fillGaps, denseFlow, buildPyramid, globalShift, chainField, grainSigma } from './core.js';
+import { FocusBuild } from './focus.js';
 
 export function frameInfo(clip, f) {
   const odd = (clip.rotation / 90) & 1;
@@ -148,7 +149,8 @@ async function pickEncoder(w, h, fps, bitrate) {
 }
 
 /**
- * plan: { segments, speed, fps, outW, outH, M (Float64Array N*4), look, audio (bool) }
+ * plan: { segments, speed, fps, outW, outH, M (Float64Array N*4), look, audio (bool),
+ *         interp, denoise, focus ('build' | 'full' | null), C (camera per frame, needed for focus) }
  * returns { blob, codec, frames, hasAudio }
  */
 export async function exportClip(clip, plan, { onProgress = () => {}, signal } = {}) {
@@ -175,26 +177,48 @@ export async function exportClip(clip, plan, { onProgress = () => {}, signal } =
     fastStart: 'in-memory',
     firstTimestampBehavior: 'cross-track-offset',
   });
-  let encErr = null, wake = null;
+  let encErr = null, wake = null, encoder = null;
   const poke = () => { if (wake) { const w = wake; wake = null; w(); } };
-  const encoder = new VideoEncoder({
-    output: (chunk, meta) => muxer.addVideoChunk(chunk, meta),
-    error: e => { encErr = e; poke(); },
-  });
-  encoder.addEventListener('dequeue', poke);
-  encoder.configure(enc.cfg);
+  // Opened just before the first frame is encoded: an encoder left idle for minutes (the first pass of focus
+  // build-up "sharp from the start" reads the whole clip without encoding) gets reclaimed by the browser.
+  const openEncoder = () => {
+    encoder = new VideoEncoder({
+      output: (chunk, meta) => muxer.addVideoChunk(chunk, meta),
+      error: e => { encErr = e; poke(); },
+    });
+    encoder.addEventListener('dequeue', poke);
+    encoder.configure(enc.cfg);
+  };
+  const closeEncoder = () => { if (encoder && encoder.state !== 'closed') encoder.close(); };
 
   const canvas = typeof OffscreenCanvas !== 'undefined' ? new OffscreenCanvas(outW, outH) : Object.assign(document.createElement('canvas'), { width: outW, height: outH });
   const R = new Renderer(canvas);
   R.setSize(outW, outH);
 
+  // every source frame the export reads (whole frames + the second frame of each in-between pair)
+  const usedFrames = new Set();
+  for (const [fi, , u] of ticks) { usedFrames.add(fi); if (u > 0) usedFrames.add(fi + 1); }
+  // ── Focus build-up: parts that have been sharp stay sharp while they haven't moved (js/focus.js) ──
+  let fb = null;
+  if (plan.focus && plan.C && plan.C.length === clip.times.length) {
+    try {
+      const frames = [...usedFrames].sort((a, b) => a - b), m0 = plan.M.subarray(4 * frames[0], 4 * frames[0] + 4);
+      fb = new FocusBuild(R, plan.C, clip.times, { frames, mode: plan.focus, dispW: clip.dispW, dispH: clip.dispH, srcPerOut: Math.hypot(m0[0], m0[1]) * clip.dispH / outH, outH });
+    } catch (e) { R.dispose(); throw e; }
+  }
+  const twoPass = !!(fb && fb.mode === 'full');
+  let dry = false, readCount = 0;   // dry = first pass of "sharp from the start": build the canvases, show nothing
+  const fo = (k, u = 0, k2 = k) => (fb && !dry ? fb.overlay(k, u, k2) : null);
+
   const fromUs = Math.round(plan.segments[0].start * 1e6) - 1, toUs = Math.round(plan.segments[plan.segments.length - 1].end * 1e6) + 1;
   const tsIndex = new Map();
   clip.times.forEach((t, i) => tsIndex.set(Math.round(t * 1e6), i));
   let emitted = 0, last = performance.now(), tEnc = 0, tGpu = 0, salvaged = null;
+  const progress = () => (dry ? 0.45 * readCount / Math.max(1, usedFrames.size) : (twoPass ? 0.45 : 0) + (twoPass ? 0.55 : 1) * emitted / ticks.length);
   const tStart = activeNow();
   const keyEvery = Math.max(1, Math.round(fps * 2));
   const emit = async ts => {
+    if (!encoder) openEncoder();
     const waitStart = activeNow();
     while (encoder.encodeQueueSize > 3 && !encErr) {
       if (activeNow() - waitStart > 20000) throw new Error('The video encoder stopped responding');
@@ -209,6 +233,13 @@ export async function exportClip(clip, plan, { onProgress = () => {}, signal } =
     vf.close();
     emitted++;
   };
+  // draw one output frame and encode it (nothing on the first, "dry" pass of focus build-up)
+  const show = async (m, look, opts, ts) => { if (dry) return; R.render(m, look, opts); await emit(ts); };
+  // focus build-up: add a frame to the canvas (its texture is on the GPU); grain level from the first frame
+  // On the dry pass nothing else waits for the GPU (no frame is encoded), so wait for each frame's work here:
+  // otherwise decoding races ahead and queues minutes of GPU work that the encoder then has to wait behind.
+  const focusStep = async (k, tex, info) => { if (fb && fb.step(k, tex, info)) { readCount++; if (dry) await R.gpuDone(); } };
+  const focusGrain = f => { if (fb && !fb.grainSet) { try { fb.setGrain(grainOfFrame(f)); } catch (e) { fb.grainSet = true; } } };
   const Mi = i => plan.M.subarray(4 * i, 4 * i + 4);
   const lerpM = (a, b, u) => [a[0] + u * (b[0] - a[0]), a[1] + u * (b[1] - a[1]), a[2] + u * (b[2] - a[2]), a[3] + u * (b[3] - a[3])];
   // In-between frames need a small greyscale copy of each frame to measure motion.
@@ -236,10 +267,10 @@ export async function exportClip(clip, plan, { onProgress = () => {}, signal } =
         const sd = sigma * Math.sqrt(2 / 5);                    // spread of a 5-tap patch difference from grain alone
         const h = Math.min(0.06, Math.max(0.004, 3.5 * sd));
         H = grainChecks ? 0.7 * H + 0.3 * h : h; grainChecks++;
+        if (fb && !fb.grainSet) fb.setGrain(sigma);
       } catch (e) { /* keep previous */ }
     };
-    const needed = new Set();
-    for (const [fi, , u] of ticks) { needed.add(fi); if (u > 0) needed.add(fi + 1); }
+    const needed = usedFrames;
     const near = k => { for (let d = -D; d <= D; d++) if (needed.has(k + d)) return true; return false; };
     const raw = new Map(), fw = new Map(), bw = new Map(), pool = [], flowPool = [];
     const targets = [];
@@ -251,7 +282,7 @@ export async function exportClip(clip, plan, { onProgress = () => {}, signal } =
       const pb = prevC && byFrame.get(prevC.c);
       if (pb && pb.between.length && !prevC.betweenDone) {
         R.useSrc(prevC.tex, prevC.info, prevC.mip);
-        for (const [ts] of pb.between) { R.render(Mi(prevC.c), lookFor(clip.times[prevC.c]), { pxScale: 1 }); await emit(ts); }
+        for (const [ts] of pb.between) await show(Mi(prevC.c), lookFor(clip.times[prevC.c]), { pxScale: 1, focus: fo(prevC.c) }, ts);
         prevC.betweenDone = true;
       }
     };
@@ -262,12 +293,13 @@ export async function exportClip(clip, plan, { onProgress = () => {}, signal } =
         R.useSrc(prevC.tex, prevC.info, prevC.mip); R.useSrcB(tex);
         R.setFlow(fw.get(c - 1).gw, fw.get(c - 1).gh, norm(fw.get(c - 1)));
         const mA = Mi(c - 1), mB = Mi(c), tA = clip.times[c - 1], tB = clip.times[c];
-        for (const [ts, u] of pb.between) { R.render(lerpM(mA, mB, u), lookFor(tA + u * (tB - tA)), { pxScale: 1, interp: u }); await emit(ts); }
+        for (const [ts, u] of pb.between) await show(lerpM(mA, mB, u), lookFor(tA + u * (tB - tA)), { pxScale: 1, interp: u, focus: fo(c - 1, u, c) }, ts);
         prevC.betweenDone = true;
       } else await holdPrev();
+      await focusStep(c, tex, C.info);
       R.useSrc(tex, C.info, C.mip);
       const outs = byFrame.get(c);
-      if (outs) for (const ts of outs.whole) { R.render(Mi(c), lookFor(clip.times[c]), { pxScale: 1 }); await emit(ts); }
+      if (outs) for (const ts of outs.whole) await show(Mi(c), lookFor(clip.times[c]), { pxScale: 1, focus: fo(c) }, ts);
       prevC = { c, tex, info: C.info, mip: C.mip };
     };
     const finalize = async c => {
@@ -318,10 +350,15 @@ export async function exportClip(clip, plan, { onProgress = () => {}, signal } =
         }
         await finalize(k - D);
         evict(k - 2 * D);
-        if (performance.now() - lastProg > 150) { lastProg = performance.now(); onProgress(emitted / ticks.length); await tick(); }
+        if (performance.now() - lastProg > 150) { lastProg = performance.now(); onProgress(progress()); await tick(); }
       },
     });
     if (!(signal && signal.aborted)) { await flushAll(); await holdPrev(); }
+    if (dry) {   // first pass of "sharp from the start": free this pass's frames before the second pass allocates its own
+      const gl = R.gl;
+      for (const t of [...pool, ...flowPool, ...[...raw.values()].map(x => x.tex)]) gl.deleteTexture(t);
+      for (const t of targets) { gl.deleteTexture(t.t); gl.deleteFramebuffer(t.fb); }
+    }
     console.info(`MacroCut extra clean: blend threshold ${H.toFixed(4)}`);
   }
 
@@ -331,60 +368,72 @@ export async function exportClip(clip, plan, { onProgress = () => {}, signal } =
     for (let k = 0; k < F.gw * F.gh; k++) { data[2 * k] = F.fx[k] / ah; data[2 * k + 1] = F.fy[k] / ah; }
     R.setFlow(F.gw, F.gh, data);
     const mA = Mi(iA), mB = Mi(iA + 1), tA = clip.times[iA], tB = clip.times[iA + 1];
-    for (const [ts, u] of list) {
-      R.render(lerpM(mA, mB, u), lookFor(tA + u * (tB - tA)), { pxScale: 1, interp: u });
-      await emit(ts);
-    }
+    for (const [ts, u] of list) await show(lerpM(mA, mB, u), lookFor(tA + u * (tB - tA)), { pxScale: 1, interp: u, focus: fo(iA, u, iA + 1) }, ts);
+  };
+  const holdFrames = async (i, list) => { for (const [ts] of list) await show(Mi(i), lookFor(clip.times[i]), { pxScale: 1, focus: fo(i) }, ts); };
+  // one pass over the clip: decode → (extra clean) → (focus build-up) → render → encode
+  const runPass = async () => {
+    prev = null;
+    if (plan.denoise) { await exportDenoised(); return; }
+    await decodeRange(clip, {
+      fromUs, toUs, signal,
+      onFrame: async f => {
+        const i = tsIndex.get(f.timestamp);
+        const outs = i === undefined ? null : byFrame.get(i);
+        const prevNeeds = prev && byFrame.get(prev.i) && byFrame.get(prev.i).between.length && prev.i === i - 1;
+        if (!outs && !prevNeeds) {
+          f.close();
+          if (prev && prev.i !== i) {
+            const pb = byFrame.get(prev.i);   // previous frame owed in-between frames but its neighbour is missing: hold it
+            if (pb && pb.between.length) await holdFrames(prev.i, pb.between);
+            prev = null;
+          }
+          return;
+        }
+        const info = frameInfo(clip, f);
+        const m = Mi(i);
+        const scale = Math.hypot(m[0], m[1]) * info.dispH / outH;
+        let pyr = null;
+        if (ds && !dry && (prevNeeds || (outs && outs.between.length))) {
+          ds.grabBytes(f, info, gbytes);
+          pyr = buildPyramid(Float32Array.from(gbytes), aw, ah, 4);
+        }
+        focusGrain(f);
+        R.uploadB(f, info, scale > 1.25);
+        f.close();
+        if (prevNeeds) { if (!dry) await renderBetween(prev.i, prev.pyr, pyr, byFrame.get(prev.i).between); }
+        else if (prev && byFrame.get(prev.i) && byFrame.get(prev.i).between.length) {
+          // no next frame available: hold the previous frame instead
+          await holdFrames(prev.i, byFrame.get(prev.i).between);
+        }
+        R.swapFrames();
+        await focusStep(i, R.src, info);
+        if (outs) for (const ts of outs.whole) await show(m, lookFor(clip.times[i]), { pxScale: 1, focus: fo(i) }, ts);
+        prev = { i, pyr };
+        if (performance.now() - last > 150) { last = performance.now(); onProgress(progress()); await tick(); }
+      },
+    });
+    // last held frame still owes in-between frames (end of range): hold it
+    if (prev && byFrame.get(prev.i) && byFrame.get(prev.i).between.length && !(signal && signal.aborted)) await holdFrames(prev.i, byFrame.get(prev.i).between);
   };
   try {
-  if (plan.denoise) await exportDenoised();
-  else await decodeRange(clip, {
-    fromUs, toUs, signal,
-    onFrame: async f => {
-      const i = tsIndex.get(f.timestamp);
-      const outs = i === undefined ? null : byFrame.get(i);
-      const prevNeeds = prev && byFrame.get(prev.i) && byFrame.get(prev.i).between.length && prev.i === i - 1;
-      if (!outs && !prevNeeds) {
-        f.close();
-        if (prev && prev.i !== i) {
-          const pb = byFrame.get(prev.i);   // previous frame owed in-between frames but its neighbour is missing: hold it
-          if (pb && pb.between.length) for (const [ts] of pb.between) { R.render(Mi(prev.i), lookFor(clip.times[prev.i]), { pxScale: 1 }); await emit(ts); }
-          prev = null;
-        }
-        return;
-      }
-      const info = frameInfo(clip, f);
-      const m = Mi(i);
-      const scale = Math.hypot(m[0], m[1]) * info.dispH / outH;
-      let pyr = null;
-      if (ds && (prevNeeds || (outs && outs.between.length))) {
-        ds.grabBytes(f, info, gbytes);
-        pyr = buildPyramid(Float32Array.from(gbytes), aw, ah, 4);
-      }
-      R.uploadB(f, info, scale > 1.25);
-      f.close();
-      if (prevNeeds) await renderBetween(prev.i, prev.pyr, pyr, byFrame.get(prev.i).between);
-      else if (prev && byFrame.get(prev.i) && byFrame.get(prev.i).between.length) {
-        // no next frame available: hold the previous frame instead
-        for (const [ts] of byFrame.get(prev.i).between) { R.render(Mi(prev.i), lookFor(clip.times[prev.i]), { pxScale: 1 }); await emit(ts); }
-      }
-      R.swapFrames();
-      if (outs) for (const ts of outs.whole) { R.render(m, lookFor(clip.times[i]), { pxScale: 1 }); await emit(ts); }
-      prev = { i, pyr };
-      if (performance.now() - last > 150) { last = performance.now(); onProgress(emitted / ticks.length); await tick(); }
-    },
-  });
-  // last held frame still owes in-between frames (end of range): hold it
-  if (!plan.denoise && prev && byFrame.get(prev.i) && byFrame.get(prev.i).between.length && !(signal && signal.aborted)) {
-    for (const [ts] of byFrame.get(prev.i).between) { R.render(Mi(prev.i), lookFor(clip.times[prev.i]), { pxScale: 1 }); await emit(ts); }
-  }
+    if (twoPass) {
+      // "sharp from the start": pass 1 builds each pose's canvas; pass 2 starts every pose from it
+      dry = true; fb.startPass(1);
+      await runPass();
+      dry = false; fb.startPass(2);
+      if (!(signal && signal.aborted)) await runPass();
+    } else await runPass();
   } catch (e) {
     // Nearly done and the encoder is fine: keep the video instead of throwing it away; it just ends a moment early.
-    if (!encErr && encoder.state === 'configured' && emitted >= ticks.length * 0.9 && !(signal && signal.aborted)) { console.warn('salvaging export', e); salvaged = e; }
-    else { if (encoder.state !== 'closed') encoder.close(); R.dispose(); if (ds) ds.dispose(); throw e; }
+    if (!encErr && encoder && encoder.state === 'configured' && emitted >= ticks.length * 0.9 && !(signal && signal.aborted)) { console.warn('salvaging export', e); salvaged = e; }
+    else { closeEncoder(); if (fb) fb.dispose(); R.dispose(); if (ds) ds.dispose(); throw e; }
   }
+  const focusInfo = fb ? { mode: fb.mode, frames: readCount, canvas: `${fb.geo.AW}×${fb.geo.AH}` } : null;
+  if (fb) { console.info(`MacroCut focus build-up: ${fb.mode}, canvas ${fb.geo.AW}×${fb.geo.AH}, decisions ${fb.geo.DW}×${fb.geo.DH}, ${fb.steps} frame updates`); fb.dispose(); }
   R.dispose(); if (ds) ds.dispose();
-  if (signal && signal.aborted) { encoder.close(); return null; }
+  if (signal && signal.aborted) { closeEncoder(); return null; }
+  if (!encoder) throw new Error('Nothing was rendered: the clip could not be read.');
   await encoder.flush();
   if (encErr) throw encErr;
   encoder.close();
@@ -408,7 +457,7 @@ export async function exportClip(clip, plan, { onProgress = () => {}, signal } =
   }
   muxer.finalize();
   onProgress(1);
-  return { blob: new Blob([target.buffer], { type: 'video/mp4' }), codec: enc.cfg.codec, frames: emitted, hasAudio: withAudio, duration, interpolated: interpCount, cleaned: !!plan.denoise,
+  return { blob: new Blob([target.buffer], { type: 'video/mp4' }), codec: enc.cfg.codec, frames: emitted, hasAudio: withAudio, duration, interpolated: interpCount, cleaned: !!plan.denoise, focus: focusInfo,
     shortBy: salvaged ? Math.max(0, (ticks.length - emitted) / fps) : 0,
     timing: { total: activeNow() - tStart, encoder: tEnc, gpu: tGpu } };
 }
