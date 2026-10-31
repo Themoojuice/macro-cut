@@ -123,7 +123,9 @@ Plus a **do-no-harm rule**: the centre frame is the base, and another frame only
   - before the focus first reaches a band: normal 28.8–29.7 → **sharp from the start 32.4–32.7** (+2.8 to +3.6 dB) ✔
   - while a band is in focus: same as normal (the live frame is shown) ✔
   - where the object left: normal 31.0 → 32.6 (no ghost); where it arrived: 20.2 → 20.2 (worst single frame −0.2 dB) ✔
+- **Real handheld spider clip** (`test/buildup_real.py`: 20 s, 960×540 30 fps copy of a 4K60 MacroCut export; the spider lowers its head at ~5 s and turns at ~19 s): subject detail vs the normal export ×1.10 (1–4 s), ×1.10 (5–10 s), **×1.25 (10–18 s)**; during the head turn ×1.01 (falls back to the live frame, no ghost). Frame-to-frame flicker is *lower* than normal (held spots are steady). *Sharp from the start* = *Build up* on this clip: the canvas keeps one view per spot, so the second pass starts from the clip's *last* pose, and spots where the spider later moved can't use it.
 - **Off = unchanged:** with focus build-up off, exports are pixel-identical to before for normal, Extra clean and smooth slow motion.
+- **Next step for *sharp from the start*:** start a fresh canvas whenever a large part of the subject changes (a new pose), so each pose gets its own first-pass result.
 - **Remaining gap:** a held view is ~1.5–2 dB below a live in-focus frame (tracking error of ~0.1–0.2 px plus one extra resample). Local sub-pixel refinement of the canvas mapping would close part of it.
 - **Cost** in the software-GPU test browser: ~3.3 s/frame at 540p for build up (normal export ~0.25 s/frame); sharp from the start ≈ 1.3× build up. Phone time not yet measured.
 
