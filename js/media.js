@@ -61,11 +61,22 @@ export function activeTimeout(p, ms, what) {
 }
 
 export class WindowReader {
-  constructor(file, win = 16 << 20) { this.file = file; this.win = win; this.start = 0; this.buf = null; }
+  // fallback: the file as originally picked. If our working copy disappears (the browser may clear private
+  // storage under space pressure), carry on reading the original instead of failing a long export.
+  constructor(file, win = 16 << 20, fallback = null) { this.file = file; this.win = win; this.start = 0; this.buf = null; this.fallback = fallback; }
   async read(off, len) {
     if (!this.buf || off < this.start || off + len > this.start + this.buf.length) {
       const end = Math.min(this.file.size, off + Math.max(this.win, len));
-      this.buf = new Uint8Array(await this.file.slice(off, end).arrayBuffer());
+      let data;
+      try { data = await this.file.slice(off, end).arrayBuffer(); }
+      catch (e) {
+        const fb = this.fallback;
+        if (!fb || fb === this.file || fb.size !== this.file.size || !/NotFound|NotReadable/.test(e.name)) throw e;
+        console.warn('working copy unreadable, reading the original file instead', e.name);
+        this.file = fb; this.fallback = null;
+        data = await this.file.slice(off, end).arrayBuffer();
+      }
+      this.buf = new Uint8Array(data);
       this.start = off;
     }
     return this.buf.subarray(off - this.start, off - this.start + len);
@@ -194,7 +205,7 @@ export async function decodeRange(clip, { fromUs = 0, toUs = Infinity, onFrame, 
   // A hardware decoder that is busy elsewhere (e.g. the preview) can accept work and never answer.
   const stalled = () => activeNow() - lastProgress > stallMs;
   dec.configure(clip.decoderConfig);
-  const reader = new WindowReader(clip.file); // own window: decodes may run alongside each other
+  const reader = new WindowReader(clip.file, undefined, clip.original); // own window: decodes may run alongside each other
   let i = start, flushed = false;
   const drain = async () => {
     while (pending.length) {

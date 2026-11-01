@@ -38,6 +38,7 @@ export const loadLastExport = () => tx('readonly', s => s.get(LAST));
 // from our own copy never lapses. Only the current clip is kept; older copies are deleted to free space.
 export async function safeCopy(file, onProgress = () => {}) {
   if (!navigator.storage || !navigator.storage.getDirectory) return file;
+  try { navigator.storage.persist && navigator.storage.persist().catch(() => {}); } catch (e) { /* ask the browser not to clear it under space pressure */ }
   const root = await navigator.storage.getDirectory();
   const dir = await root.getDirectoryHandle('clips', { create: true });
   const name = `${file.size}_${file.lastModified || 0}_${file.name}`.replace(/[^\w.\-]+/g, '_').slice(-120);

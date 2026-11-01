@@ -17,7 +17,7 @@ const state = {
   frame: { aspect: 'native', rot: 0, quarter: 0, zoom: 1, panX: 0, panY: 0 },
   look: defaultLook(),
   speed: 1, scope: 'part', smoothSlow: true,
-  exp: { res: 'source', fps: 'auto', audio: true, clean: false },
+  exp: { res: 'source', fps: 'auto', audio: true, clean: false, focus: 'off' },
   muted: false, playing: false, compare: false,
   mediaTime: 0, plan: null, planRaw: null, previewInfo: null, tab: 'tab-trim',
 };
@@ -196,6 +196,7 @@ async function loadFile(file) {
     step('copying', 'Getting the clip ready…');
     file = await safeCopy(original, p => toast(`Getting the clip ready… ${p}%`));
     const clip = await openClip(file, msg => toast(msg));
+    if (file !== original) clip.original = original;   // read the picked file if our working copy goes missing
     state.analysis = null; state.stab.roi = null; state.stab.on = false;
     state.segments = [{ start: 0, end: clip.duration }]; state.sel = 0; clearUndo();
     state.look = defaultLook();   // every new clip starts at Natural with all sliders at 0
@@ -299,7 +300,18 @@ async function parkVideo() {
   return async () => {
     video.src = videoURL;
     try { await waitVideo('loadeddata', 15000); video.currentTime = t; await waitVideo('seeked', 3000).catch(() => {}); }
-    catch (e) { toast('Preview reload failed: ' + e.message, 4000); }
+    catch (e) {
+      // our working copy may have been cleared by the browser: show the picked file instead
+      const orig = state.clip && state.clip.original;
+      let ok = false;
+      if (orig) {
+        try {
+          URL.revokeObjectURL(videoURL); videoURL = URL.createObjectURL(orig); video.src = videoURL;
+          await waitVideo('loadeddata', 15000); video.currentTime = t; await waitVideo('seeked', 3000).catch(() => {}); ok = true;
+        } catch (e2) { /* fall through */ }
+      }
+      if (!ok) toast('Preview reload failed: ' + e.message, 4000);
+    }
     finally { parked = Math.max(0, parked - 1); }
   };
 }
@@ -1107,6 +1119,12 @@ function download(blob, name) {
 
 // ───────────── export ─────────────
 let exportAbort = null, exportResult = null;
+const FOCUS_HINT = {
+  off: 'For a still spider filmed while you lean in and out: every part that comes into focus can stay sharp.',
+  build: '<b>Build up:</b> as the focus moves through the spider, each part stays sharp once it has been in focus. Anything that moves (palps, legs, a head turn) shows as filmed, so nothing ghosts. Export takes longer.',
+  full: '<b>Sharp from the start:</b> each still pose is sharp from its first frame, using the sharpest moments from later on too. MacroCut reads the clip twice, so export takes more than twice as long.',
+};
+const FOCUS_NOTE = ' Each spot shows its sharpest moment, so the result blends moments rather than showing one instant.';
 function exportFps() {
   if (state.exp.fps !== 'auto') return parseInt(state.exp.fps, 10);
   const f = state.clip.fps;
@@ -1127,12 +1145,16 @@ function renderExportOptions() {
   pills('fpsGroup', 'fps', state.exp.fps);
   $('expAudio').checked = state.exp.audio;
   $('expClean').checked = !!state.exp.clean;
+  if (!FOCUS_HINT[state.exp.focus]) state.exp.focus = 'off';
+  pills('focusGroup', 'focus', state.exp.focus);
+  $('focusHint').innerHTML = FOCUS_HINT[state.exp.focus] + (state.exp.focus !== 'off' ? FOCUS_NOTE : '');
   $('expAudio').disabled = anySlow() || !state.clip.audio;
   const total = state.segments.reduce((s, x) => s + (x.end - x.start) / (x.speed != null ? x.speed : state.speed), 0);
   const speeds = new Set(state.segments.map(x => x.speed != null ? x.speed : state.speed));
-  $('exportSummary').textContent = `${total.toFixed(1)} s · ${exportFps()} fps · ${state.analysis && state.stab.on ? `steadied (${LEVELS[state.stab.level].label})` : 'not steadied'} · ${state.exp.clean ? 'extra clean · ' : ''}${speeds.size > 1 ? 'mixed speeds' : speedLabel([...speeds][0]) + ' speed'}${state.segments.some(x => x.look) ? ' · per-part looks' : ''}`;
+  $('exportSummary').textContent = `${total.toFixed(1)} s · ${exportFps()} fps · ${state.analysis && state.stab.on ? `steadied (${LEVELS[state.stab.level].label})` : 'not steadied'} · ${state.exp.clean ? 'extra clean · ' : ''}${state.exp.focus !== 'off' ? `focus ${state.exp.focus === 'full' ? 'sharp from the start' : 'build-up'} · ` : ''}${speeds.size > 1 ? 'mixed speeds' : speedLabel([...speeds][0]) + ' speed'}${state.segments.some(x => x.look) ? ' · per-part looks' : ''}`;
 }
 document.querySelectorAll('#fpsGroup .pill-btn').forEach(b => b.onclick = () => { state.exp.fps = b.dataset.fps; persist(); renderExportOptions(); });
+document.querySelectorAll('#focusGroup .pill-btn').forEach(b => b.onclick = () => { state.exp.focus = b.dataset.focus; persist(); renderExportOptions(); });
 $('expAudio').onchange = e => { state.exp.audio = e.target.checked; persist(); };
 $('expClean').onchange = e => { state.exp.clean = e.target.checked; persist(); renderExportOptions(); };
 // ── never lose a finished video: it saves itself, stays one tap away, and survives closing or reloading ──
@@ -1202,6 +1224,15 @@ $('btnExportGo').onclick = async () => {
   setExportUI('running'); $('exportBar').style.width = '0';
   $('exportMsg').textContent = `Rendering ${w}×${h} @ ${fps} fps…`;
   prepareAlerts(); resetHidden();
+  // focus build-up follows the spider with the shake measurement: make sure it exists (before the preview is parked)
+  const focus = state.exp.focus !== 'off' ? state.exp.focus : null;
+  if (focus && !state.analysis) {
+    $('exportMsg').textContent = 'Focus build-up: measuring how the spider and camera move first…';
+    if (!await ensureAnalysis('Measuring movement for focus build-up…')) {
+      $('exportMsg').textContent = 'Couldn\'t measure the clip\'s movement, which focus build-up needs. Try again, or switch focus build-up off.';
+      setExportUI('error'); return;
+    }
+  }
   exportAbort = new AbortController();
   const t0 = performance.now();
   const resume = await parkVideo();
@@ -1213,6 +1244,7 @@ $('btnExportGo').onclick = async () => {
     const res = await exportClip(state.clip, {
       segments: expSegs, speed: state.speed, fps, outW: w, outH: h,
       M: state.plan.M, look: t => lookAt(expSegs, baseLook, t), audio: state.exp.audio, interp: state.smoothSlow, denoise: !!state.exp.clean,
+      focus, C: focus && state.analysis ? state.analysis.C : null,
     }, {
       signal: exportAbort.signal,
       onProgress: p => {
@@ -1232,9 +1264,9 @@ $('btnExportGo').onclick = async () => {
     let where = '';
     if (T && T.total > 5000) {
       const out = Math.min(100, Math.round(100 * (T.encoder + T.gpu) / T.total));
-      where = ` Time split: drawing + encoding frames ${out}%, reading the clip${res.interpolated || res.cleaned ? ' + working out motion' : ''} ${100 - out}%.`;
+      where = ` Time split: drawing + encoding frames ${out}%, reading the clip${res.interpolated || res.cleaned || res.focus ? ' + working out motion and focus' : ''} ${100 - out}%.`;
     }
-    $('exportMsg').innerHTML = `<b>✓ Saved to your phone's Downloads</b> as ${name}. Done in ${secs < 90 ? `${secs.toFixed(0)} s` : `${(secs / 60).toFixed(1)} min`}: ${(res.blob.size / 1e6).toFixed(1)} MB, ${res.frames} frames, ${res.codec.startsWith('avc') ? 'H.264' : 'VP9'}${res.hasAudio ? ' + audio' : ''}${res.interpolated ? `, ${res.interpolated} in-between frames created` : ''}${res.cleaned ? ', extra clean' : ''}.${res.shortBy ? ` The phone stopped reading the clip near the end, so it finishes ${res.shortBy < 1 ? 'a moment' : `${res.shortBy.toFixed(1)} s`} early.` : ''} If it isn't in Downloads, tap Save again; it also stays under Export until your next video.${where}`;
+    $('exportMsg').innerHTML = `<b>✓ Saved to your phone's Downloads</b> as ${name}. Done in ${secs < 90 ? `${secs.toFixed(0)} s` : `${(secs / 60).toFixed(1)} min`}: ${(res.blob.size / 1e6).toFixed(1)} MB, ${res.frames} frames, ${res.codec.startsWith('avc') ? 'H.264' : 'VP9'}${res.hasAudio ? ' + audio' : ''}${res.interpolated ? `, ${res.interpolated} in-between frames created` : ''}${res.cleaned ? ', extra clean' : ''}${res.focus ? `, focus ${res.focus.mode === 'full' ? 'sharp from the start' : 'build-up'}` : ''}.${res.shortBy ? ` The phone stopped reading the clip near the end, so it finishes ${res.shortBy < 1 ? 'a moment' : `${res.shortBy.toFixed(1)} s`} early.` : ''} If it isn't in Downloads, tap Save again; it also stays under Export until your next video.${where}`;
     setExportUI('done');
     finishedAlert(true, `${name} is saved to Downloads.`);
   } catch (e) {
