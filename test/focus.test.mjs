@@ -1,6 +1,6 @@
 // Node test: focus build-up geometry (canvas sizes, frame → canvas mapping, when a fresh canvas starts).
 import assert from 'node:assert/strict';
-import { canvasGeometry, frameToAnchor, fitsCanvas, planAnchors, decisionParams, lodForSigma, FOCUS_MARGIN, poseTracker, POSE } from '../js/focus.js';
+import { canvasGeometry, frameToAnchor, fitsCanvas, planAnchors, decisionParams, lodForSigma, FOCUS_MARGIN } from '../js/focus.js';
 import { compose, apply, fromParams } from '../js/core.js';
 
 let n = 0; const ok = (name, f) => { f(); n++; console.log('ok', name); };
@@ -63,47 +63,13 @@ ok('composition sanity (core.compose used for anchors)', () => {
   near(G[0], 1, 1e-12); near(G[1], 0, 1e-12); near(G[2], 0, 1e-12); near(G[3], 0, 1e-12);
   void compose;
 });
-// pose tracking ("sharp from the start"): frames list the regions that stopped matching ({ id: share of the
-// detailed area }); like the GPU mask, "since" is the area of the union since the tracker last asked for a reset.
-const run = (frames, fps = 30) => {
-  const p = poseTracker(); let seen = new Map();
-  return frames.map((f, k) => {
-    for (const [id, a] of Object.entries(f)) seen.set(id, a);
-    const o = p.push(k, k / fps, [...seen.values()].reduce((x, y) => x + y, 0));
-    if (o.reset) seen = new Map();
-    return o;
-  });
-};
-const rng = (seed => () => (seed = (seed * 16807) % 2147483647) / 2147483647)(7);
-const palps = () => (rng() < 0.5 ? { palpL: 0.03 } : {}) ;
-ok('pose: a still spider flicking its palps never splits, and keeps snapshotting', () => {
-  for (const fps of [30, 60]) {
-    const out = run(Array.from({ length: 10 * fps }, palps), fps);
-    assert.equal(out.filter(o => o.brk).length, 0);
-    assert.ok(out.filter(o => o.snap).length >= 30, `snapshots refresh while still (${fps} fps)`);
+ok('alignment and pool grids sized from the decision grid', () => {
+  for (const [w, h, sc] of [[3840, 2160, 0.9], [1920, 1080, 1], [640, 360, 1], [360, 640, 1]]) {
+    const g = canvasGeometry(w, h, sc);
+    assert.ok(Math.abs(g.FW - g.DW / 2) <= 1 && Math.abs(g.FH - g.DH / 2) <= 1 && g.FW >= 16 && g.FH >= 16);
+    assert.ok(g.MW * 24 >= g.DW && g.MH * 24 >= g.DH && g.MW >= 4 && g.MH >= 3);
   }
+  const p = decisionParams(2160, canvasGeometry(3840, 2160, 1));
+  assert.ok(p.maxShift > p.win && p.alignLodA > 0 && p.alignLodW > 0);
 });
-ok('pose: a head turn splits at the last still snapshot before it', () => {
-  const f = Array.from({ length: 200 }, (_, k) => (k >= 100 && k < 106 ? { ['head' + k]: 0.08, ...palps() } : palps()));
-  const out = run(f), b = out.filter(o => o.brk && o.brk.end != null);
-  assert.equal(b.length, 1, 'one pose ends with a snapshot (any later splits mid-turn have none)');
-  assert.ok(out.filter(o => o.brk).every(o => o.k >= 100 && o.k < 110));
-  const lastSnapBefore = Math.max(...out.filter(o => o.snap && o.k < 100).map(o => o.k));
-  assert.equal(b[0].brk.end, lastSnapBefore); assert.ok(100 - lastSnapBefore <= 9, `snapshot ${100 - lastSnapBefore} frames before the move`);
-  assert.ok(out.some(o => o.snap && o.k > 110), 'snapshots resume once still');
-});
-ok('pose: a slow drift that never looks like movement in any one window does not split (behaves like Build up)', () => {
-  const out = run(Array.from({ length: 240 }, (_, k) => (k >= 80 && k < 140 ? { ['drop' + k]: 0.006 } : {})));
-  assert.equal(out.filter(o => o.brk).length, 0); assert.ok(out.some(o => o.snap && o.k > 140), 'still snapshotting');
-});
-ok('pose: a quick reposition spread over two windows carries over and splits', () => {
-  const f = Array.from({ length: 200 }, (_, k) => (k >= 100 && k < 112 ? { ['m' + k]: 0.05 } : {}));
-  const b = run(f).filter(o => o.brk);
-  assert.ok(b.length >= 1 && b[0].brk.end != null && b[0].brk.end < 100);
-});
-ok('pose: walking splits without a still snapshot to keep', () => {
-  const out = run(Array.from({ length: 150 }, (_, k) => ({ ['walk' + k]: 0.05 })));
-  assert.ok(out.filter(o => o.brk).length >= 3 && out.every(o => !o.brk || o.brk.end == null) && out.every(o => !o.snap));
-});
-ok('pose: parameters sane', () => { assert.ok(POSE.quiet < POSE.brk && POSE.refresh > 0.05 && POSE.refresh < 1); });
 console.log(`${n} focus tests passed`);

@@ -90,7 +90,7 @@ Plus a **do-no-harm rule**: the centre frame is the base, and another frame only
 
 ### Behaviour
 - Export sheet, **Focus build-up**: *Off* · *Build up* · *Sharp from the start*.
-- **Build up:** as the focus moves through the spider, every part that has been sharp stays sharp, until the whole animal is in focus. Anything that moves (palps, a leg, a head turn) shows the live frame instead of an old copy, so nothing ghosts.
+- **Build up:** as the focus moves through the spider, every part that has been sharp stays sharp, until the whole animal is in focus. Anything that moves (palps, a leg, a head turn) shows the live frame instead of an old copy, so nothing ghosts. When verified detail moves (nearby, or across much of the picture), stored detail the new view can't confirm is dropped too, so nothing stale lingers after a turn. Each spot's stored view is kept lined up with the live frame by a small local shift (lean-in parallax, posture).
 - **Sharp from the start:** same, but each still pose is sharp from its first frame: the clip is read twice, and the second pass starts from what the first pass built.
 - Needs the shake measurement (it is run first if missing). Works with Extra clean, smooth slow motion, per-part looks and speeds. Preview is unchanged (it needs every frame in order).
 - Honest note in the UI: the result is a composite in time (each spot shows its sharpest *still-valid* view), not a single moment.
@@ -125,12 +125,44 @@ Plus a **do-no-harm rule**: the centre frame is the base, and another frame only
   - where the object left: normal 31.0 → 32.6 (no ghost); where it arrived: 20.2 → 20.2 (worst single frame −0.2 dB) ✔
 - **Real handheld spider clip** (`test/buildup_real.py`: 20 s, 960×540 30 fps copy of a 4K60 MacroCut export; the spider lowers its head at ~5 s and turns at ~19 s): subject detail vs the normal export ×1.10 (1–4 s), ×1.10 (5–10 s), **×1.25 (10–18 s)**; during the head turn ×1.01 (falls back to the live frame, no ghost). Frame-to-frame flicker is *lower* than normal (held spots are steady). *Sharp from the start* = *Build up* on this clip: the canvas keeps one view per spot, so the second pass starts from the clip's *last* pose, and spots where the spider later moved can't use it.
 - **Off = unchanged:** with focus build-up off, exports are pixel-identical to before for normal, Extra clean and smooth slow motion.
-- **Next step for *sharp from the start*:** start a fresh canvas whenever a large part of the subject changes (a new pose), so each pose gets its own first-pass result. *(Done: see "Per-pose" below.)*
-- **Remaining gap:** a held view is ~1.5–2 dB below a live in-focus frame (tracking error of ~0.1–0.2 px plus one extra resample). Local sub-pixel refinement of the canvas mapping would close part of it.
+- **Next step for *sharp from the start*:** start a fresh canvas whenever a large part of the subject changes (a new pose), so each pose gets its own first-pass result. *(Tried and dropped: see "Tried: per-pose" below.)*
+- **Remaining gap:** a held view is ~1.5–2 dB below a live in-focus frame (tracking error of ~0.1–0.2 px plus one extra resample). Local sub-pixel refinement of the canvas mapping would close part of it. *(Local alignment: see below.)*
 - **Cost** in the software-GPU test browser: ~3.3 s/frame at 540p for build up (normal export ~0.25 s/frame); sharp from the start ≈ 1.3× build up. Phone time not yet measured.
 
-### Per-pose "sharp from the start"
-One canvas keeps one view per spot, so a single first-pass result only helps frames in the *last* pose. Now the first pass splits the clip into poses and keeps a snapshot per pose:
+### Stale detail and local alignment (Nov 2026; alignment not kept)
+Testing per-pose *sharp from the start* (below) exposed two weaknesses that `main` had too:
+1. **Stale detail.** Where a spot is heavily out of focus, the "same thing?" test can't see a move smaller than the blur, so after the spider shifts, sharp detail from before can stay on screen in the wrong place. Synthetic two-pose clip (`test/make_poses.py`: a large body shifts 40 px at 3 s, the tracker partly follows): at the start of the second pose, *Build up* on `main` was 1.3–2.5 dB **worse** than a normal export in bands 1–3, and the leftover detail matched the first pose (correlation 0.5–0.77).
+2. **Older views rejected.** The tracker lines frames up as a whole; a 3D spider doesn't move as a whole (lean-in parallax, posture). A view from seconds ago is then a pixel or two off, and when the focus comes back near it, the strict test rejects it.
+
+**Doubt rule (fix 1).**
+- The decision pass also records, per spot, whether stored detail *moved* (changed even allowing ~2 px of extra shift) and whether this frame *clearly verifies* it (the live view shows most of the stored detail). Only clearly verified spots vote: a blurred comparison can't see a move and would count as "didn't move".
+- Votes are pooled per block (~24 decision cells) and over the whole frame. Where verified detail moved within ~2 blocks, or a large part of the picture moved (≥ 20–35% of the clearly verified detail, in ≥ 5–9% of the blocks), stored detail that this frame can't clearly confirm is dropped: the live frame is stored and shown. All or nothing: a half-dropped view just looks like weaker detail and survives.
+- Thresholds from real footage: on the active spider clip half the frames have ~4.5% of blocks with verified movement (so the whole-frame rule needs more than that); on the still spider clip the whole-frame rule fires once, at the turn (19.2 s), and never during palp movement or the head drop.
+- Bugs found on the way: the whole-frame figure was first read from the top mipmap of a non-power-of-two grid (mipmapping drops rows, so the only rows with verified detail vanished and it read "no movement"; now an explicit 1×1 sum), and a 32-bit float texture had linear filtering (reads as zeros without the float-linear extension; now nearest).
+
+**Local alignment (fix 2).** Per spot (on half the decision grid), a shift that lines the stored view up with the live one, used by the "same thing?" test, the output and the canvas update.
+- **Only where the live view is nearly sharp** (blurring the stored view twice as much doesn't match it better). That is where the test is strict and rejects misaligned views, and where a shift can be measured without bias. Elsewhere the last shift is kept.
+- **Estimate:** one gradient (Lucas–Kanade) step per frame from last frame's shift, over a 5×5 patch (taps 4 px apart at 720p scale) in colour with the brightness offset removed; damped, so it doesn't slide along an edge.
+- **Integration:** a per-spot Kalman filter. Each spot keeps its shift and its uncertainty (in the flow texture's spare channel); every frame the uncertainty grows a little (slow drift allowed), and each estimate pulls the shift in proportion to its precision. No shift (the tracker) is the default until repeated evidence says otherwise, and held views don't wander or shimmer.
+- **Canvas update:** stored detail is never resampled. A partial update writes the live frame *into the stored view's geometry* (read through the shift); only a full replacement puts the spot back into the live frame's geometry and resets its shift.
+- **Tried and not kept** (each measured on the two-pose and parallax clips):
+  - A small search with 5–10% acceptance margins: the cost is a sum over correlated taps, so that is within noise. Shifts wandered (median 1–1.5 px on a still scene) and held detail smeared: −2 dB vs `main`.
+  - Re-lining the kept part of the canvas up whenever new detail was blended in: stored detail was resampled again and again, a random walk plus cumulative softening (−1.5 dB).
+  - Measuring at the live view's own blur scale (×2, ×4) as well. It does follow parallax: the parallax clip passed, band 0 late −0.4 dB vs normal against `main`'s −2.0. But the wider patch spans parts at different depths, and a defocus difference across it reads as a 1–2 px shift: held views crept by ~1 px on a still scene (−1.5 dB vs `main`). A dead zone for those estimates lost the parallax gain; using them only to flag misplaced views fired on 6% of spots of a still scene.
+  - Dropping a held view when the fine-scale estimates stayed large: single-frame estimates wobble by ~1 px, so it also fired on still scenes.
+
+**Results** (360p copies; software GPU in the test browser):
+- *Two-pose clip* (Build up, dB vs normal, body only): while nothing moves, level with `main` (band 0 within 0–0.5 dB of it); at the start of the second pose, bands 1–3 **−0.1 to 0.0** (`main` −1.3 to −2.5), and the leftover first-pose detail is gone (correlation 0.03–0.08, `main` 0.5–0.77); later in the second pose 0.4–1.0 dB ahead of `main` in bands 1–2.
+- *Whole-body drift clip* (`make_drift.py d3 3`): +3.0 dB over normal late in the clip (`main` +2.9), worst single frame −0.6 dB (`main` −1.1). Pass.
+- *Original acceptance clip* (`test/buildup.py`, grainy, with focus breathing): passes, but Build up after a band has been in focus is 31.9 / 32.4 / 32.5 dB against `main`'s 32.9 / 32.9 / 33.1. With the local alignment switched off (shift always zero) it is 32.5 / 32.8 / 32.8: **the alignment itself costs ~0.5 dB here**, even using a spot's shift only once it is beyond ~2 standard deviations of its uncertainty and above 0.2 px. Its estimates are confidently wrong just often enough.
+- *Focus build-up off:* pixel-identical to `main` (normal, Extra clean, smooth slow motion).
+
+**Conclusion:** the doubt rule earns its place (stale detail gone; no misfires on the still spider; ~0.1–0.4 dB cost on the acceptance clip, near its constantly wiggling object). The local alignment doesn't, in any form tried: the fine-scale version gains at most 0.2–0.3 dB (drift, parallax) and costs ~0.5 dB on grainy footage; the coarse-scale versions follow parallax but make held views creep on still footage. So the doubt rule ships on its own (branch `focus-doubt`), and this branch keeps the full alignment build for the record.
+
+**Remaining limitation:** parts that stay heavily defocused while near and far parts drift apart (lean-in) can still show detail a few pixels out of place, as on `main` (synthetic parallax clip, `test/make_drift.py … hover parallax`: band 0 late −1.9 dB vs normal, `main` −2.0). Measuring the shift there needs a depth-aware comparison or a drift-velocity model; neither is built.
+
+### Tried: per-pose "sharp from the start" (not kept)
+Built in draft PR #17 (Nov 2026) and not merged; the code is gone again (one snapshot per canvas, as before), but its findings led to the section above. One canvas keeps one view per spot, so a single first-pass result only helps frames in the *last* pose. The idea was to split the clip into poses in the first pass and keep a snapshot per pose:
 - **Movement measure.** The "same thing?" test is deliberately strict (a stored view is never shown even slightly out of place), so it also fires on lean-in parallax inside a 3D spider (face and legs shift 1–2 px relative to each other) and, before a fix, on newly-in-focus detail (the test now works in both blur directions). Pose tracking uses its own measure: where the strict test fires, would a shift of ~2 px (720p scale) explain it? If not, the spot *moved*. A GPU mask keeps the union of moved spots since the last snapshot, so a palp flicking ten times counts once; a 16×9 summary is read back each frame of the first pass.
 - **Poses.** In 0.25 s windows: a window where < 20% of the spider's detailed area moved is a still moment, and the canvas is snapshotted ("this pose so far"). When movement since the last still moment passes 40%, the pose ends at that snapshot and a new one begins. The second pass starts each pose from its snapshot. Splits are recorded in pass 1 and replayed, so both passes agree.
 - **Measured** (360p copies, share of detailed area per window): still spider while the focus sweeps 0.05–0.19, settled 0.01–0.03, head turn 0.5–1.7; active walking spider 0.6–1.6 most of the time, its still spells 0.1–0.3. A slow head drop stays below the still threshold: no split, so that stretch simply behaves like *Build up*.
@@ -144,5 +176,8 @@ One canvas keeps one view per spot, so a single first-pass result only helps fra
 
 ### Acceptance tests
 - Synthetic focus-dwell clip with an all-sharp truth and a moving object: once each depth band has been in focus, build-up must beat the normal export in that band; where the object moved, it must not be worse than the normal export (no ghost).
-- Real handheld spider clip: visibly sharper during still poses, falls back to the live frame during a head turn.
+- Synthetic two-pose clip (`test/poses.py`): at the start of each pose, neither mode may be more than 0.5 dB worse than a normal export (no stale detail).
+- Synthetic drift clips (`test/drift.py`): whole-body drift (which the tracker follows): build up ≥ normal + 2 dB late in the clip and no worse than before; parallax (near and far parts drift apart): no worse than normal and better than before. No single frame more than 1.5 dB worse than normal.
+- Real handheld spider clips: visibly sharper during still poses, falls back to the live frame during a head turn; no less detail and no more flicker than before.
+- Focus build-up off: exports pixel-identical to before.
 - Existing suite still passes.

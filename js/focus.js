@@ -22,7 +22,10 @@ export function canvasGeometry(dispW, dispH, srcPerOut = 1, maxTex = 8192) {
   // decisions are made on a grid of about 540 rows per frame height (fine enough for edges, cheap on a phone)
   const d = Math.min(1, (540 * k) / AH);
   const DW = Math.max(16, Math.round(AW * d)), DH = Math.max(16, Math.round(AH * d));
-  return { CW: A * k, CH: k, AW, AH, DW, DH, scale, A };
+  // local alignment on half the decision grid; movement pooled in blocks of ~24 decision cells
+  const FW = Math.max(16, Math.round(DW / 2)), FH = Math.max(16, Math.round(DH / 2));
+  const MW = Math.max(4, Math.ceil(DW / 24)), MH = Math.max(3, Math.ceil(DH / 24));
+  return { CW: A * k, CH: k, AW, AH, DW, DH, FW, FH, MW, MH, scale, A };
 }
 
 // frame k (normalised) → anchor canvas (normalised)
@@ -63,77 +66,39 @@ export function decisionParams(dispH, geo) {
   return {
     lodW: lodForSigma(0.75 * px720),                // the live frame, lightly blurred (grain, blocking)
     lodA: [0.75, 1.5, 3, 6, 12, 24].map(s => lodForSigma(s * accPx)),   // stored view blurred by several amounts
-    win: 4 / 720,                                   // spacing of the 3×3 comparison taps (normalised units)
-    shift: 2 / 720,                                 // pose tracking forgives shifts this small (lean-in parallax)
+    win: 4 / 720,                                   // spacing of the comparison taps (3×3 same-thing test, 5×5 alignment)
+    shift: 2 / 720,                                 // "moved" = changed even allowing this much extra shift
+    maxShift: 12 / 720,                             // local alignment never shifts a spot further than this
+    alignLodA: lodForSigma(3 * accPx),              // local alignment compares both views blurred by ~3 px (720p scale)
+    alignLodW: lodForSigma(3 * px720),
     covLod: Math.max(0, Math.log2(geo.AH / geo.DH)),
     down: geo.scale < 0.8 ? Math.log2(1 / geo.scale) : 0,
-  };
-}
-
-// Pose tracking for "sharp from the start" (first pass). Measured in windows of `refresh` seconds: `since` is the
-// share of the spider's detailed area that stopped matching during the window (an area: repeated palp flicks
-// count once). Tuned on real clips (see docs/SPEC-multiframe.md §C).
-export const POSE = {
-  refresh: 0.25, // s per window
-  quiet: 0.2,    // a window that moved less than this is a still moment: snapshot "this pose so far"
-  brk: 0.4,      // movement since the last still moment above this = a new pose
-};
-// Measured (360p copies, share of detailed area per 0.25 s window, upper bound): still spider during focus sweeps
-// 0.05–0.19, settled 0.01–0.03; head turn 0.5–1.7. Slow or small moves (a head drop) stay below `quiet`: no new
-// pose, which only means that stretch behaves like Build up.
-
-/**
- * Pose segmentation (pure; the live code and the tests use the same logic).
- * push(k, t, since) per frame → { snap: take a still snapshot now, brk: null | { end: last still frame },
- * reset: start a new window (clear the GPU "since" mask) }
- */
-export function poseTracker(prm = POSE) {
-  let tRef = null, candK = null, carried = 0;
-  return {
-    get candK() { return candK; },
-    get moving() { return carried > 0; },
-    push(k, t, since) {
-      if (tRef == null) tRef = t;
-      const out = { k, snap: false, brk: null, reset: false };
-      if (carried + since > prm.brk) {
-        out.brk = { end: candK }; out.reset = true;
-        candK = null; carried = 0; tRef = t;
-        return out;
-      }
-      if (t - tRef >= prm.refresh - 1e-6) {
-        if (since < prm.quiet) { out.snap = true; candK = k; carried = 0; } else carried += since;
-        tRef = t; out.reset = true;
-      }
-      return out;
-    },
   };
 }
 
 /**
  * Drives the GPU accumulator through an export.
  * R: Renderer (focus* methods). C: camera per frame. times: frame times (s).
- * opts: { frames (sorted processed frame indices), mode: 'build'|'full', dispW, dispH, srcPerOut, outH }
- *
- * "full" (sharp from the start) = two passes. Pass 1 builds the canvas and splits the clip into segments: a new
- * canvas (view moved too far) or a new pose (a big part of the spider stopped matching). Each segment keeps a
- * snapshot of its best state (for a pose: the last still moment before the spider moved). Pass 2 starts every
- * segment from its snapshot, so each pose is sharp from its first frame.
+ * opts: { frames (sorted processed frame indices), mode: 'build'|'full', dispW, dispH, srcPerOut, outH, debug }
+ * "full" (sharp from the start) = two passes: pass 1 builds each canvas and keeps a snapshot of how it ended;
+ * pass 2 starts each canvas from that snapshot. Per spot, the "same thing?" test (with local alignment) decides
+ * what of it still applies, and stored detail that can't be verified next to real movement is dropped.
  */
 export class FocusBuild {
   constructor(R, C, times, opts) {
     this.R = R; this.C = C; this.times = times; this.mode = opts.mode; this.outH = opts.outH;
-    this.dispH = opts.dispH; this.frames = opts.frames;
+    this.dispH = opts.dispH;
     const maxTex = R.gl ? R.gl.getParameter(R.gl.MAX_TEXTURE_SIZE) : 8192;
     this.geo = canvasGeometry(opts.dispW, opts.dispH, opts.srcPerOut, maxTex);
     this.prm = decisionParams(opts.dispH, this.geo);
     this.anchorOf = planAnchors(opts.frames, C, this.geo);
     this.noise = 0.2 * 0.004 * 0.004; this.eps = 1e-4; this.grainSet = false;
     this.pass = opts.mode === 'full' ? 1 : 2;
-    // memory: snapshots kept between the passes (no mipmaps), longest segments first; one more for the live candidate
-    const bytes = this.geo.AW * this.geo.AH * 4 + this.geo.DW * this.geo.DH * 8;
-    this.maxSeeds = Math.max(1, Math.min(12, Math.floor(160e6 / bytes) - 1));
-    this.segments = [];          // pass 1 → 2: { start, end, geo (new canvas), seed }
-    this.segAt = new Map();      // pass 2: start frame → segment
+    this.seeds = new Map();          // anchor → { snap, frames } built by pass 1
+    this.segLen = new Map();
+    for (const a of this.anchorOf.values()) this.segLen.set(a, (this.segLen.get(a) || 0) + 1);
+    const g = this.geo, bytes = g.AW * g.AH * 4 + g.DW * g.DH * 8 + g.FW * g.FH * 8;   // snapshots have no mipmaps
+    this.maxSeeds = Math.max(1, Math.min(8, Math.floor(160e6 / bytes)));
     this.cur = null; this.lastK = null; this.steps = 0;
     this.debug = !!opts.debug; this.log = [];
     R.focusBegin(this.geo);
@@ -143,83 +108,41 @@ export class FocusBuild {
     const s = Math.max(sigma || 0, 0.002);
     this.noise = 0.2 * s * s; this.eps = Math.max(4 * this.noise, 1e-4); this.grainSet = true;
   }
-  _nextFrame(k) { const f = this.frames; let lo = 0, hi = f.length; while (lo < hi) { const m = (lo + hi) >> 1; if (f[m] <= k) lo = m + 1; else hi = m; } return lo < f.length ? f[lo] : null; }
-  _len(sg) { let n = 0; for (const k of this.frames) if (k >= sg.start && k <= sg.end) n++; return n; }
-  _setSeed(sg, snap) {
-    sg.seed = snap;
-    const kept = this.segments.filter(x => x.seed);
-    if (kept.length > this.maxSeeds) {
-      kept.sort((a, b) => this._len(a) - this._len(b));
-      this.R.focusDrop(kept[0].seed); kept[0].seed = null;
-    }
-  }
-  // pass 1: close the open segment at frame `end`; its snapshot is `snap` (or none)
-  _close(end, snap) {
-    const sg = this.segments[this.segments.length - 1];
-    if (!sg || sg.end != null) { if (snap) this.R.focusDrop(snap); return; }
-    sg.end = end;
-    if (snap && end >= sg.start) this._setSeed(sg, snap); else if (snap) this.R.focusDrop(snap);
-  }
-  // pass 1 at a new canvas / end of pass: best snapshot of the open segment = now if still, else the last still one
-  _closeHere() {
-    const sg = this.segments[this.segments.length - 1];
-    if (!sg || sg.end != null || this.lastK == null) return;
-    const still = !this.pose.moving || this.cand == null;
-    const snap = still ? this.R.focusSnapshot() : this.cand;
-    if (still && this.cand) this.R.focusDrop(this.cand);
-    this.cand = null;
-    this._close(still ? this.lastK : this.pose.candK, snap);
-  }
   startPass(p) {
-    if (p === 2 && this.pass === 1) {
-      this._closeHere();
-      for (const sg of this.segments) this.segAt.set(sg.start, sg);
-      if (this.debug) this.log.push(['segments', this.segments.map(sg => [sg.start, sg.end, sg.geo ? 'canvas' : 'pose', !!sg.seed])]);
-    }
+    if (p === 2 && this.pass === 1 && this.cur != null) this._keepSeed(this.cur);
     this.pass = p; this.cur = null; this.lastK = null;
+  }
+  _keepSeed(a) {
+    const n = this.segLen.get(a) || 0;
+    if (n < 6) return;   // too short to be worth it
+    this.seeds.set(a, { snap: this.R.focusSnapshot(), frames: n });
+    while (this.seeds.size > this.maxSeeds) {
+      let worst = null; for (const [k, s] of this.seeds) if (!worst || s.frames < worst[1].frames) worst = [k, s];
+      this.R.focusDrop(worst[1].snap); this.seeds.delete(worst[0]);
+    }
+  }
+  _start(a) {
+    if (this.pass === 1 && this.cur != null) this._keepSeed(this.cur);
+    this.cur = a; this.lastK = null;
+    const s = this.pass === 2 && this.seeds.get(a);
+    if (s) { this.R.focusRestore(s.snap); this.R.focusDrop(s.snap); this.seeds.delete(a); } else this.R.focusClear();
   }
   // Add frame k (its texture is on the GPU, display info as frameInfo()).
   step(k, tex, info) {
     const a = this.anchorOf.get(k);
     if (a === undefined) return false;
-    const R = this.R;
-    if (this.pass === 1) {
-      if (a !== this.cur) {   // new canvas
-        this._closeHere();
-        this.segments.push({ start: k, end: null, geo: true, seed: null });
-        this.pose = poseTracker(); this.cand = null;
-        R.focusClear();
-      }
-    } else {
-      const sg = this.segAt.get(k);
-      if (sg && sg.seed) { R.focusRestore(sg.seed); R.focusDrop(sg.seed); sg.seed = null; }
-      else if (a !== this.cur || (sg && sg.geo)) R.focusClear();
-    }
-    this.cur = a;
+    if (a !== this.cur) this._start(a);
     const dt = this.lastK == null ? 0 : Math.max(0, this.times[k] - this.times[this.lastK]);
     const T = invert(frameToAnchor(this.C[a], this.C[k]));   // canvas → frame k
-    R.mipTex(tex);
-    R.focusStep(tex, info, T, { ...this.prm, noise: this.noise, eps: this.eps, decay: Math.pow(0.5, dt / 11) });
+    this.R.mipTex(tex);
+    this.R.focusStep(tex, info, T, { ...this.prm, noise: this.noise, eps: this.eps, decay: Math.pow(0.5, dt / 11) });
     this.lastK = k; this.steps++;
-    if (this.pass === 1 || this.debug) {
-      const st = R.focusStats(this.eps);
-      if (this.debug) this.log.push([k, +st.changed.toFixed(4), +st.since.toFixed(4), +st.detail.toFixed(4), this.pass]);
-      if (this.pass === 1) this._watch(k, st);
+    if (this.debug) {
+      const mk = typeof self !== 'undefined' && self.MC_FOCUS_MAPK, maps = mk ? mk.includes(k) : k % 15 === 0, st = this.R.focusStats(this.eps, maps);
+      this.log.push([k, +st.moved.toFixed(4), +st.doubt.toFixed(4), +st.detail.toFixed(4), this.pass, st.shift50, st.shift95, st.atCap, st.conf, st.globR, st.globG, st.globA, st.sur99, st.outOfPlace]);
+      if (maps) (this.maps = this.maps || []).push({ k, pass: this.pass, fw: st.fw, fh: st.fh, flow: st.flow, dw: st.dw, dh: st.dh, dec: st.dec });
     }
     return true;
-  }
-  // pass 1: follow the pose; snapshot still moments; split where the spider moved
-  _watch(k, st) {
-    const d = this.pose.push(k, this.times[k], st.since);
-    if (d.reset) this.R.focusResetSince();
-    if (d.brk) {
-      const end = d.brk.end != null ? d.brk.end : k;
-      this._close(end, d.brk.end != null ? this.cand : null);
-      this.cand = null;
-      const next = this._nextFrame(end);
-      if (next != null) this.segments.push({ start: next, end: null, geo: false, seed: null });
-      if (this.debug) this.log.push(['pose', k, end, next]);
-    } else if (d.snap) this.cand = R_snapshot(this.R, this.cand);
   }
   // Overlay for rendering frame k (or u of the way from k to k2, for in-between frames).
   overlay(k, u = 0, k2 = k) {
@@ -231,9 +154,5 @@ export class FocusBuild {
     }
     return { G };
   }
-  dispose() {
-    for (const sg of this.segments) if (sg.seed) { this.R.focusDrop(sg.seed); sg.seed = null; }
-    if (this.cand) { this.R.focusDrop(this.cand); this.cand = null; }
-  }
+  dispose() { for (const s of this.seeds.values()) this.R.focusDrop(s.snap); this.seeds.clear(); }
 }
-const R_snapshot = (R, into) => R.focusSnapshot(into);

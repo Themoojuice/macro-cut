@@ -430,7 +430,7 @@ export async function exportClip(clip, plan, { onProgress = () => {}, signal } =
     else { closeEncoder(); if (fb) fb.dispose(); R.dispose(); if (ds) ds.dispose(); throw e; }
   }
   const focusInfo = fb ? { mode: fb.mode, frames: readCount, canvas: `${fb.geo.AW}×${fb.geo.AH}` } : null;
-  if (fb && fb.debug) self.MC_FOCUS_LOG = fb.log;
+  if (fb && fb.debug) { self.MC_FOCUS_LOG = fb.log; self.MC_FOCUS_MAPS = fb.maps || []; }
   if (fb) { console.info(`MacroCut focus build-up: ${fb.mode}, canvas ${fb.geo.AW}×${fb.geo.AH}, decisions ${fb.geo.DW}×${fb.geo.DH}, ${fb.steps} frame updates`); fb.dispose(); }
   R.dispose(); if (ds) ds.dispose();
   if (signal && signal.aborted) { closeEncoder(); return null; }
