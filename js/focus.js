@@ -22,7 +22,10 @@ export function canvasGeometry(dispW, dispH, srcPerOut = 1, maxTex = 8192) {
   // decisions are made on a grid of about 540 rows per frame height (fine enough for edges, cheap on a phone)
   const d = Math.min(1, (540 * k) / AH);
   const DW = Math.max(16, Math.round(AW * d)), DH = Math.max(16, Math.round(AH * d));
-  return { CW: A * k, CH: k, AW, AH, DW, DH, scale, A };
+  // local alignment on half the decision grid; movement pooled in blocks of ~24 decision cells
+  const FW = Math.max(16, Math.round(DW / 2)), FH = Math.max(16, Math.round(DH / 2));
+  const MW = Math.max(4, Math.ceil(DW / 24)), MH = Math.max(3, Math.ceil(DH / 24));
+  return { CW: A * k, CH: k, AW, AH, DW, DH, FW, FH, MW, MH, scale, A };
 }
 
 // frame k (normalised) → anchor canvas (normalised)
@@ -63,7 +66,11 @@ export function decisionParams(dispH, geo) {
   return {
     lodW: lodForSigma(0.75 * px720),                // the live frame, lightly blurred (grain, blocking)
     lodA: [0.75, 1.5, 3, 6, 12, 24].map(s => lodForSigma(s * accPx)),   // stored view blurred by several amounts
-    win: 4 / 720,                                   // spacing of the 3×3 comparison taps (normalised units)
+    win: 4 / 720,                                   // spacing of the comparison taps (3×3 same-thing test, 5×5 alignment)
+    shift: 2 / 720,                                 // "moved" = changed even allowing this much extra shift
+    maxShift: 12 / 720,                             // local alignment never shifts a spot further than this
+    alignLodA: lodForSigma(3 * accPx),              // local alignment compares both views blurred by ~3 px (720p scale)
+    alignLodW: lodForSigma(3 * px720),
     covLod: Math.max(0, Math.log2(geo.AH / geo.DH)),
     down: geo.scale < 0.8 ? Math.log2(1 / geo.scale) : 0,
   };
@@ -72,7 +79,10 @@ export function decisionParams(dispH, geo) {
 /**
  * Drives the GPU accumulator through an export.
  * R: Renderer (focus* methods). C: camera per frame. times: frame times (s).
- * opts: { frames (sorted processed frame indices), mode: 'build'|'full', dispW, dispH, srcPerOut, outH }
+ * opts: { frames (sorted processed frame indices), mode: 'build'|'full', dispW, dispH, srcPerOut, outH, debug }
+ * "full" (sharp from the start) = two passes: pass 1 builds each canvas and keeps a snapshot of how it ended;
+ * pass 2 starts each canvas from that snapshot. Per spot, the "same thing?" test (with local alignment) decides
+ * what of it still applies, and stored detail that can't be verified next to real movement is dropped.
  */
 export class FocusBuild {
   constructor(R, C, times, opts) {
@@ -84,13 +94,13 @@ export class FocusBuild {
     this.anchorOf = planAnchors(opts.frames, C, this.geo);
     this.noise = 0.2 * 0.004 * 0.004; this.eps = 1e-4; this.grainSet = false;
     this.pass = opts.mode === 'full' ? 1 : 2;
-    this.seeds = new Map();          // anchor → { tex, frames } built by pass 1 ("sharp from the start")
+    this.seeds = new Map();          // anchor → { snap, frames } built by pass 1
     this.segLen = new Map();
     for (const a of this.anchorOf.values()) this.segLen.set(a, (this.segLen.get(a) || 0) + 1);
-    // memory: keep at most this many finished canvases between the passes (longest poses first)
-    const bytes = this.geo.AW * this.geo.AH * 4 * 1.34 + this.geo.DW * this.geo.DH * 8;
+    const g = this.geo, bytes = g.AW * g.AH * 4 + g.DW * g.DH * 8 + g.FW * g.FH * 8;   // snapshots have no mipmaps
     this.maxSeeds = Math.max(1, Math.min(8, Math.floor(160e6 / bytes)));
     this.cur = null; this.lastK = null; this.steps = 0;
+    this.debug = !!opts.debug; this.log = [];
     R.focusBegin(this.geo);
   }
   // grain level of the clip (σ, 0..1): sharpness below what grain alone makes doesn't count
@@ -105,17 +115,17 @@ export class FocusBuild {
   _keepSeed(a) {
     const n = this.segLen.get(a) || 0;
     if (n < 6) return;   // too short to be worth it
-    this.seeds.set(a, { tex: this.R.focusDetach(), frames: n });
+    this.seeds.set(a, { snap: this.R.focusSnapshot(), frames: n });
     while (this.seeds.size > this.maxSeeds) {
       let worst = null; for (const [k, s] of this.seeds) if (!worst || s.frames < worst[1].frames) worst = [k, s];
-      this.R.focusDrop(worst[1].tex); this.seeds.delete(worst[0]);
+      this.R.focusDrop(worst[1].snap); this.seeds.delete(worst[0]);
     }
   }
   _start(a) {
     if (this.pass === 1 && this.cur != null) this._keepSeed(this.cur);
     this.cur = a; this.lastK = null;
     const s = this.pass === 2 && this.seeds.get(a);
-    if (s) { this.R.focusAttach(s.tex); this.seeds.delete(a); } else this.R.focusClear();
+    if (s) { this.R.focusRestore(s.snap); this.R.focusDrop(s.snap); this.seeds.delete(a); } else this.R.focusClear();
   }
   // Add frame k (its texture is on the GPU, display info as frameInfo()).
   step(k, tex, info) {
@@ -127,6 +137,11 @@ export class FocusBuild {
     this.R.mipTex(tex);
     this.R.focusStep(tex, info, T, { ...this.prm, noise: this.noise, eps: this.eps, decay: Math.pow(0.5, dt / 11) });
     this.lastK = k; this.steps++;
+    if (this.debug) {
+      const mk = typeof self !== 'undefined' && self.MC_FOCUS_MAPK, maps = mk ? mk.includes(k) : k % 15 === 0, st = this.R.focusStats(this.eps, maps);
+      this.log.push([k, +st.moved.toFixed(4), +st.doubt.toFixed(4), +st.detail.toFixed(4), this.pass, st.shift50, st.shift95, st.atCap, st.conf, st.globR, st.globG, st.globA, st.sur99, st.outOfPlace]);
+      if (maps) (this.maps = this.maps || []).push({ k, pass: this.pass, fw: st.fw, fh: st.fh, flow: st.flow, dw: st.dw, dh: st.dh, dec: st.dec });
+    }
     return true;
   }
   // Overlay for rendering frame k (or u of the way from k to k2, for in-between frames).
@@ -139,5 +154,5 @@ export class FocusBuild {
     }
     return { G };
   }
-  dispose() { for (const s of this.seeds.values()) this.R.focusDrop(s.tex); this.seeds.clear(); }
+  dispose() { for (const s of this.seeds.values()) this.R.focusDrop(s.snap); this.seeds.clear(); }
 }

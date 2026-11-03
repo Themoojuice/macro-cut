@@ -63,4 +63,13 @@ ok('composition sanity (core.compose used for anchors)', () => {
   near(G[0], 1, 1e-12); near(G[1], 0, 1e-12); near(G[2], 0, 1e-12); near(G[3], 0, 1e-12);
   void compose;
 });
+ok('alignment and pool grids sized from the decision grid', () => {
+  for (const [w, h, sc] of [[3840, 2160, 0.9], [1920, 1080, 1], [640, 360, 1], [360, 640, 1]]) {
+    const g = canvasGeometry(w, h, sc);
+    assert.ok(Math.abs(g.FW - g.DW / 2) <= 1 && Math.abs(g.FH - g.DH / 2) <= 1 && g.FW >= 16 && g.FH >= 16);
+    assert.ok(g.MW * 24 >= g.DW && g.MH * 24 >= g.DH && g.MW >= 4 && g.MH >= 3);
+  }
+  const p = decisionParams(2160, canvasGeometry(3840, 2160, 1));
+  assert.ok(p.maxShift > p.win && p.alignLodA > 0 && p.alignLodW > 0);
+});
 console.log(`${n} focus tests passed`);

@@ -203,7 +203,7 @@ export async function exportClip(clip, plan, { onProgress = () => {}, signal } =
   if (plan.focus && plan.C && plan.C.length === clip.times.length) {
     try {
       const frames = [...usedFrames].sort((a, b) => a - b), m0 = plan.M.subarray(4 * frames[0], 4 * frames[0] + 4);
-      fb = new FocusBuild(R, plan.C, clip.times, { frames, mode: plan.focus, dispW: clip.dispW, dispH: clip.dispH, srcPerOut: Math.hypot(m0[0], m0[1]) * clip.dispH / outH, outH });
+      fb = new FocusBuild(R, plan.C, clip.times, { frames, mode: plan.focus, dispW: clip.dispW, dispH: clip.dispH, srcPerOut: Math.hypot(m0[0], m0[1]) * clip.dispH / outH, outH, debug: !!(typeof self !== 'undefined' && self.MC_FOCUS_DEBUG) });
     } catch (e) { R.dispose(); throw e; }
   }
   const twoPass = !!(fb && fb.mode === 'full');
@@ -430,6 +430,7 @@ export async function exportClip(clip, plan, { onProgress = () => {}, signal } =
     else { closeEncoder(); if (fb) fb.dispose(); R.dispose(); if (ds) ds.dispose(); throw e; }
   }
   const focusInfo = fb ? { mode: fb.mode, frames: readCount, canvas: `${fb.geo.AW}×${fb.geo.AH}` } : null;
+  if (fb && fb.debug) { self.MC_FOCUS_LOG = fb.log; self.MC_FOCUS_MAPS = fb.maps || []; }
   if (fb) { console.info(`MacroCut focus build-up: ${fb.mode}, canvas ${fb.geo.AW}×${fb.geo.AH}, decisions ${fb.geo.DW}×${fb.geo.DH}, ${fb.steps} frame updates`); fb.dispose(); }
   R.dispose(); if (ds) ds.dispose();
   if (signal && signal.aborted) { closeEncoder(); return null; }
