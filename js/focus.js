@@ -22,7 +22,9 @@ export function canvasGeometry(dispW, dispH, srcPerOut = 1, maxTex = 8192) {
   // decisions are made on a grid of about 540 rows per frame height (fine enough for edges, cheap on a phone)
   const d = Math.min(1, (540 * k) / AH);
   const DW = Math.max(16, Math.round(AW * d)), DH = Math.max(16, Math.round(AH * d));
-  return { CW: A * k, CH: k, AW, AH, DW, DH, scale, A };
+  // movement is pooled in blocks of ~24 decision cells (doubt rule)
+  const MW = Math.max(4, Math.ceil(DW / 24)), MH = Math.max(3, Math.ceil(DH / 24));
+  return { CW: A * k, CH: k, AW, AH, DW, DH, MW, MH, scale, A };
 }
 
 // frame k (normalised) → anchor canvas (normalised)
@@ -64,6 +66,7 @@ export function decisionParams(dispH, geo) {
     lodW: lodForSigma(0.75 * px720),                // the live frame, lightly blurred (grain, blocking)
     lodA: [0.75, 1.5, 3, 6, 12, 24].map(s => lodForSigma(s * accPx)),   // stored view blurred by several amounts
     win: 4 / 720,                                   // spacing of the 3×3 comparison taps (normalised units)
+    shift: 2 / 720,                                 // "moved" = changed even allowing this much extra shift
     covLod: Math.max(0, Math.log2(geo.AH / geo.DH)),
     down: geo.scale < 0.8 ? Math.log2(1 / geo.scale) : 0,
   };
@@ -72,7 +75,7 @@ export function decisionParams(dispH, geo) {
 /**
  * Drives the GPU accumulator through an export.
  * R: Renderer (focus* methods). C: camera per frame. times: frame times (s).
- * opts: { frames (sorted processed frame indices), mode: 'build'|'full', dispW, dispH, srcPerOut, outH }
+ * opts: { frames (sorted processed frame indices), mode: 'build'|'full', dispW, dispH, srcPerOut, outH, debug }
  */
 export class FocusBuild {
   constructor(R, C, times, opts) {
@@ -91,6 +94,7 @@ export class FocusBuild {
     const bytes = this.geo.AW * this.geo.AH * 4 * 1.34 + this.geo.DW * this.geo.DH * 8;
     this.maxSeeds = Math.max(1, Math.min(8, Math.floor(160e6 / bytes)));
     this.cur = null; this.lastK = null; this.steps = 0;
+    this.debug = !!opts.debug; this.log = [];   // debug: per frame [k, moved, doubt, detail, pass, frame-wide moved, verified, moved blocks]
     R.focusBegin(this.geo);
   }
   // grain level of the clip (σ, 0..1): sharpness below what grain alone makes doesn't count
@@ -127,6 +131,10 @@ export class FocusBuild {
     this.R.mipTex(tex);
     this.R.focusStep(tex, info, T, { ...this.prm, noise: this.noise, eps: this.eps, decay: Math.pow(0.5, dt / 11) });
     this.lastK = k; this.steps++;
+    if (this.debug) {
+      const st = this.R.focusStats(this.eps);
+      this.log.push([k, +st.moved.toFixed(4), +st.doubt.toFixed(4), +st.detail.toFixed(4), this.pass, st.globR, st.globG, st.globA]);
+    }
     return true;
   }
   // Overlay for rendering frame k (or u of the way from k to k2, for in-between frames).

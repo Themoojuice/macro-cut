@@ -63,4 +63,12 @@ ok('composition sanity (core.compose used for anchors)', () => {
   near(G[0], 1, 1e-12); near(G[1], 0, 1e-12); near(G[2], 0, 1e-12); near(G[3], 0, 1e-12);
   void compose;
 });
+ok('movement pool grid sized from the decision grid', () => {
+  for (const [w, h, sc] of [[3840, 2160, 0.9], [1920, 1080, 1], [640, 360, 1], [360, 640, 1]]) {
+    const g = canvasGeometry(w, h, sc);
+    assert.ok(g.MW * 24 >= g.DW && g.MH * 24 >= g.DH && g.MW >= 4 && g.MH >= 3);
+  }
+  const p = decisionParams(2160, canvasGeometry(3840, 2160, 1));
+  assert.ok(p.shift > 0 && p.shift < p.win);
+});
 console.log(`${n} focus tests passed`);

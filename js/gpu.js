@@ -147,14 +147,17 @@ float lum(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }`;
 // Pass 1 (decision grid): how sharp is the incoming frame here, is the stored view still the same thing,
 // so should we take the new frame? Out: r = take (sharper / nothing stored), g = sharpness now,
 // b = stored sharpness (decayed), a = 0 outside the frame, else 1 + "this spot changed" (0..1).
+// Out 2: r = moved (changed even allowing a small extra shift), g = how well this frame can verify the stored
+// view here (the live view has enough detail), b = stored detail, a = clearly verified.
 const FS_FDECIDE = `#version 300 es
 precision highp float;
 uniform sampler2D u_src, u_acc; uniform highp sampler2D u_dec;
-uniform float u_noise, u_eps, u_decay, u_lodW, u_win, u_covLod;
+uniform float u_noise, u_eps, u_decay, u_lodW, u_win, u_covLod, u_shift;
 uniform float u_lodA[6];
 ${ORIENT}
 ${FOCUS_COMMON}
-out vec4 o;
+layout(location = 0) out vec4 o;
+layout(location = 1) out vec4 o2;
 // detail energy in the 2–6 px band of the live frame (as for stacked stills), 5×5 taps 3 source px apart
 float focusEnergy(vec2 s) {
   float px = 1.0 / u_dispSize.y, e = 0.0;
@@ -168,46 +171,115 @@ float focusEnergy(vec2 s) {
 void main() {
   vec2 uv = gl_FragCoord.xy / vec2(textureSize(u_dec, 0)), p = accP(uv), s = accToFrame(p);
   float Sd = texelFetch(u_dec, ivec2(gl_FragCoord.xy), 0).r * u_decay;
+  o2 = vec4(0.0);
   if (outside(dispToUV(s))) { o = vec4(0.0, 0.0, Sd, 0.0); return; }
   float e = max(focusEnergy(s) - u_noise, 0.0) * 1000.0, k = u_eps * 1000.0;   // ×1000: half-float range
   float sharper = smoothstep(1.1, 1.5, (e + k) / (Sd + k));
   float cov = textureLod(u_acc, uv, u_covLod).a;
-  // Same thing as stored? Some blur of the stored view must explain what the camera sees now (a sharp and a
-  // defocused view of the same thing agree after blurring; a palp or leg that moved doesn't). Compared in colour
-  // (blurred stripes can match a plain background's brightness, rarely its colour), and only as much blur as the
-  // drop in sharpness can account for: a view about as sharp as the stored one must match it nearly as it is.
-  float lmax = 1.0 + 2.0 * log2(max((Sd + k) / (e + k), 1.0));
-  vec3 sd[6]; float sd2[6];
-  for (int l = 0; l < 6; l++) { sd[l] = vec3(0.0); sd2[l] = 0.0; }
+  // Same thing as stored? Defocus only removes detail, so one view must be a blurred version of the other: some
+  // blur of the stored view explains the live one (focus moved away), or some blur of the live view explains the
+  // stored one (focus moved onto it). A palp or leg that moved fits neither. Compared in colour (blurred stripes
+  // can match a plain background's brightness, rarely its colour), and only with as much blur as the sharpness
+  // difference accounts for: two views about as sharp as each other must match nearly as they are.
+  float lmaxA = 1.0 + 2.0 * log2(max((Sd + k) / (e + k), 1.0));
+  float lmaxW = 1.0 + 2.0 * log2(max((e + k) / (Sd + k), 1.0));
+  vec3 sdA[6], sdW[6]; float s2A[6], s2W[6];
+  for (int l = 0; l < 6; l++) { sdA[l] = vec3(0.0); sdW[l] = vec3(0.0); s2A[l] = 0.0; s2W[l] = 0.0; }
   for (int j = -1; j <= 1; j++) for (int i = -1; i <= 1; i++) {
     vec2 q = p + vec2(float(i), float(j)) * u_win;
-    vec3 w = textureLod(u_src, dispToUV(accToFrame(q)), u_lodW).rgb;
-    vec2 au = accUV(q);
-    for (int l = 0; l < 6; l++) { vec3 d = textureLod(u_acc, au, u_lodA[l]).rgb - w; sd[l] += d; sd2[l] += dot(d, d); }
+    vec2 qu = dispToUV(accToFrame(q)), au = accUV(q);
+    vec3 w0 = textureLod(u_src, qu, u_lodW).rgb, a0 = textureLod(u_acc, au, u_lodA[0]).rgb;
+    for (int l = 0; l < 6; l++) {
+      vec3 d = textureLod(u_acc, au, u_lodA[l]).rgb - w0; sdA[l] += d; s2A[l] += dot(d, d);
+      if (float(l) <= lmaxW) { d = a0 - textureLod(u_src, qu, u_lodW + u_lodA[l] - u_lodA[0]).rgb; sdW[l] += d; s2W[l] += dot(d, d); }
+    }
   }
-  float emin = 1e9;
+  float emin = 1e9; int bl = 0; bool bw = false;
   for (int l = 0; l < 6; l++) {
-    if (float(l) > lmax) break;
-    vec3 m = sd[l] / 9.0;
-    emin = min(emin, (sd2[l] / 9.0 - 0.3 * dot(m, m)) / 3.0);   // small brightness offsets (exposure drift) forgiven
+    vec3 m = sdA[l] / 9.0;   // small brightness offsets (exposure drift) forgiven
+    float ea = (s2A[l] / 9.0 - 0.3 * dot(m, m)) / 3.0;
+    if (float(l) <= lmaxA && ea < emin) { emin = ea; bl = l; bw = false; }
+    m = sdW[l] / 9.0;
+    float ew = (s2W[l] / 9.0 - 0.3 * dot(m, m)) / 3.0;
+    if (float(l) <= lmaxW && ew < emin) { emin = ew; bl = l; bw = true; }
   }
   float changed = smoothstep(0.025 * 0.025, 0.05 * 0.05, emin) * smoothstep(0.5, 0.9, cov);
   float take = max(sharper, 1.0 - smoothstep(0.5, 0.9, cov));
+  // Moved = changed even allowing a further ~2 px (720p scale) shift: a real movement, not alignment slack.
+  float moved = changed;
+  if (changed > 0.01) {
+    float la = bw ? u_lodA[0] : u_lodA[bl], lw = bw ? u_lodW + u_lodA[bl] - u_lodA[0] : u_lodW, best = 1e9;
+    for (int n = 0; n < 8; n++) {
+      float ang = float(n) * 0.7853982;
+      vec2 dl = vec2(cos(ang), sin(ang)) * u_shift;
+      vec3 sm = vec3(0.0); float s2 = 0.0;
+      for (int j = -1; j <= 1; j++) for (int i = -1; i <= 1; i++) {
+        vec2 q = p + vec2(float(i), float(j)) * u_win;
+        vec3 d = textureLod(u_acc, accUV(q + dl), la).rgb - textureLod(u_src, dispToUV(accToFrame(q)), lw).rgb;
+        sm += d; s2 += dot(d, d);
+      }
+      sm /= 9.0; best = min(best, (s2 / 9.0 - 0.3 * dot(sm, sm)) / 3.0);
+    }
+    moved = changed * smoothstep(0.025 * 0.025, 0.05 * 0.05, best);
+  }
+  // Can this frame check the stored view here? Only if the live view has a fair share of its detail: a shift smaller
+  // than the live view's blur is invisible in it.
+  float verify = smoothstep(0.1, 0.4, (e + k) / (Sd + k));
   o = vec4(take, e, Sd, 1.0 + changed);
+  // a = clearly verified (the live view shows most of the stored detail): only these vote on whether things moved,
+  // since a blurred comparison can't see a move and would count as "didn't move"
+  o2 = vec4(moved, verify, smoothstep(2.0 * k, 6.0 * k, Sd), smoothstep(0.35, 0.7, (e + k) / (Sd + k)));
+}`;
+
+// Pass 1b (pool grid, ~24 decision cells per block): where did verified detail move? Per block: (moved × clearly
+// verified detail, clearly verified detail) averaged over the block.
+const FS_FPOOL = `#version 300 es
+precision highp float;
+uniform highp sampler2D u_raw, u_raw2; uniform vec2 u_psz;
+out vec4 o;
+void main() {
+  ivec2 sz = textureSize(u_raw, 0), M = ivec2(u_psz), B = ivec2(gl_FragCoord.xy);
+  ivec2 p0 = B * sz / M, p1 = (B + 1) * sz / M;
+  vec2 acc = vec2(0.0); float n = 0.0;
+  for (int y = p0.y; y < p1.y; y++) for (int x = p0.x; x < p1.x; x++) {
+    n += 1.0;
+    if (texelFetch(u_raw, ivec2(x, y), 0).a < 0.5) continue;
+    vec4 r2 = texelFetch(u_raw2, ivec2(x, y), 0);
+    float w = r2.a * r2.b;
+    acc += vec2(r2.r * w, w);
+  }
+  o = vec4(acc / max(n, 1.0), 0.0, 1.0);
+}`;
+// Pass 1c (1×1): the same over the whole frame (an explicit sum: mipmaps of a non-power-of-two grid drop rows), plus
+// the share of blocks where verified detail moved (how much of the picture moved, however sparse its detail).
+const FS_FGLOB = `#version 300 es
+precision highp float;
+uniform highp sampler2D u_pool;
+out vec4 o;
+void main() {
+  ivec2 sz = textureSize(u_pool, 0); vec3 acc = vec3(0.0);
+  for (int y = 0; y < sz.y; y++) for (int x = 0; x < sz.x; x++) {
+    vec2 b = texelFetch(u_pool, ivec2(x, y), 0).rg;
+    acc += vec3(b, smoothstep(0.15, 0.35, b.r / (b.g + 0.02)));
+  }
+  o = vec4(acc / float(sz.x * sz.y), 1.0);
 }`;
 
 // Pass 2 (decision grid): soften the decisions so they don't flicker pixel to pixel; "changed" spots are
 // grown by ~2 cells first (decision cells are ~1.3 px at 720p scale) so a moved palp is replaced whole, edges
 // included. Two decisions: STORE the new frame (clearly sharper, changed, or nothing stored) and SHOW the live
 // frame (it is nearly as sharp as the best stored view, so the live pixel — current, resampled once — wins).
-// Out: r = stored sharpness, g = store, b = show live.
+// Doubt: where verified detail just moved nearby (within ~2 blocks), or a large part of the whole picture moved (a
+// turn, a shift), stored detail that this frame can't clearly confirm is dropped: what moved next to it probably
+// moved it too, and the live view there is too blurred to show it.
+// Out: r = stored sharpness, g = store, b = show live, a = doubt (for the stats).
 const FS_FSMOOTH = `#version 300 es
 precision highp float;
-uniform highp sampler2D u_raw; uniform float u_eps;
+uniform highp sampler2D u_raw, u_raw2, u_pool, u_glob; uniform float u_eps;
 out vec4 o;
 void main() {
   ivec2 P = ivec2(gl_FragCoord.xy), mx = textureSize(u_raw, 0) - 1;
-  vec4 c = texelFetch(u_raw, P, 0);
+  vec4 c = texelFetch(u_raw, P, 0), c2 = texelFetch(u_raw2, P, 0);
   if (c.a < 0.5) { o = vec4(c.b, 0.0, 0.0, 0.0); return; }
   float k = u_eps * 1000.0, ts = 0.0, tl = 0.0, ws = 0.0, tc = 0.0;
   for (int j = -3; j <= 3; j++) for (int i = -3; i <= 3; i++) {
@@ -218,9 +290,41 @@ void main() {
     if (d2 <= 2.0) { float w = exp(-0.5 * d2); ts += w * r.r; tl += w * smoothstep(0.7, 0.9, (r.g + k) / (r.b + k)); ws += w; }
     tc = max(tc, (r.a - 1.0) * clamp(1.6 - 0.3 * sqrt(d2), 0.0, 1.0));
   }
-  float take = clamp(max(ws > 0.0 ? ts / ws : 0.0, tc), 0.0, 1.0);
+  ivec2 psz = textureSize(u_pool, 0), PB = P * psz / (mx + 1);
+  float near = 0.0;
+  for (int j = -2; j <= 2; j++) for (int i = -2; i <= 2; i++) {
+    vec4 b = texelFetch(u_pool, clamp(PB + ivec2(i, j), ivec2(0), psz - 1), 0);
+    near = max(near, b.r / (b.g + 0.02));
+  }
+  // the whole frame counts only when a real share of it moved (a turn, a shift), not one waving palp
+  vec4 g = texelFetch(u_glob, ivec2(0), 0);
+  float glob = smoothstep(0.2, 0.35, g.r / (g.g + 1e-3)) * smoothstep(0.05, 0.09, g.b);
+  float motion = max(smoothstep(0.15, 0.35, near), glob);
+  // after real movement, stored detail stays only where this frame clearly confirms it; all-or-nothing, since
+  // half-dropped stale detail would just look like weaker detail
+  float doubt = smoothstep(0.3, 0.6, (1.0 - c2.a) * motion);
+  float take = clamp(max(max(ws > 0.0 ? ts / ws : 0.0, tc), doubt), 0.0, 1.0);
   float live = max(take, ws > 0.0 ? tl / ws : 0.0);
-  o = vec4(mix(c.b, c.g, take), take, live, 0.0);
+  o = vec4(mix(c.b, c.g, take), take, live, doubt);
+}`;
+
+// Summary of the last decision pass, in 16×9 blocks (debug stats): (moved × detailed, detailed, doubt × detailed,
+// inside frame). "Detailed" = spots whose stored view has real detail (the subject, not plain background).
+const FS_FSUM = `#version 300 es
+precision highp float;
+uniform highp sampler2D u_raw, u_raw2, u_dec; uniform float u_eps;
+out vec4 o;
+void main() {
+  ivec2 sz = textureSize(u_raw, 0), B = ivec2(gl_FragCoord.xy);
+  ivec2 p0 = B * sz / ivec2(16, 9), p1 = (B + 1) * sz / ivec2(16, 9);
+  float k = u_eps * 1000.0; vec4 acc = vec4(0.0);
+  for (int y = p0.y; y < p1.y; y++) for (int x = p0.x; x < p1.x; x++) {
+    vec4 r = texelFetch(u_raw, ivec2(x, y), 0);
+    if (r.a < 0.5) continue;
+    float det = smoothstep(2.0 * k, 6.0 * k, r.b);
+    acc += vec4(texelFetch(u_raw2, ivec2(x, y), 0).r * det, det, texelFetch(u_dec, ivec2(x, y), 0).a * det, 1.0);
+  }
+  o = acc;
 }`;
 
 // Pass 3 (canvas, full resolution): stored = mix(stored, frame, take). Alpha = "something stored here".
@@ -647,11 +751,15 @@ class Base {
     gl.deleteSync(f);
   }
   // ── focus build-up (see js/focus.js) ──
-  // Canvas: RGBA8 + mipmaps (rgb = stored picture, a = something stored). Decision maps: RGBA16F.
+  // Canvas: RGBA8 + mipmaps (rgb = stored picture, a = something stored). Decision maps: RGBA16F (the decision pass
+  // writes a second one: moved / verified / detail). Movement pool: small RGBA16F grid, plus a 1×1 total.
   focusBegin(geo) {
     const gl = this.gl;
     if (!gl.getExtension('EXT_color_buffer_float')) throw new Error('This phone\'s graphics chip can\'t do focus build-up (no float render targets).');
-    if (!this.fdP) { this.fdP = compile(gl, VS, FS_FDECIDE); this.fsP = compile(gl, VS, FS_FSMOOTH); this.fuP = compile(gl, VS, FS_FUPDATE); }
+    if (!this.fdP) {
+      this.fdP = compile(gl, VS, FS_FDECIDE); this.fpP = compile(gl, VS, FS_FPOOL); this.fgP = compile(gl, VS, FS_FGLOB);
+      this.fsP = compile(gl, VS, FS_FSMOOTH); this.fuP = compile(gl, VS, FS_FUPDATE); this.fsumP = compile(gl, VS, FS_FSUM);
+    }
     if (this.facc) this.focusEnd();
     const levels = 1 + Math.floor(Math.log2(Math.max(geo.AW, geo.AH)));
     const fbo = (t, w, h) => { const fb = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, fb); gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, t, 0); return { t, fb, w, h }; };
@@ -663,6 +771,14 @@ class Base {
     this.fMkDec = () => { const t = this.makeTex(); gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA16F, geo.DW, geo.DH); return fbo(t, geo.DW, geo.DH); };
     this.fgeo = geo;
     this.facc = [this.fMkAcc(), this.fMkAcc()]; this.fdec = [this.fMkDec(), this.fMkDec()]; this.fraw = this.fMkDec(); this.fi = 0;
+    { const t = this.makeTex(); gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA16F, geo.DW, geo.DH); this.fraw2 = { t, fb: null, w: geo.DW, h: geo.DH };
+      gl.bindFramebuffer(gl.FRAMEBUFFER, this.fraw.fb); gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT1, gl.TEXTURE_2D, t, 0);
+      gl.drawBuffers([gl.COLOR_ATTACHMENT0, gl.COLOR_ATTACHMENT1]); }
+    { const t = this.makeTex(); gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA16F, geo.MW, geo.MH);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST); this.fpool = fbo(t, geo.MW, geo.MH); }
+    { const t = this.makeTex(); gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA32F, 1, 1);   // 32-bit float: must not filter, or it reads as 0
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST); this.fglob = fbo(t, 1, 1); }
+    if (!this.fsum) { const t = this.makeTex(); gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA32F, 16, 9); this.fsum = fbo(t, 16, 9); this.fsumPx = new Float32Array(16 * 9 * 4); }
     this.focusClear();
   }
   focusClear() {
@@ -676,9 +792,28 @@ class Base {
   focusDetach() { const s = { acc: this.facc[this.fi], dec: this.fdec[this.fi] }; this.facc[this.fi] = this.fMkAcc(); this.fdec[this.fi] = this.fMkDec(); return s; }
   focusAttach(s) { this._fFree([this.facc[this.fi], this.fdec[this.fi]]); this.facc[this.fi] = s.acc; this.fdec[this.fi] = s.dec; }
   focusDrop(s) { this._fFree([s.acc, s.dec]); }
-  focusEnd() { if (this.facc) this._fFree([...this.facc, ...this.fdec, this.fraw]); this.facc = this.fdec = this.fraw = null; }
-  // One frame: decide (decision grid) → soften → update the canvas → mipmaps. srcTex must have mipmaps.
-  // T: canvas-normalised → frame display-normalised similarity [a,b,tx,ty].
+  focusEnd() {
+    if (this.facc) { this._fFree([...this.facc, ...this.fdec, this.fraw, this.fpool, this.fglob]); this.gl.deleteTexture(this.fraw2.t); }
+    this.facc = this.fdec = this.fraw = this.fraw2 = this.fpool = this.fglob = null;
+  }
+  // Debug stats of the last focusStep (reads back 16×9 numbers; waits for the GPU): { moved: share of the detailed
+  // (subject) area that moved this frame, doubt: share dropped as unverifiable next to movement, detail: detailed share }
+  focusStats(eps) {
+    const gl = this.gl, P = this.fsumP;
+    gl.useProgram(P.p);
+    gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, this.fdec[this.fi].t); gl.uniform1i(P.u.u_dec, 1);
+    gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, this.fraw2.t); gl.uniform1i(P.u.u_raw2, 2);
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, this.fraw.t); gl.uniform1i(P.u.u_raw, 0); gl.uniform1f(P.u.u_eps, eps);
+    this.draw(this.fsum.fb, 16, 9);
+    gl.readPixels(0, 0, 16, 9, gl.RGBA, gl.FLOAT, this.fsumPx);
+    let md = 0, d = 0, dd = 0, n = 0;
+    for (let i = 0; i < 16 * 9 * 4; i += 4) { md += this.fsumPx[i]; d += this.fsumPx[i + 1]; dd += this.fsumPx[i + 2]; n += this.fsumPx[i + 3]; }
+    const gv = new Float32Array(4); gl.bindFramebuffer(gl.FRAMEBUFFER, this.fglob.fb); gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.FLOAT, gv);
+    return { moved: d > 0 ? md / d : 0, doubt: d > 0 ? dd / d : 0, detail: n > 0 ? d / n : 0,
+             globR: +gv[0].toPrecision(3), globG: +gv[1].toPrecision(3), globA: +gv[2].toPrecision(3) };
+  }
+  // One frame: decide (decision grid) → pool movement → soften (+ doubt) → update the canvas → mipmaps.
+  // srcTex must have mipmaps. T: canvas-normalised → frame display-normalised similarity [a,b,tx,ty].
   focusStep(srcTex, info, T, prm) {
     const gl = this.gl, geo = this.fgeo, i0 = this.fi, i1 = 1 - this.fi;
     const A0 = this.facc[i0], A1 = this.facc[i1], D0 = this.fdec[i0], D1 = this.fdec[i1];
@@ -691,11 +826,18 @@ class Base {
     bindTo(P, 0, srcTex, 'u_src'); bindTo(P, 1, A0.t, 'u_acc'); bindTo(P, 2, D0.t, 'u_dec');
     geom(P);
     gl.uniform1f(P.u.u_noise, prm.noise); gl.uniform1f(P.u.u_eps, prm.eps); gl.uniform1f(P.u.u_decay, prm.decay);
-    gl.uniform1f(P.u.u_lodW, prm.lodW); gl.uniform1f(P.u.u_win, prm.win); gl.uniform1f(P.u.u_covLod, prm.covLod);
+    gl.uniform1f(P.u.u_lodW, prm.lodW); gl.uniform1f(P.u.u_win, prm.win); gl.uniform1f(P.u.u_covLod, prm.covLod); gl.uniform1f(P.u.u_shift, prm.shift);
     gl.uniform1fv(P.u['u_lodA[0]'], prm.lodA);
     this.draw(this.fraw.fb, geo.DW, geo.DH);
+    // where verified detail moved: per block, then over the whole frame
+    P = this.fpP; gl.useProgram(P.p);
+    bindTo(P, 0, this.fraw.t, 'u_raw'); bindTo(P, 1, this.fraw2.t, 'u_raw2'); gl.uniform2f(P.u.u_psz, geo.MW, geo.MH);
+    this.draw(this.fpool.fb, geo.MW, geo.MH);
+    P = this.fgP; gl.useProgram(P.p); bindTo(P, 0, this.fpool.t, 'u_pool');
+    this.draw(this.fglob.fb, 1, 1);
     P = this.fsP; gl.useProgram(P.p);
-    bindTo(P, 0, this.fraw.t, 'u_raw'); gl.uniform1f(P.u.u_eps, prm.eps);
+    bindTo(P, 0, this.fraw.t, 'u_raw'); bindTo(P, 1, this.fraw2.t, 'u_raw2'); bindTo(P, 2, this.fpool.t, 'u_pool'); bindTo(P, 3, this.fglob.t, 'u_glob');
+    gl.uniform1f(P.u.u_eps, prm.eps);
     this.draw(D1.fb, geo.DW, geo.DH);
     P = this.fuP; gl.useProgram(P.p);
     bindTo(P, 0, srcTex, 'u_src'); bindTo(P, 1, A0.t, 'u_acc'); bindTo(P, 2, D1.t, 'u_dec');
