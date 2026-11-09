@@ -185,6 +185,8 @@ export async function chunkFor(clip, s, reader = clip.reader) {
 /**
  * Decode frames in presentation order between [fromUs, toUs]. onFrame(frame) may be async and MUST close the frame.
  * Frames outside the range are closed automatically. Returns when done or aborted (signal.aborted).
+ * The decoder is kept supplied the whole time: while onFrame works on one frame (drawing, encoding), the next
+ * ones are already being read from the file and decoded.
  */
 export async function decodeRange(clip, { fromUs = 0, toUs = Infinity, onFrame, signal, maxQueue = 3, stallMs = 15000 }) {
   const S = clip.samples;
@@ -196,21 +198,39 @@ export async function decodeRange(clip, { fromUs = 0, toUs = Infinity, onFrame, 
   for (let i = start; i < S.length; i++) { if (S[i].key && S[i].ts > toUs) { end = i - 1; break; } }
   const pending = [];
   let err = null, wake = null, lastProgress = activeNow();
+  const aborted = () => !!(signal && signal.aborted);
   const poke = () => { lastProgress = activeNow(); if (wake) { const w = wake; wake = null; w(); } };
+  let i = start, flushed = false, feeding = false;
   const dec = new VideoDecoder({
     output: f => { pending.push(f); poke(); },
     error: e => { err = e; poke(); },
   });
-  dec.addEventListener('dequeue', poke);
   // A hardware decoder that is busy elsewhere (e.g. the preview) can accept work and never answer.
   const stalled = () => activeNow() - lastProgress > stallMs;
   dec.configure(clip.decoderConfig);
   const reader = new WindowReader(clip.file, undefined, clip.original); // own window: decodes may run alongside each other
-  let i = start, flushed = false;
+  // Feed while there is room: a few chunks queued in the decoder, and not too many finished frames waiting for us
+  // (a phone decoder has only a few frame slots). Runs whenever the decoder takes a chunk, so it never sits idle
+  // while we are busy with a frame.
+  const canFeed = () => i <= end && !err && !aborted() && dec.state === 'configured' && dec.decodeQueueSize < 4 && pending.length < maxQueue;
+  const feed = async () => {
+    if (feeding) return;
+    feeding = true;
+    try {
+      while (canFeed()) {
+        const ch = await chunkFor(clip, S[i++], reader);
+        if (dec.state === 'configured') dec.decode(ch);
+        lastProgress = Math.max(lastProgress, activeNow() - stallMs / 2);
+      }
+    } catch (e) { if (!err) err = e; poke(); }
+    finally { feeding = false; }
+  };
+  dec.addEventListener('dequeue', () => { poke(); feed(); });
   const drain = async () => {
     while (pending.length) {
       const f = pending.shift();
-      if (signal && signal.aborted) { f.close(); continue; }
+      feed();
+      if (aborted()) { f.close(); continue; }
       if (f.timestamp < fromUs || f.timestamp > toUs) { f.close(); continue; }
       await onFrame(f);
     }
@@ -218,11 +238,15 @@ export async function decodeRange(clip, { fromUs = 0, toUs = Infinity, onFrame, 
   try {
     while (true) {
       if (err) throw err;
-      if (signal && signal.aborted) break;
+      if (aborted()) break;
       if (pending.length) { await drain(); lastProgress = activeNow(); continue; }
-      if (i <= end) {
-        if (dec.decodeQueueSize < 4 && pending.length < maxQueue) { const ch = await chunkFor(clip, S[i++], reader); if (dec.state === 'configured') dec.decode(ch); lastProgress = Math.max(lastProgress, activeNow() - stallMs / 2); continue; }
-      } else if (!flushed) {
+      if (i <= end || feeding) {
+        feed();
+        if (stalled()) throw new Error('The video decoder stopped responding');
+        await new Promise(r => { wake = r; setTimeout(r, 30); });
+        continue;
+      }
+      if (!flushed) {
         // Ask for the last frames, and keep taking them while it finishes: a phone decoder has only a few
         // frame slots, so waiting for the flush without emptying them deadlocks at 100%.
         flushed = true;
@@ -231,16 +255,15 @@ export async function decodeRange(clip, { fromUs = 0, toUs = Infinity, onFrame, 
         lastProgress = activeNow();
         while (!fin) {
           if (err) throw err;
-          if (signal && signal.aborted) break;
+          if (aborted()) break;
           if (pending.length) { await drain(); lastProgress = activeNow(); continue; }
           if (stalled()) { console.warn('decoder flush never finished; using the frames we have'); break; }
           await new Promise(r => { wake = r; setTimeout(r, 30); });
         }
-        if (ferr && !(signal && signal.aborted) && dec.state !== 'closed') console.warn('decoder flush failed; using the frames we have', ferr);
+        if (ferr && !aborted() && dec.state !== 'closed') console.warn('decoder flush failed; using the frames we have', ferr);
         continue;
-      } else break;
-      if (stalled()) throw new Error('The video decoder stopped responding');
-      await new Promise(r => { wake = r; setTimeout(r, 30); });
+      }
+      break;
     }
     await drain();
   } finally {
