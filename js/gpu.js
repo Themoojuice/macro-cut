@@ -396,6 +396,33 @@ uniform highp sampler2D u_acc;
 out vec4 o;
 void main() { vec4 a = texelFetch(u_acc, ivec2(gl_FragCoord.xy), 0); o = vec4(a.rgb / max(a.a, 1e-6), 1.0); }`;
 
+// Finished frame → the encoder's own format (I420, BT.709 limited range), packed 4 bytes per RGBA texel so one
+// readback returns the three planes laid out exactly as VideoFrame wants them. Rows [0, H): Y. Then U, then V, each
+// ceil(H/4) rows holding two chroma rows (stride S/2) per row. Chroma = 2×2 average (as the browser's own converter).
+// About 1/3 of the bytes of reading back RGBA, no colour conversion on the CPU, and the readback doesn't stall.
+const FS_YUV = `#version 300 es
+precision highp float;
+uniform sampler2D u_rgb; uniform int u_W, u_H, u_S, u_Q;
+out vec4 o;
+const vec3 KY = vec3(0.2126, 0.7152, 0.0722);
+vec3 px(int x, int y) { return texelFetch(u_rgb, ivec2(min(x, u_W - 1), u_H - 1 - min(y, u_H - 1)), 0).rgb; }
+float Yb(vec3 c) { return (16.0 + 219.0 * dot(c, KY)) / 255.0; }
+vec2 UVb(int cx, int cy) {
+  vec3 c = 0.25 * (px(2 * cx, 2 * cy) + px(2 * cx + 1, 2 * cy) + px(2 * cx, 2 * cy + 1) + px(2 * cx + 1, 2 * cy + 1));
+  float y = dot(c, KY);
+  return (128.0 + 224.0 * vec2((c.b - y) / 1.8556, (c.r - y) / 1.5748)) / 255.0;
+}
+void main() {
+  int tx = int(gl_FragCoord.x), ty = int(gl_FragCoord.y);
+  if (ty < u_H) { int x = tx * 4; o = vec4(Yb(px(x, ty)), Yb(px(x + 1, ty)), Yb(px(x + 2, ty)), Yb(px(x + 3, ty))); return; }
+  int r = ty - u_H, plane = r < u_Q ? 0 : 1; r -= plane * u_Q;
+  int hw = u_S / 8, crow = 2 * r + (tx >= hw ? 1 : 0), cx0 = (tx % hw) * 4;
+  if (crow >= (u_H + 1) / 2) { o = vec4(0.5); return; }
+  vec4 v;
+  for (int i = 0; i < 4; i++) { vec2 uv = UVb(cx0 + i, crow); v[i] = plane == 0 ? uv.x : uv.y; }
+  o = v;
+}`;
+
 const FS_BLUR = `#version 300 es
 precision highp float;
 uniform sampler2D u_tex; uniform vec2 u_dir; uniform float u_sigma; uniform int u_rad;
@@ -499,6 +526,13 @@ function makeTex(gl, w, h) {
   gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
   gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, t, 0);
   return { t, fb, w, h };
+}
+
+// Let the page breathe without a timer (timers are throttled to 1/s when the page isn't in front).
+let _yc = null; const _yq = [];
+export function yieldNow() {
+  if (!_yc && typeof MessageChannel !== 'undefined' && typeof document !== 'undefined') { _yc = new MessageChannel(); _yc.port1.onmessage = () => { const r = _yq.shift(); if (r) r(); }; }
+  return _yc ? new Promise(r => { _yq.push(r); _yc.port2.postMessage(0); }) : new Promise(r => setTimeout(r, 0));
 }
 
 class Base {
@@ -637,6 +671,69 @@ class Base {
     this.acc = null; this.emax = null;
   }
   mipTex(tex) { const gl = this.gl; gl.bindTexture(gl.TEXTURE_2D, tex); gl.generateMipmap(gl.TEXTURE_2D); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR); }
+  // ── asynchronous readback: GPU → pixel-pack buffer, fenced; collected once the GPU is done (no stall) ──
+  makePackBuffer(bytes) {
+    const gl = this.gl, b = gl.createBuffer();
+    gl.bindBuffer(gl.PIXEL_PACK_BUFFER, b); gl.bufferData(gl.PIXEL_PACK_BUFFER, bytes, gl.STREAM_READ); gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
+    return { b, bytes };
+  }
+  // read the w×h RGBA8 framebuffer fb into pack buffer pb, return a fence for it
+  readAsync(fb, w, h, pb) {
+    const gl = this.gl;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+    gl.bindBuffer(gl.PIXEL_PACK_BUFFER, pb.b);
+    gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, 0);
+    gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
+    const f = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
+    gl.flush();
+    return f;
+  }
+  fenceDone(f) {
+    const gl = this.gl;
+    if (!f || gl.isContextLost()) return true;
+    const st = gl.clientWaitSync(f, 0, 0);
+    return st === gl.ALREADY_SIGNALED || st === gl.CONDITION_SATISFIED || st === gl.WAIT_FAILED;
+  }
+  // Resolves once fence f has passed. Polls without blocking the page: a few immediate re-checks (the browser
+  // updates fence status between tasks), then short sleeps.
+  async waitFence(f, maxMs = 30000) {
+    if (!f) return;
+    const t0 = performance.now();
+    for (let n = 0; !this.fenceDone(f); n++) {
+      if (performance.now() - t0 > maxMs) break;
+      await (n < 4 ? yieldNow() : new Promise(r => setTimeout(r, n < 40 ? 1 : 4)));
+    }
+    this.gl.deleteSync(f);
+  }
+  // copy a finished pack buffer into dst (Uint8Array)
+  collect(pb, dst) {
+    const gl = this.gl;
+    gl.bindBuffer(gl.PIXEL_PACK_BUFFER, pb.b);
+    gl.getBufferSubData(gl.PIXEL_PACK_BUFFER, 0, dst, 0, pb.bytes);
+    gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
+    return dst;
+  }
+  // Small greyscale copy of texture tex for motion measuring, exactly as Downscaler.grabBytes makes it (same shader,
+  // same mipmapped sampling), but from the frame already on this GPU context and read back without waiting.
+  // Returns a fence; the w×h RGBA rows land in pack buffer pb (red = luma).
+  analysisAsync(tex, info, w, h, pb, hasMips = false) {
+    const gl = this.gl;
+    if (!this.anP) this.anP = compile(gl, VS, FS_ANALYSIS);
+    if (!this.anT || this.anT.w !== w || this.anT.h !== h) { if (this.anT) { gl.deleteTexture(this.anT.t); gl.deleteFramebuffer(this.anT.fb); } this.anT = makeTex(gl, w, h); }
+    const mip = info.dispH / h > 2.5;
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, tex);
+    if (mip) { if (!hasMips) gl.generateMipmap(gl.TEXTURE_2D); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR); }
+    else gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.useProgram(this.anP.p);
+    gl.uniform1i(this.anP.u.u_src, 0);
+    gl.uniform2f(this.anP.u.u_out, w, h);
+    this.setOrient(this.anP, info);
+    this.draw(this.anT.fb, w, h);
+    // the render path keeps its own sampling (hasMips = the frame is drawn from its mipmaps)
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, hasMips ? gl.LINEAR_MIPMAP_LINEAR : gl.LINEAR);
+    return this.readAsync(this.anT.fb, w, h, pb);
+  }
   // Resolves when the GPU has finished everything queued so far (fence, polled without blocking the page).
   async gpuDone(maxMs = 30000) {
     const gl = this.gl, f = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
@@ -763,6 +860,19 @@ export class Downscaler extends Base {
     for (let i = 0, j = 0; j < g.length; i += 4, j++) g[j] = this.px[i];
     return g;
   }
+  // Same as grab() but the result is read back without waiting for the GPU: draws now (the frame can be closed
+  // straight away), returns a fence; once it has passed, collect(pb, rgba) gives the RGBA rows (red = luma).
+  grabAsync(source, info, pb) {
+    const gl = this.gl;
+    this.upload(source, info, info.dispH / this.h > 2.5);
+    gl.useProgram(this.prog.p);
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, this.src);
+    gl.uniform1i(this.prog.u.u_src, 0);
+    gl.uniform2f(this.prog.u.u_out, this.w, this.h);
+    this.setOrient(this.prog, info);
+    this.draw(this.target.fb, this.w, this.h);
+    return this.readAsync(this.target.fb, this.w, this.h, pb);
+  }
   // Same as grab() but into a Uint8Array (compact, transferable to a worker).
   grabBytes(source, info, out) {
     const gl = this.gl;
@@ -793,6 +903,7 @@ export class Renderer extends Base {
     this.dn = null;   // denoise program, compiled on first use
     this.fin = compile(gl, VS, FS_FINAL);
     this.size = [0, 0];
+    this.outFB = null;   // null = draw finished frames onto the canvas
   }
   setSize(w, h) {
     if (this.size[0] === w && this.size[1] === h) return;
@@ -801,6 +912,30 @@ export class Renderer extends Base {
     for (const t of [this.A, this.B, this.Cc]) if (t) { gl.deleteTexture(t.t); gl.deleteFramebuffer(t.fb); }
     this.A = makeTex(gl, w, h); this.B = makeTex(gl, w, h); this.Cc = makeTex(gl, w, h);
     this.size = [w, h];
+    if (this.yuv) this.useYuvOutput(true);
+  }
+  // Export: draw finished frames into a texture (not the canvas) and hand them over as I420 (see FS_YUV).
+  // Returns the packed layout { S (luma stride), Q (rows per chroma plane), TW×TH (pack texture), bytes }.
+  useYuvOutput(on) {
+    const gl = this.gl;
+    for (const t of [this.O, this.P]) if (t) { gl.deleteTexture(t.t); gl.deleteFramebuffer(t.fb); }
+    this.O = this.P = null; this.outFB = null; this.yuv = null;
+    if (!on) return null;
+    const [w, h] = this.size;
+    if (!this.yuvP) this.yuvP = compile(gl, VS, FS_YUV);
+    const S = Math.ceil(w / 8) * 8, Q = Math.ceil(h / 4), TW = S / 4, TH = h + 2 * Q;
+    this.O = makeTex(gl, w, h); this.P = makeTex(gl, TW, TH); this.outFB = this.O.fb;
+    this.yuv = { S, Q, TW, TH, bytes: S * TH, W: w, H: h };
+    return this.yuv;
+  }
+  // pack the last rendered frame and start reading it into pack buffer pb; returns a fence
+  readYuvAsync(pb) {
+    const gl = this.gl, y = this.yuv, P = this.yuvP;
+    gl.useProgram(P.p);
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, this.O.t); gl.uniform1i(P.u.u_rgb, 0);
+    gl.uniform1i(P.u.u_W, y.W); gl.uniform1i(P.u.u_H, y.H); gl.uniform1i(P.u.u_S, y.S); gl.uniform1i(P.u.u_Q, y.Q);
+    this.draw(this.P.fb, y.TW, y.TH);
+    return this.readAsync(this.P.fb, y.TW, y.TH, pb);
   }
   // Small RGB thumbnail of the current source (whole frame, no look), for calibration probes.
   thumb() {
@@ -877,6 +1012,6 @@ export class Renderer extends Base {
     gl.uniform1f(u.u_shadows, L.shadows); gl.uniform1f(u.u_highlights, L.highlights);
     gl.uniform1f(u.u_sat, 1 + L.saturation); gl.uniform1f(u.u_vib, L.vibrance);
     gl.uniform1f(u.u_warm, L.warmth); gl.uniform1f(u.u_tint, L.tint);
-    this.draw(null, w, h);
+    this.draw(this.outFB, w, h);
   }
 }

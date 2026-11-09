@@ -1262,9 +1262,12 @@ $('btnExportGo').onclick = async () => {
     download(res.blob, name);   // save straight away: no extra tap needed
     const secs = (performance.now() - t0) / 1000, T = res.timing;
     let where = '';
-    if (T && T.total > 5000) {
-      const out = Math.min(100, Math.round(100 * (T.encoder + T.gpu) / T.total));
-      where = ` Time split: drawing + encoding frames ${out}%, reading the clip${res.interpolated || res.cleaned || res.focus ? ' + working out motion and focus' : ''} ${100 - out}%.`;
+    if (T && T.total > 3000) {
+      // where the time went, in words: what the drawing/encoding mostly waited for
+      const pct = v => Math.round(100 * v / T.total);
+      const parts = [['drawing (graphics chip)', T.outWait], ['the video encoder', T.encWait], ['reading the clip', T.srcWait], ['measuring motion', T.flowWait]]
+        .filter(([, v]) => pct(v) >= 5).sort((a, b) => b[1] - a[1]).map(([n, v]) => `${n} ${pct(v)}%`);
+      where = ` Speed: ${(res.frames / (T.total / 1000)).toFixed(1)} frames a second, ${res.hardware ? 'hardware' : 'software'} encoder${parts.length ? `; mostly waiting on ${parts.join(', ')}` : ''}.`;
     }
     $('exportMsg').innerHTML = `<b>✓ Saved to your phone's Downloads</b> as ${name}. Done in ${secs < 90 ? `${secs.toFixed(0)} s` : `${(secs / 60).toFixed(1)} min`}: ${(res.blob.size / 1e6).toFixed(1)} MB, ${res.frames} frames, ${res.codec.startsWith('avc') ? 'H.264' : 'VP9'}${res.hasAudio ? ' + audio' : ''}${res.interpolated ? `, ${res.interpolated} in-between frames created` : ''}${res.cleaned ? ', extra clean' : ''}${res.focus ? `, focus ${res.focus.mode === 'full' ? 'sharp from the start' : 'build-up'}` : ''}.${res.shortBy ? ` The phone stopped reading the clip near the end, so it finishes ${res.shortBy < 1 ? 'a moment' : `${res.shortBy.toFixed(1)} s`} early.` : ''} If it isn't in Downloads, tap Save again; it also stays under Export until your next video.${where}`;
     setExportUI('done');

@@ -1,6 +1,6 @@
 // Network-first (new commits show up immediately), falling back to cache so the app also works offline in the field.
-const CACHE = 'macrocut-v18';
-const SHELL = ['./', './index.html', './css/app.css?v=18', './js/app.js?v=18', './js/core.js', './js/gpu.js', './js/media.js', './js/engine.js', './js/track-worker.js', './js/store.js', './js/look.js', './js/focus.js',
+const CACHE = 'macrocut-v19';
+const SHELL = ['./', './index.html', './css/app.css?v=19', './js/app.js?v=19', './js/core.js', './js/gpu.js', './js/media.js', './js/engine.js', './js/track-worker.js', './js/motion-worker.js', './js/store.js', './js/look.js', './js/focus.js',
   './vendor/mp4box.all.min.js', './vendor/mp4-muxer.js', './manifest.json'];
 
 self.addEventListener('install', e => {

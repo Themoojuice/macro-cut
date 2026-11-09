@@ -138,20 +138,26 @@ export function detectFeatures(img, w, h, maxN = 160, mask = null, margin = 12, 
 
 // ───────────────────────── keyframe templates for inverse-compositional LK ─────────────────────────
 export function makeTemplates(pyr, feats, half) {
-  const n = feats.length / 2, L = pyr.length, ws = 2 * half + 1, np = ws * ws;
+  const n = feats.length / 2, L = pyr.length, ws = 2 * half + 1, np = ws * ws, ps = ws + 2;
   const lv = [];
+  // The template and its gradients come from one (ws+2)² patch of bilinear samples around the feature (x ± 1 is the
+  // neighbouring sample: feature coordinates plus small integers are exact in floating point, so this is the same
+  // arithmetic as sampling each tap separately). Clamp/floor/fraction are worked out once per column and row.
+  const cx = new Int32Array(ps), cf = new Float64Array(ps), ry = new Int32Array(ps), rf = new Float64Array(ps), S = new Float64Array(ps * ps);
   for (let l = 0; l < L; l++) {
     const { d, w, h } = pyr[l], sc = 1 / (1 << l);
     const T = new Float32Array(n * np), GX = new Float32Array(n * np), GY = new Float32Array(n * np);
     const Hinv = new Float32Array(n * 3), mg = new Float32Array(n * 2), ok = new Uint8Array(n);
     for (let f = 0; f < n; f++) {
       const px = feats[2 * f] * sc, py = feats[2 * f + 1] * sc, base = f * np;
+      for (let u = -half - 1, j = 0; u <= half + 1; u++, j++) bilinAxis(px + u, w, cx, cf, j);
+      for (let v = -half - 1, j = 0; v <= half + 1; v++, j++) bilinAxis(py + v, h, ry, rf, j);
+      for (let v = 0, q = 0; v < ps; v++) { const y0 = ry[v], fy = rf[v]; for (let u = 0; u < ps; u++, q++) S[q] = bilinAt(d, w, cx[u], cf[u], y0, fy); }
       let sgx = 0, sgy = 0, k = 0;
-      for (let v = -half; v <= half; v++) for (let u = -half; u <= half; u++, k++) {
-        const x = px + u, y = py + v;
-        T[base + k] = bilin(d, w, h, x, y);
-        const gxv = (bilin(d, w, h, x + 1, y) - bilin(d, w, h, x - 1, y)) * 0.5;
-        const gyv = (bilin(d, w, h, x, y + 1) - bilin(d, w, h, x, y - 1)) * 0.5;
+      for (let v = 1; v <= ws; v++) for (let u = 1; u <= ws; u++, k++) {
+        const q = v * ps + u;
+        T[base + k] = S[q];
+        const gxv = (S[q + 1] - S[q - 1]) * 0.5, gyv = (S[q + ps] - S[q - ps]) * 0.5;
         GX[base + k] = gxv; GY[base + k] = gyv; sgx += gxv; sgy += gyv;
       }
       const mx = sgx / np, my = sgy / np;
@@ -171,10 +177,27 @@ export function makeTemplates(pyr, feats, half) {
   return { lv, half, np, n };
 }
 
+// bilin() split by axis: the clamped integer cell and fraction of one coordinate (identical arithmetic).
+function bilinAxis(x, n, cell, frac, j) {
+  if (x < 0) x = 0; else if (x > n - 1.001) x = n - 1.001;
+  const x0 = x | 0; cell[j] = x0; frac[j] = x - x0;
+}
+function bilinAt(d, w, x0, fx, y0, fy) {
+  const i = y0 * w + x0, a = d[i], b = d[i + 1], c = d[i + w], e = d[i + w + 1];
+  return a + fx * (b - a) + fy * (c - a) + fx * fy * (a - b - c + e);
+}
+
 // Track keyframe features into current pyramid. guess: Float32Array of predicted level-0 positions.
 export function trackLK(tpl, feats, cur, guess, maxErr = 14) {
-  const { lv, half, np, n } = tpl, L = Math.min(lv.length, cur.length);
+  const { lv, half, np, n } = tpl, L = Math.min(lv.length, cur.length), ws = 2 * half + 1;
   const out = new Float32Array(n * 2), status = new Uint8Array(n);
+  const cx = new Int32Array(ws), cf = new Float64Array(ws), ry = new Int32Array(ws), rf = new Float64Array(ws), buf = new Float64Array(np);
+  const gxm = new Float64Array(np), gym = new Float64Array(np);
+  // window taps at (ox + u, oy + v): bilinear cells/fractions per column and row, then the taps themselves
+  const prep = (ox, oy, w, h) => {
+    for (let u = -half, j = 0; u <= half; u++, j++) bilinAxis(ox + u, w, cx, cf, j);
+    for (let v = -half, j = 0; v <= half; v++, j++) bilinAxis(oy + v, h, ry, rf, j);
+  };
   for (let f = 0; f < n; f++) {
     let dx = (guess[2 * f] - feats[2 * f]) / (1 << (L - 1));
     let dy = (guess[2 * f + 1] - feats[2 * f + 1]) / (1 << (L - 1));
@@ -185,13 +208,19 @@ export function trackLK(tpl, feats, cur, guess, maxErr = 14) {
       const { d, w, h } = cur[l], sc = 1 / (1 << l);
       const px = feats[2 * f] * sc, py = feats[2 * f + 1] * sc, base = f * np;
       const h0 = T.Hinv[3 * f], h1 = T.Hinv[3 * f + 1], h2 = T.Hinv[3 * f + 2], mx = T.mg[2 * f], my = T.mg[2 * f + 1];
+      const TT = T.T, GX = T.GX, GY = T.GY;
+      for (let k = 0; k < np; k++) { gxm[k] = GX[base + k] - mx; gym[k] = GY[base + k] - my; }
       const iters = l === L - 1 ? 10 : 7;
       for (let it = 0; it < iters; it++) {
         let bx = 0, by = 0, k = 0;
-        const ox = px + dx, oy = py + dy;
-        for (let v = -half; v <= half; v++) for (let u = -half; u <= half; u++, k++) {
-          const e = bilin(d, w, h, ox + u, oy + v) - T.T[base + k];
-          bx += (T.GX[base + k] - mx) * e; by += (T.GY[base + k] - my) * e;
+        prep(px + dx, py + dy, w, h);
+        for (let v = 0; v < ws; v++) {
+          const r = ry[v] * w, fy = rf[v];
+          for (let u = 0; u < ws; u++, k++) {
+            const fx = cf[u], i = r + cx[u], a = d[i], b = d[i + 1], c = d[i + w], e4 = d[i + w + 1];
+            const e = (a + fx * (b - a) + fy * (c - a) + fx * fy * (a - b - c + e4)) - TT[base + k];
+            bx += gxm[k] * e; by += gym[k] * e;
+          }
         }
         // brightness-offset invariant (zero-mean) update
         const ddx = h0 * bx + h1 * by, ddy = h1 * bx + h2 * by;
@@ -202,17 +231,17 @@ export function trackLK(tpl, feats, cur, guess, maxErr = 14) {
       else {
         // residual after convergence (offset-compensated)
         let s = 0, sa = 0, k = 0;
-        const ox = px + dx, oy = py + dy, buf = [];
-        for (let v = -half; v <= half; v++) for (let u = -half; u <= half; u++, k++) {
-          const e = bilin(d, w, h, ox + u, oy + v) - T.T[base + k]; buf.push(e); s += e;
+        prep(px + dx, py + dy, w, h);
+        for (let v = 0; v < ws; v++) for (let u = 0; u < ws; u++, k++) {
+          const e = bilinAt(d, w, cx[u], cf[u], ry[v], rf[v]) - TT[base + k]; buf[k] = e; s += e;
         }
         const m = s / np;
-        for (const e of buf) sa += Math.abs(e - m);
+        for (k = 0; k < np; k++) sa += Math.abs(buf[k] - m);
         // contrast-relative: fine hair texture resamples with large absolute residuals but is still well tracked
         let tm = 0, tv = 0;
-        for (k = 0; k < np; k++) tm += T.T[base + k];
+        for (k = 0; k < np; k++) tm += TT[base + k];
         tm /= np;
-        for (k = 0; k < np; k++) tv += Math.abs(T.T[base + k] - tm);
+        for (k = 0; k < np; k++) tv += Math.abs(TT[base + k] - tm);
         if (sa / np > Math.max(maxErr, 0.5 * tv / np)) good = false;
         const nx = feats[2 * f] + dx, ny = feats[2 * f + 1] + dy;
         if (!(nx > 1 && ny > 1 && nx < w - 2 && ny < h - 2)) good = false;
